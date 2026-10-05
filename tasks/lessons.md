@@ -330,14 +330,14 @@
   output without an output schema`. Live `execute` → `tools.todoread({})`
   hit that. Declare the schema (JSON Schema is a valid `ValueSchema`) or omit
   `output` from the result.
-- **Do not register permission-sensitive direct tools through the 2.0 public
+- **Do not register a second permission-sensitive web-search fallback through the 2.0 public
   `ToolContext`.** It exposes session/agent/message/call identity and progress,
   but no permission-request method. The provider aliases the host's native
   permission-gated `websearch` → `custom_websearch` and supplies an Exa backend
   through `ctx.websearch.transform`; a second direct fallback would bypass
-  `ask`. For the same reason, stock 2.0 must not advertise
-  `cursor_image_save`: refuse generation/binary writes before staging until the
-  public API can raise `external_directory` and `edit`.
+  `ask`. `cursor_image_save` is handle-only (opaque id, containment) and is
+  registered on 2.0 with catalog `permission: "edit"` so generated images can
+  be committed; do not turn it into a general file writer.
 
 ## 2026-09-15 — Cursor native todos mirror into host todowrite/todoread
 
@@ -506,3 +506,79 @@
   instructions after an intervening update. Matching the frozen first-turn
   prefix does not prove matching the checkpoint's latest effective context
   (`test/context-epoch.test.ts:158`).
+
+## 2026-10-04 — Describe provider behavior in OpenCode terms only
+
+- A fix motivated by a clone host must still be stated, implemented, and tested
+  as OpenCode behavior. "OpenCode 1.x-shaped host without `plan_enter`" and
+  "(Kilo, MiMo)" in the changelog, another host's agent names (`code`,
+  `checkpoint-writer`) in tests, and their approval wording in comments all
+  broke the boundary. Check the OpenCode source first: current 1.x has no
+  `plan_enter` at all, so the case was simply "OpenCode 1.x".
+- A structural bridge member may only override a native OpenCode rule, never
+  replace it. `planFile` without a native fallback left stock OpenCode with no
+  plan file; the provider now follows `Session.plan` itself
+  (`src/context/paths.ts` `hostPlanFilePath`).
+- "Host location" means each OpenCode version's own default, not the
+  operator's config or env: 1.x `Session.plan` (worktree `.opencode/plans`
+  in a git project), 2.0 the Plan directory `~/.opencode/plan`. Verify 2.0
+  through its documented `plugin/opencode2` entry in a dedicated
+  `OPENCODE_CONFIG_DIR`, never through a global config that loads the
+  classic entry.
+- Pin host binaries by absolute path in live runs. A tmux login shell put the
+  nvm OpenCode 1.x ahead of the installed 2.0, so "2.0" runs were 1.x runs.
+
+## 2026-10-04 — Prefer the host's review; ask only where it has none
+
+- Route plan approval to the host's own review first (a plan-stage tool, or
+  `plan_exit` under its `plan` agent). Only where the host has none does
+  CreatePlan ask through `question`, with upstream `PlanExitTool`'s wording.
+- 2026-10-05: the docs, the plan-mode reminder and the SwitchMode refusal had
+  drifted to "the provider never asks; the user switches agents" while the
+  code still asked. One policy, stated identically in code, reminders, README,
+  `docs/opencode-2.md`, `docs/cli-parity.md` and `AGENTS.md`.
+
+## 2026-10-04 — Reconcile state at the delivery boundary
+
+- A smaller catalog is insufficient evidence of a helper when the request
+  carries a result for the held parent's pending call. Check that correlation
+  before choosing isolation; a result followed by an agent reminder is still
+  owed to the parent Run (`test/fresh-turn-drain.test.ts`).
+- Serialize native-agent callbacks per session, including replacement requests.
+  An awaited callback must delete only its own queue entry, and a failed older
+  callback must not clear a newer request's Run ownership
+  (`test/switch-mode.test.ts`).
+- Encode approval replies without mutating execution state. Apply the mode
+  transition and queue the native switch only after delivery succeeds
+  (`test/create-plan.test.ts`).
+
+- Keep acceptance documents reusable: incorporate review findings as test
+  criteria in the checklist, and keep dated review results, approvals, and
+  validation counts in separate run reports.
+
+## 2026-10-05 — Read the whole frame tail before giving up a Run
+
+- A display `tool_call_completed` is Cursor closing a call it already has an
+  answer for; it never waits on the client. The fresh-turn drain stopped there
+  and superseded the Run ~150 ms before its checkpoint and `turn_ended`, so the
+  next Run resumed from the pre-plan checkpoint (live self-verify logs of
+  hosts that answer a plan review together with a new user message).
+  Stop draining only on frames Cursor waits on (new tool, exec, interaction).
+- A tool-less (title/summary) Run still narrates and tries tools; the refused
+  calls are invisible to the host, so the narration ends up in the title. Hold
+  tool-less text and drop the part that preceded a refused call.
+- Cursor can span one "step" over several tool calls and interactions, so
+  `step_completed` is not a text boundary; tool and interaction frames are.
+
+## 2026-10-05 — A plugin cleanup removes only what its own setup installed
+
+- OpenCode 2.0 sets a plugin up once per location instance and again on a
+  plugin reload, then disposes older setups while newer ones run. A cleanup
+  that reset process-wide state (`setHostAgentModeSwitch(undefined)`,
+  `setNativePlansDir(undefined)`) removed the live setup's switch: SwitchMode
+  fell back to provider-owned mode, plans went to `<data>/plans`, and an
+  approved plan never started. Setters return a disposer for their own
+  registration; an entrypoint with nothing to install must not clear another's.
+- Diagnose from the host's own log first: `~/.local/share/opencode/log`
+  showed four "loading plugin" entries for two directories.
+

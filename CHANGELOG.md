@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Changed
+
+- CreatePlan writes plans where OpenCode keeps them: the session's own plan file on OpenCode 1.x (`.opencode/plans/` in a git project, otherwise the data `plans/` folder) and the Plan directory (`~/.opencode/plan`) on OpenCode 2.0, instead of a provider-chosen folder
+- Cursor follows the OpenCode agent on every turn, as Cursor CLI does: choosing `plan` in OpenCode's agent picker puts Cursor in plan mode, and leaving it returns Cursor to agent mode
+- Cursor SwitchMode into plan mode moves the session to OpenCode's `plan` agent once the turn ends (OpenCode 2.0, and 1.x without `plan_enter`)
+- In plan mode without a host `plan_exit`, CreatePlan shows the plan and asks through `question` whether to start implementing; Yes switches to the build agent and continues. Under the `plan` agent with `plan_exit`, CreatePlan writes the session plan file and runs that review instead; a host plan-stage tool receives the plan directly
+- `cursor-opencode-provider/image-save` accepts `ask: null` for hosts without a permission prompt (the image is written after containment only); a missing `ask` is still refused
+
+### Fixed
+
+- OpenCode 2.0 saves Cursor-generated images through `cursor_image_save` instead of refusing the binary write
+- On OpenCode 2.0, an approved plan starts implementing and plans land in the Plan directory even after the plugin is set up for several locations or reloaded; before, disposing an older setup removed the newer one's agent switch and the session stopped after approval
+- Assistant text before and after a tool call or plan review is separated into paragraphs instead of running together, so a shown plan's heading renders
+- Session titles and summaries contain only the model's answer, not its narration before tools it could not use
+- A new message that arrives with a plan approval or plan-mode switch no longer discards the Cursor turn that raised it
+- A new message sent while a plan review, question, or mode switch is still open declines it instead of leaving the earlier Cursor run open
+- A pending tool result in a new message reaches its Cursor run before helper detection, so the conversation is kept even when the tool catalog shrank
+- Approving a plan is not undone by plan-mode reminders the host appends after the answer, and a failed approval delivery no longer changes the mode or starts implementing
+- Native agent switches run once per session at a time and keep a newer request that arrives while one is applying
+- On OpenCode 1.x, a SwitchMode in a session's first turn moves it to the `plan` agent too
+- Where OpenCode offers no `plan_enter`, the model is told to enter plan mode with Cursor's SwitchMode directly instead of concluding plan mode is unavailable
+- With a host plan-stage tool, plan mode is kept while the host still advertises `plan_enter`
+- After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed

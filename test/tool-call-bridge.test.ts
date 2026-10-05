@@ -77,8 +77,8 @@ describe("tool-call-bridge", () => {
       update_todos_tool_call: {
         args: {
           todos: [
-            { id: "a", content: "ocp-token-a", status: "completed" },
-            { id: "b", content: "ocp-token-b", status: "completed" },
+            { id: "a", content: "sv-token-a", status: "completed" },
+            { id: "b", content: "sv-token-b", status: "completed" },
           ],
         },
         result: { success: { todos: [] } },
@@ -86,8 +86,8 @@ describe("tool-call-bridge", () => {
     })
 
     expect(display?.args.todos).toEqual([
-      { id: "a", content: "ocp-token-a", status: "completed", priority: "medium" },
-      { id: "b", content: "ocp-token-b", status: "completed", priority: "medium" },
+      { id: "a", content: "sv-token-a", status: "completed", priority: "medium" },
+      { id: "b", content: "sv-token-b", status: "completed", priority: "medium" },
     ])
   })
 

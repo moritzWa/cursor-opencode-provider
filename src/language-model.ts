@@ -34,6 +34,7 @@ import {
   buildCustomWebToolAliases,
   extractHostSubagentCatalog,
   toolsToDescriptors,
+  resolveToolServerIdentity,
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
   preferCorrelatedTaskDescription,
@@ -85,14 +86,16 @@ import {
 } from "./protocol/ask-question.js"
 import {
   SWITCH_MODE_RESULT_FIELD,
+  cursorAgentModeWireValue,
+  followHostPlanAgent,
   getActiveCursorMode,
   isBridgedCursorPlanModeActive,
   isCursorPlanModeActive,
   setActiveCursorMode,
-  switchModeResultFromQuestionOutput,
   switchModeResultFromToolOutput,
   switchModeToolInput,
   takeActiveCursorModeReminder,
+  takeHostPlanAgentNote,
 } from "./protocol/switch-mode.js"
 import {
   CREATE_PLAN_NOT_APPROVED_REASON,
@@ -101,17 +104,11 @@ import {
   createPlanApproved,
   createPlanStageInput,
 } from "./protocol/create-plan.js"
-import {
-  flushPlanExecutionKickoff,
-  formatPlanKickoffPath,
-  hasPlanExecutionKickoff,
-  planExecutionKickoffState,
-  planPathFromUri,
-  queuePlanExecutionKickoff,
-  takePlanExecutionKickoffWarning,
-} from "./plan-execution-kickoff.js"
+import { hostPlanFileFor } from "./host-plan-file.js"
 import {
   flushHostAgentModeSwitch,
+  hostAgentModeSwitchKind,
+  isHostPlanEntryPending,
   queueHostAgentModeSwitch,
 } from "./host-agent-mode.js"
 import {
@@ -173,9 +170,9 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
-import { getFrozenRequestContext, getOrBuildRequestContext } from "./context/frozen.js"
+import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
-import { loadMergedConfig } from "./context/rules.js"
+import { loadMergedConfig, type OpencodeJson } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
 } from "./context/dynamic-catalog.js"
@@ -804,7 +801,9 @@ async function doStreamImpl(
     // Write pending results onto the held-open Run. A dead stream closes the
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
-    session = deliverContinuationResults(session, trailingToolResults)
+    session = deliverContinuationResults(session, trailingToolResults, {
+      hostAgent: hostAgentFromCallOptions(callOptions),
+    })
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
 
@@ -822,9 +821,9 @@ async function doStreamImpl(
     } else {
       // Fresh turn (prompt ends with user/assistant text). Historical tool
       // results may exist mid-prompt; they are not live exec replies.
-      const historical = extractToolResults(prompt).length
-      if (historical > 0) {
-        trace(`fresh turn: ignoring ${historical} historical tool result(s) (not trailing)`)
+      const historicalResults = extractToolResults(prompt)
+      if (historicalResults.length > 0) {
+        trace(`fresh turn: reconciling ${historicalResults.length} historical tool result(s) with held pending calls`)
       }
       // An in-session helper (title/memory/task child) that reuses the parent
       // OpenCode session id with a strictly smaller catalog must not cancel or
@@ -832,9 +831,7 @@ async function doStreamImpl(
       // the trailing tool result returns. Isolate onto an ephemeral conversation.
       const busyPrior = sessionManager.findOpenByOpenCodeSessionId(sessionKey)
       if (
-        busyPrior
-        && !busyPrior.closed
-        && isProperCatalogSubset(extractTools(callOptions), busyPrior.toolCatalog ?? [])
+        busyPrior && shouldIsolateInSessionHelper(sessionKey, extractTools(callOptions), historicalResults)
       ) {
         trace(
           `fresh turn: isolating in-session helper — incomingTools subset of ` +
@@ -849,7 +846,10 @@ async function doStreamImpl(
         // is preserved. registerSession will not close a prior Run that still
         // has real pending execs; a failed prepare leaves that Run held.
         try {
-          await preparePriorSessionForFreshTurn(sessionKey)
+          await preparePriorSessionForFreshTurn(sessionKey, {
+            toolResults: historicalResults,
+            hostAgent: hostAgentFromCallOptions(callOptions),
+          })
         } catch (error) {
           trace(
             `fresh turn: prepare-prior failed — opening the new Run and leaving ` +
@@ -899,21 +899,7 @@ async function doStreamImpl(
           }
           // pumpWithRecovery has returned only after the Run reached terminal
           // turn_ended and endPump cleared ownership. This is the first safe
-          // point to start a second OpenCode generation. A failed prior handoff
-          // is retried only because this explicit new provider turn reached its
-          // own terminal boundary — never from a timer or tight loop.
-          const kickoff = await flushPlanExecutionKickoff(activeSession.openCodeSessionId, {
-            cursorSessionID: activeSession.sessionId,
-            terminal: activeSession.closed,
-            pumpActive: activeSession.pumpActive || activeSession.pumpOwner != null,
-            pendingExecs: activeSession.pending.size,
-          })
-          if (!kickoff) {
-            const state = planExecutionKickoffState(activeSession.openCodeSessionId)
-            if (state?.status === "failed") {
-              setActiveCursorMode(activeSession.openCodeSessionId, "plan")
-            }
-          }
+          // point to change the host agent for the next generation.
           await flushHostAgentModeSwitch(activeSession.openCodeSessionId, {
             cursorSessionID: activeSession.sessionId,
             terminal: activeSession.closed,
@@ -1150,9 +1136,7 @@ async function startSession(
     })
   }
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
-  const hostAgent = typeof providerOptions?.[CURSOR_HOST_AGENT_OPTION] === "string"
-    ? String(providerOptions[CURSOR_HOST_AGENT_OPTION]).trim() || undefined
-    : undefined
+  const hostAgent = hostAgentFromCallOptions(callOptions)
   // The classic plugin marks OpenCode's agent="compaction" through chat.params.
   // OpenCode 2.0 removed that hook, so its plugin writes the same request-local
   // option from session hooks. The session marker is a fallback only when a
@@ -1290,22 +1274,36 @@ async function startSession(
   if (startedWithCheckpoint) {
     userText = groundCheckpointTurnText(userText, true, workspaceRoot, cursorTools)
   }
+  if (!isCompaction && !lifecycle && sessionKey) {
+    const previousHostAgent = promptIdentityBySession.get(sessionKey)?.hostAgent
+    const followed = followHostPlanAgent(sessionKey, previousHostAgent, hostAgent)
+    if (followed) {
+      trace(`host-agent-mode: host ${followed} plan agent sessionKey=${sessionKey} hostAgent=${hostAgent}`)
+    }
+  }
   const activeMode = getActiveCursorMode(sessionKey)
+  // The host plan agent's own prompt owns plan mode, unless a host plan-stage
+  // tool takes the plan: then the provider's stage reminder says how to submit it.
   const nativePlanPromptOwnsMode = hostAgent === "plan"
     && (activeMode === "plan" || activeMode === "spec")
-  // Mode/kickoff are chronological Mid-Conversation updates (V2), including on
+    && !cursorTools.some((tool) => tool.name === CURSOR_PLAN_STAGE_TOOL)
+  // Mode reminders are chronological Mid-Conversation updates (V2), including on
   // checkpoint Turns — never folded into the frozen system baseline.
   const modeReminder = isCompaction || lifecycle || nativePlanPromptOwnsMode
     ? undefined
     : takeActiveCursorModeReminder(sessionKey, {
         advertisedTools: cursorTools.map((tool) => tool.name),
+        ...(hostAgent ? { hostAgent } : {}),
       })
-  const kickoffWarning = isCompaction || lifecycle
+  const hostPlanAgentNote = isCompaction || lifecycle
     ? undefined
-    : takePlanExecutionKickoffWarning(sessionKey)
+    : takeHostPlanAgentNote(sessionKey, conversationId, hostAgent, cursorTools, {
+        ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
+        server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
+      })
   const oneShotReminders = [
     modeReminder,
-    kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
+    hostPlanAgentNote,
   ].filter((part): part is string => !!part)
 
   // `systemPrompt` is the host system context composed for a seed Run (kept for
@@ -1487,6 +1485,7 @@ async function startSession(
   // CLI parity: echo the last conversation_checkpoint_update as conversation_state.
   // After compaction or an unsafe checkpoint reset there is no checkpoint —
   // seed a new Cursor conversation from OpenCode's authoritative history.
+  const cursorMode = getActiveCursorMode(sessionKey)
   const reqBytes = buildRunRequest({
     text: userText,
     images,
@@ -1501,6 +1500,7 @@ async function startSession(
     toolDescriptors,
     requestContext,
     action: resuming ? "resume" : "user",
+    mode: cursorAgentModeWireValue(cursorMode),
   })
   // Content hashes — Cursor content-addresses large payloads; logging these lets
   // us match a server get_blob_args.blob_id to what it wants served.
@@ -1537,7 +1537,7 @@ async function startSession(
     `outbound Run: model=${cursorModelId} opencodeModel=${modelId} ` +
       `conversationId=${conversationId} conversationGroupId=${conversationGroupId} ` +
       `params=${JSON.stringify(parameterValues ?? [])} ` +
-      `maxMode=${maxMode} systemPromptLen=${systemPrompt?.length ?? 0} ` +
+      `maxMode=${maxMode} cursorMode=${cursorMode ?? "-"} systemPromptLen=${systemPrompt?.length ?? 0} ` +
       `tools=${tools.length} incomingTools=${incomingTools.length} compaction=${isCompaction} ` +
       `hooks=${hooksCtx ? hooksCtx.split("\n").length : 0} ` +
       `availableModels=${_availableModels?.length ?? 0} userTextLen=${userText.length} ` +
@@ -1676,6 +1676,7 @@ async function startSession(
       toolDescriptors: session.toolDescriptors,
       requestContext: session.requestContext,
       action: "user",
+      mode: cursorAgentModeWireValue(getActiveCursorMode(session.openCodeSessionId)),
     })
     try {
       await writeWithBackpressure(next, reqBytes, "progress-only continuation Run")
@@ -1740,15 +1741,21 @@ export function isProperCatalogSubset(
 
 /**
  * An open parent Run for this OpenCode session whose catalog strictly contains
- * the incoming tools is treated as an in-session helper. Those calls must not
- * cancel/supersede the parent (that remints on the trailing tool result).
+ * the incoming tools is treated as an in-session helper unless the request
+ * carries a result for that parent's pending call. A result can precede a new
+ * user message or agent-change reminder and still needs to reach the parent.
+ * Helper calls must not cancel/supersede the parent.
  */
 export function shouldIsolateInSessionHelper(
   openCodeSessionId: string | undefined,
   incomingTools: ReadonlyArray<{ name?: string }>,
+  historicalResults: ExtractedToolResult[] = [],
 ): boolean {
   const prior = sessionManager.findOpenByOpenCodeSessionId(openCodeSessionId)
   if (!prior || prior.closed) return false
+  if (historicalResults.some(result =>
+    result.sessionId === prior.sessionId && prior.pending.has(result.execId),
+  )) return false
   return isProperCatalogSubset(incomingTools, prior.toolCatalog ?? [])
 }
 
@@ -1772,7 +1779,12 @@ export const FRESH_TURN_PENDING_CANCEL_REASON =
  */
 export async function preparePriorSessionForFreshTurn(
   openCodeSessionId: string | undefined,
-  opts?: { timeoutMs?: number },
+  opts?: {
+    timeoutMs?: number
+    /** Tool results already in this prompt; deliver any that match held pendings before cancel. */
+    toolResults?: ExtractedToolResult[]
+    hostAgent?: string
+  },
 ): Promise<"drained" | "settled-only" | "busy" | "none"> {
   const prior = sessionManager.findOpenByOpenCodeSessionId(openCodeSessionId)
   if (!prior) return "none"
@@ -1801,6 +1813,18 @@ export async function preparePriorSessionForFreshTurn(
   }
 
   if (prior.closed) return "none"
+
+  const historicalPending = (opts?.toolResults ?? []).filter(
+    (result) => result.sessionId === prior.sessionId && prior.pending.has(result.execId),
+  )
+  if (historicalPending.length > 0) {
+    trace(
+      `fresh turn: delivering ${historicalPending.length} historical tool result(s) ` +
+        `for pending exec(s) on prior session ${prior.sessionId}`,
+    )
+    deliverContinuationResults(prior, historicalPending, { hostAgent: opts?.hostAgent })
+    if (prior.closed) return "settled-only"
+  }
 
   const cancelled = cancelPendingExecsForFreshTurn(prior)
   if (cancelled > 0) {
@@ -1846,6 +1870,12 @@ export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
   for (const [execId, pending] of session.pending.entries()) {
     if (pending.bridged) continue
     if (pending.state !== "pending") continue
+    // Bridged interactions (CreatePlan / AskQuestion / SwitchMode) included:
+    // a host result already in the prompt was delivered before this cancel,
+    // so one still open here was abandoned by the host. Its error reply is a
+    // refusal with this reason, not an invented user answer. Leaving it open
+    // instead kept the old Run alive beside the new Run on the same
+    // conversation, with nothing left to close it.
     synthetic.push({
       toolCallId: `cursor_${session.sessionId}_${execId}`,
       sessionId: session.sessionId,
@@ -2071,8 +2101,18 @@ export async function drainSessionUntilTurnEnded(
         sessionManager.recordSemanticProgress(session)
         continue
       }
-      if (iu?.tool_call_started || iu?.tool_call_completed) {
-        // A new display tool needs host mediation — stop draining.
+      if (iu?.tool_call_completed) {
+        // Display close of a call Cursor already has its answer for (the
+        // result this drain just delivered, typically). Cursor does not wait
+        // on it, and its checkpoint and turn_ended follow; stopping here would
+        // supersede the Run and lose that turn. Its display mirror, if any,
+        // has no host consumer on this path.
+        sessionManager.recordSemanticProgress(session)
+        trace(`fresh turn drain: skipped display tool_call_completed sessionId=${session.sessionId}`)
+        continue
+      }
+      if (iu?.tool_call_started) {
+        // A new tool needs host mediation — stop draining.
         outcome = "busy"
         break
       }
@@ -2130,7 +2170,8 @@ function buildAskQuestionContinuationFrame(
  * user approved execution, `error` means the plan was written but not accepted,
  * so the model keeps planning instead of starting work.
  *
- * A host plan-stage tool reports that outcome as tool success/failure. The
+ * A host plan-stage tool reports that outcome as tool success/failure; the
+ * host `plan_exit` review approves by moving the session out of `plan`. The
  * emulated path asks through `question`, so only an explicit "Yes" approves.
  * On approval the session leaves plan mode, which arms the agent-mode
  * `<system_reminder>` for the next Run.
@@ -2138,9 +2179,9 @@ function buildAskQuestionContinuationFrame(
 function buildCreatePlanContinuationFrame(
   pending: PendingExec,
   result: ExtractedToolResult,
-  sessionKey: string | undefined,
-  cursorSessionID: string,
-): Uint8Array {
+  /** Host primary agent of the request carrying the host tool result. */
+  deliveryHostAgent?: string,
+): { frame: Uint8Array; approved: boolean; emulated: boolean } {
   const metadata = pending.resultMetadata ?? {}
   const interactionId = metadata.interactionId
   if (typeof interactionId !== "number") {
@@ -2151,60 +2192,47 @@ function buildCreatePlanContinuationFrame(
     throw new CursorProtocolError("Bridged CreatePlan lost its plan URI")
   }
 
-  const approved = metadata.createPlanBridgeKind === "approve"
+  // OpenCode's plan_exit approves by adding a `build` user message, so the turn
+  // that carries its result already runs outside `plan`; "No" fails the tool.
+  // Staying in `plan` means refine or dismiss, and plan_exit's output says so.
+  // A host plan-stage tool reports approval as tool success.
+  const hostExit = metadata.createPlanBridgeKind === "exit"
+  const emulated = metadata.createPlanBridgeKind === "approve"
+  const approved = emulated
     ? createPlanApproved(
         result.output,
         result.error !== undefined,
         typeof metadata.createPlanQuestion === "string" ? metadata.createPlanQuestion : "",
       )
-    : result.error === undefined
+    : hostExit
+      ? result.error === undefined && !!deliveryHostAgent && deliveryHostAgent !== "plan"
+      : result.error === undefined
+  if (emulated) {
+    trace(
+      `create_plan: emulated approval=${approved ? "yes" : "no"} outLen=${result.output.length}` +
+        (result.error !== undefined ? " error=true" : ""),
+    )
+  }
   if (!approved) {
-    const reason = result.error?.trim()
-    return buildCreatePlanInteractionReply(interactionId, {
-      error: { error: reason || CREATE_PLAN_NOT_APPROVED_REASON },
-      plan_uri: "",
-    })
-  }
-
-  // The question-emulated path can report execution approval only when a host
-  // kickoff exists. Otherwise keep planning mode active and return an error.
-  if (metadata.createPlanBridgeKind === "approve" && !hasPlanExecutionKickoff()) {
-    return buildCreatePlanInteractionReply(interactionId, {
-      error: { error: "The plan was approved, but this host cannot start its execution turn." },
-      plan_uri: planUri,
-    })
-  }
-
-  // Approved: planning is over for this plan, so drop the plan-mode reminder
-  // and hand the next Run the agent-mode contract, exactly as an approved
-  // plan_exit does.
-  setActiveCursorMode(sessionKey, "agent")
-
-  // Only the question-emulated path needs the provider's synthetic build turn.
-  // A host stage tool owns both approval and execution handoff itself.
-  if (metadata.createPlanBridgeKind === "approve" && sessionKey) {
-    const absolute =
-      typeof metadata.planPath === "string" && metadata.planPath.trim()
-        ? metadata.planPath.trim()
-        : planPathFromUri(planUri)
-    const workspaceRoot =
-      typeof metadata.workspaceRoot === "string" ? metadata.workspaceRoot : undefined
-    if (!queuePlanExecutionKickoff({
-      sessionID: sessionKey,
-      planPath: formatPlanKickoffPath(absolute, workspaceRoot),
-      cursorSessionID,
-    })) {
-      return buildCreatePlanInteractionReply(interactionId, {
-        error: { error: "The plan was approved, but this host cannot start its execution turn." },
-        plan_uri: planUri,
-      })
+    const reason = result.error?.trim() || (hostExit ? result.output.trim() : "")
+    return {
+      frame: buildCreatePlanInteractionReply(interactionId, {
+        error: { error: reason || CREATE_PLAN_NOT_APPROVED_REASON },
+        plan_uri: "",
+      }),
+      approved: false,
+      emulated,
     }
   }
 
-  return buildCreatePlanInteractionReply(interactionId, {
-    success: {},
-    plan_uri: planUri,
-  })
+  return {
+    frame: buildCreatePlanInteractionReply(interactionId, {
+      success: {},
+      plan_uri: planUri,
+    }),
+    approved: true,
+    emulated,
+  }
 }
 
 function buildSwitchModeContinuationFrame(
@@ -2220,12 +2248,7 @@ function buildSwitchModeContinuationFrame(
   if (typeof interactionId !== "number") {
     throw new CursorProtocolError("Bridged SwitchMode lost its interaction id")
   }
-  // A question-emulated exit carries the user's Yes/No as prose, not a plan
-  // tool's success/failure, so it needs the answer parser rather than the
-  // error-shaped mapping.
-  const answer = metadata.switchModeBridgeKind === "question"
-    ? switchModeResultFromQuestionOutput(result.output, result.error !== undefined)
-    : switchModeResultFromToolOutput(result.output, result.error !== undefined)
+  const answer = switchModeResultFromToolOutput(result.output, result.error !== undefined)
   const target = "approved" in answer && typeof metadata.switchModeTarget === "string"
     ? metadata.switchModeTarget.trim()
     : ""
@@ -2241,9 +2264,19 @@ function buildSwitchModeContinuationFrame(
  * cleared). Returns undefined after closing the session when a write fails, so
  * the caller can rebase onto a fresh Run instead of pumping a dead stream.
  */
+/** Host primary agent of one request, as reported through provider options. */
+function hostAgentFromCallOptions(callOptions: LanguageModelV3CallOptions): string | undefined {
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  return typeof providerOptions?.[CURSOR_HOST_AGENT_OPTION] === "string"
+    ? String(providerOptions[CURSOR_HOST_AGENT_OPTION]).trim() || undefined
+    : undefined
+}
+
 export function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
+  /** Host primary agent of the request that carries these results. */
+  delivery: { hostAgent?: string } = {},
 ): CursorSession | undefined {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -2269,6 +2302,7 @@ export function deliverContinuationResults(
     const pending = claim.pending
     let frames: Uint8Array[] = []
     let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
+    let deliveredCreatePlan: { approved: boolean; emulated: boolean } | undefined
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
       // choices; translate them back into the Cursor result the interaction is
@@ -2301,12 +2335,13 @@ export function deliverContinuationResults(
       }
     } else if (pending.resultField === CREATE_PLAN_RESULT_FIELD) {
       try {
-        frames = [buildCreatePlanContinuationFrame(
+        const built = buildCreatePlanContinuationFrame(
           pending,
           r,
-          session.openCodeSessionId,
-          session.sessionId,
-        )]
+          delivery.hostAgent,
+        )
+        frames = [built.frame]
+        deliveredCreatePlan = built
       } catch (error) {
         trace(`continuation: create_plan encode FAILED execId=${r.execId} err=${(error as Error).message}`)
         sessionManager.close(session, "result-write-failed")
@@ -2426,15 +2461,22 @@ export function deliverContinuationResults(
       setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
         bridgedPlanEntered: normalized === "plan" || normalized === "spec",
       })
-      // A question-emulated exit has no native host plan tool to perform the
-      // actual primary-agent switch. Queue only after Cursor received the
-      // approved response; a failed write must not mutate host mode.
-      if (deliveredSwitchMode.bridgeKind === "question" && session.openCodeSessionId) {
-        queueHostAgentModeSwitch({
+    }
+    if (deliveredCreatePlan?.approved) {
+      setActiveCursorMode(session.openCodeSessionId, "agent")
+      if (deliveredCreatePlan.emulated && session.openCodeSessionId) {
+        const queued = queueHostAgentModeSwitch({
           sessionID: session.openCodeSessionId,
-          targetModeID: deliveredSwitchMode.target,
+          targetModeID: "agent",
           cursorSessionID: session.sessionId,
+          hostAgent: "plan",
         })
+        if (!queued) {
+          trace(
+            `create_plan: approved but no native host-agent switch accepted sessionID=` +
+              `${session.openCodeSessionId}; the host must start the build turn`,
+          )
+        }
       }
     }
     // A directly called advertised plan-stage tool can own the same review
@@ -2689,6 +2731,10 @@ export async function pump(
   let textStarted = false
   let reasoningStarted = false
   let assistantText = ""
+  /** A tool or interaction came after the last text: start new text as a new paragraph. */
+  let textBreakPending = false
+  /** Text of a tool-less turn, held until its answer is known (see `emitText`). */
+  let toollessText = ""
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
   const replaySafety = new AttemptReplaySafety(session.sessionId)
@@ -2951,8 +2997,36 @@ export async function pump(
     textStarted = false
   }
 
+  /**
+   * Cursor shows text on either side of a tool call or interaction as
+   * separate blocks. In one host text part they would run together
+   * ("…the change.Recording…", or a plan heading glued to a sentence).
+   */
+  const withParagraphBreak = (before: string, text: string): string => {
+    const broken = textBreakPending && before && !/\n\s*$/.test(before) && !/^\s*\n/.test(text)
+    textBreakPending = false
+    return broken ? `\n\n${text}` : text
+  }
   const emitText = (text: string) => {
     if (!text) return
+    // A tool-less turn (title, summary, compaction) answers with text only,
+    // but Cursor still narrates and tries tools first; those calls are refused.
+    // Hold its text so the narration before a refused call can be dropped and
+    // only the answer reaches the host (a title is the first line of it).
+    if (!session.allowTools) {
+      toollessText += withParagraphBreak(toollessText, text)
+      return
+    }
+    emitVisibleText(text)
+  }
+  const flushToollessText = () => {
+    if (!toollessText) return
+    const text = toollessText
+    toollessText = ""
+    emitVisibleText(text)
+  }
+  const emitVisibleText = (input: string) => {
+    const text = withParagraphBreak(assistantText, input)
     assistantText += text
     replaySafety.markBarrier("visible-text")
     // Close reasoning before text (hosts expect reasoning-end before text-start).
@@ -2983,6 +3057,7 @@ export async function pump(
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
   ) => {
+    flushToollessText()
     closeOpenSpans()
     const est = session.usageEstimate
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
@@ -3232,6 +3307,10 @@ export async function pump(
       )
     }
 
+    if (iu?.tool_call_started || iu?.tool_call_completed || iu?.step_completed || interactionQuery || esm) {
+      textBreakPending = true
+    }
+
     try {
     // CLI: conversationCheckpointUpdate → replace agentStore conversation state.
     // Store opaque bytes keyed by conversation_id; next Run echoes them.
@@ -3366,10 +3445,16 @@ export async function pump(
         } else {
           const display = parseDisplayToolCall(callId, toolCall, session.mirroredTodos)
           const advertised = advertisedToolNamesFromDescriptors(session.toolDescriptors)
-          const bridged = display
+          // A deferred CreatePlan recorded nothing: mirroring its todos would
+          // overwrite the host's list with a plan that does not exist.
+          const deferredPlan = display?.variant === "create_plan_tool_call"
+            && session.deferredCreatePlanCalls?.delete(callId) === true
+          const bridged = display && !deferredPlan
             ? resolveBridgedOpenCodeToolCall(display, advertised, session.hostToolDialect)
             : undefined
-          if (!display) {
+          if (deferredPlan) {
+            trace(`display tool_call_completed: deferred create_plan not mirrored callId=${callId}`)
+          } else if (!display) {
             const callIdLog = callId.replace(/\r?\n/g, "\\n")
             // AgentServerMessage.interaction_update(1).tool_call_completed(3).tool_call(2)
             const toolBytes = extractProtobufSubmessage(payload, [1, 3, 2])
@@ -3384,8 +3469,17 @@ export async function pump(
             // GetMcpTools / GetDynamicTools is executed by Cursor after mcp_state;
             // large catalogs then spill through write_args. Not a missing host tool.
             if (isNativeDisplayToolCall(display.variant)) {
+              const lookup = (toolCall as { get_mcp_tools_tool_call?: Record<string, any> })
+                .get_mcp_tools_tool_call
+              const lookupArgs = lookup?.args ?? {}
+              const found = lookup?.result?.success
               trace(
                 `display tool_call_completed: native ${display.preferredToolName} callId=${callId} ` +
+                  `server=${JSON.stringify(lookupArgs.server ?? "")} ` +
+                  `tool_name=${JSON.stringify(lookupArgs.tool_name ?? "")} ` +
+                  `pattern=${JSON.stringify(lookupArgs.pattern ?? "")} ` +
+                  `contentLen=${typeof found?.content === "string" ? found.content.length : 0} ` +
+                  `spilled=${typeof found?.output_file_path === "string" && found.output_file_path !== ""} ` +
                   `(server-side catalog; spill uses write_args)`,
               )
             } else {
@@ -3607,6 +3701,10 @@ export async function pump(
           if (!session.allowTools) {
             const reason = "Tool calls are not available during this turn (summary/compaction)."
             if (!await rejectExec(parsed, reason, "allowTools=false")) return
+            if (toollessText) {
+              trace(`exec: dropped ${toollessText.length} chars of tool-less narration before refused id=${parsed.id}`)
+              toollessText = ""
+            }
             continue
           }
           // Cursor writes a generated image with an ordinary write exec whose
@@ -3621,6 +3719,18 @@ export async function pump(
                 "This OpenCode agent cannot write binary file content. "
                 + "Do not retry this write with the same bytes."
               if (!await rejectExec(parsed, reason, "binary write unsupported")) return
+              continue
+            }
+            const permittedForImage = session.permittedToolNames
+            if (
+              permittedForImage
+              && permittedForImage.size > 0
+              && !permittedForImage.has(CURSOR_IMAGE_SAVE_TOOL)
+            ) {
+              const reason =
+                "This OpenCode agent cannot write binary file content on this turn. "
+                + "Do not retry this write with the same bytes."
+              if (!await rejectExec(parsed, reason, "binary write not permitted")) return
               continue
             }
             const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
@@ -3827,7 +3937,12 @@ export async function pump(
               && isBridgedCursorPlanModeActive(session.openCodeSessionId)
               && advertisedToolNameSet.has(CURSOR_PLAN_STAGE_TOOL)
               && advertisedToolNameSet.has("write"),
+            hostPlanEntryPending: isHostPlanEntryPending(session.openCodeSessionId),
             planModeActive: isCursorPlanModeActive(session.openCodeSessionId),
+            ...(hostPlanFileFor(session.openCodeSessionId)
+              ? { hostPlanFile: hostPlanFileFor(session.openCodeSessionId)! }
+              : {}),
+            ...(session.hostAgent ? { hostAgent: session.hostAgent } : {}),
             ...(getActiveCursorMode(session.openCodeSessionId)
               ? { activeCursorModeId: getActiveCursorMode(session.openCodeSessionId)! }
               : {}),
@@ -3858,6 +3973,9 @@ export async function pump(
         // any outcome (acknowledged/approved/bridged) via presence, not kind.
         if (handled.createPlan && session.cacheDiagnostics) {
           session.cacheDiagnostics.createPlanInTurn = true
+        }
+        if (handled.deferredCreatePlanToolCallId) {
+          ;(session.deferredCreatePlanCalls ??= new Set()).add(handled.deferredCreatePlanToolCallId)
         }
         if (handled.switchMode && session.cacheDiagnostics) {
           session.cacheDiagnostics.switchModeInTurn = true
@@ -3927,6 +4045,7 @@ export async function pump(
             sessionID: session.openCodeSessionId,
             targetModeID: sw.args.targetModeId,
             cursorSessionID: session.sessionId,
+            ...(session.hostAgent ? { hostAgent: session.hostAgent } : {}),
           })
           : false
         trace(
@@ -3939,8 +4058,8 @@ export async function pump(
       }
       if (handled.outcome === "bridged" && handled.switchMode) {
         // Cursor raised SwitchMode; the host owns the outcome, so the switch
-        // leaves as a tool call (native plan_enter / plan_exit, or the emulated
-        // `question` approval prompt) and this doStream ends. The Run stays open
+        // leaves as a tool call (the host's plan_enter / plan_exit) and this
+        // doStream ends. The Run stays open
         // on the pending entry; approved/rejected is written back on the next
         // continuation while Cursor is still blocking on the query.
         const sw = handled.switchMode
@@ -3961,9 +4080,7 @@ export async function pump(
           },
         )
         const toolCallId = `cursor_${session.sessionId}_${execId}`
-        const input = JSON.stringify(
-          sw.bridge.kind === "question" ? sw.bridge.input : switchModeToolInput(),
-        )
+        const input = JSON.stringify(switchModeToolInput())
         trace(
           `interaction_query: BRIDGED switch_mode id=${handled.id} toolCallId=${toolCallId} ` +
             `bridge=${bridgeKind} hostTool=${toolName} ` +
@@ -3982,9 +4099,9 @@ export async function pump(
         return
       }
       if (handled.outcome === "bridged" && handled.createPlan) {
-        // Either a host plan-stage tool (writes the plan and runs its own
-        // approval UI) or the emulated prompt after the provider already wrote
-        // the plan. Both hold Cursor's query open until the user decides.
+        // A host plan-stage tool, the host plan_exit review of the plan the
+        // provider already wrote, or the emulated `question` prompt after that
+        // write. All hold Cursor's query open until the host answers.
         const plan = handled.createPlan
         const staged = plan.bridge.kind === "stage" ? createPlanStageInput(plan.args) : undefined
         const planUri = staged?.plan_uri ?? plan.planUri ?? ""
@@ -4000,14 +4117,11 @@ export async function pump(
             interactionId: handled.id,
             createPlanToolCallId: plan.toolCallId,
             createPlanBridgeKind: plan.bridge.kind,
-            // The host echoes the prompt verbatim; it anchors the answer parse.
             createPlanQuestion: plan.questionInput?.questions[0]?.question ?? "",
             planUri,
-            // Absolute path for the post-Yes OpenCode kickoff (plan_exit shape).
             ...(typeof plan.planPath === "string" && plan.planPath.trim()
               ? { planPath: plan.planPath.trim() }
               : {}),
-            workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
           },
         )
         const stageToolCallId = `cursor_${session.sessionId}_${stageExecId}`
@@ -4018,7 +4132,7 @@ export async function pump(
         )
         // Cursor sends the plan body through the interaction query, not the
         // text stream, so nothing has shown it yet. Put it in the transcript
-        // before asking — approving a plan you cannot read is not approval.
+        // before the host review — approving a plan you cannot read is not approval.
         if (plan.planReview) emitText(plan.planReview)
         emittedHostTools++
         closeOpenSpans()
@@ -4136,13 +4250,20 @@ function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): Extra
  */
 // OpenCode 2.x appends these host notes after the tool results of a step:
 // mid-turn system updates (skill / MCP availability changes) are lowered to a
-// user message wrapping `<system-update>`, and tool-result media is re-sent as
-// a user message starting with this caption.
+// user message wrapping `<system-update>`, plan-agent guidance uses
+// `<system-reminder>`, and tool-result media is re-sent as a user message
+// starting with this caption.
 const SYSTEM_UPDATE_OPEN = "<system-update>"
 const SYSTEM_UPDATE_CLOSE = "</system-update>"
+const SYSTEM_REMINDER_OPEN = "<system-reminder>"
+const SYSTEM_REMINDER_CLOSE = "</system-reminder>"
 const TOOL_MEDIA_CAPTION = "Attached media from tool result:"
 
 type HostTailNote = { text?: string }
+
+function wrappedHostNote(text: string, open: string, close: string): boolean {
+  return text.startsWith(open) && text.endsWith(close)
+}
 
 function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): HostTailNote | undefined {
   if (message.role === "system") return { text: message.content }
@@ -4150,12 +4271,25 @@ function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): Ho
   const [first] = message.content
   if (first?.type === "text" && first.text === TOOL_MEDIA_CAPTION) return {}
   const texts: string[] = []
+  let append = false
+  let reminderOnly = false
   for (const part of message.content) {
     if (part.type !== "text") return undefined
     const text = part.text.trim()
-    if (!text.startsWith(SYSTEM_UPDATE_OPEN) || !text.endsWith(SYSTEM_UPDATE_CLOSE)) return undefined
-    texts.push(text)
+    if (wrappedHostNote(text, SYSTEM_UPDATE_OPEN, SYSTEM_UPDATE_CLOSE)) {
+      texts.push(text)
+      append = true
+      continue
+    }
+    if (wrappedHostNote(text, SYSTEM_REMINDER_OPEN, SYSTEM_REMINDER_CLOSE)) {
+      reminderOnly = true
+      continue
+    }
+    return undefined
   }
+  // Plan-mode reminders must not ride onto the tool result: they would tell
+  // Cursor to keep planning after the user already approved execution.
+  if (!append) return reminderOnly ? {} : undefined
   return { text: texts.join("\n") }
 }
 
@@ -4297,11 +4431,27 @@ export function buildOpenCodeInteractionGuidance(
   instructions.push(
     names.has("cursor_plan_stage")
       ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until that tool returns success. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete."
-      : "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally; the provider writes the plan under the host's calculated plans directory and handles execution approval. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete.",
+      : names.has("question")
+        ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally. The provider records the plan, then asks through the OpenCode `question` tool whether to switch to the build agent and start implementing. Wait for that answer. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete."
+        : "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally; the provider records the plan where the host keeps plans, and the host decides when it is executed (without a host review, the user switches to the build agent). Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete.",
   )
   if (names.has("plan_enter")) {
     instructions.push(
       "- To enter plan mode, call the OpenCode `plan_enter` tool. Cursor-native SwitchMode requests for plan/spec are also accepted and answered through it.",
+    )
+  } else {
+    // Without `plan_enter`, SwitchMode is the only way in. It is a Cursor-native
+    // tool, never listed in the OpenCode catalog or Cursor's dynamic namespace,
+    // so say so or the model looks it up there and concludes it is missing.
+    const hostSwitch = hostAgentModeSwitchKind()
+    instructions.push(
+      "- To enter plan mode, call the Cursor-native SwitchMode tool with target_mode_id `plan`. " +
+        "It is not in the OpenCode list or the `cursor` GetDynamicTools namespace; call it directly." +
+        (hostSwitch === "resumes"
+          ? " OpenCode moves the session to its `plan` agent when this turn ends and continues there: end the turn after the switch and record the plan with CreatePlan in that plan turn."
+          : hostSwitch === "next-turn"
+            ? " After SwitchMode, record the plan with CreatePlan in this same turn; OpenCode only moves the session to its `plan` agent when the turn ends and will not start a later plan turn to record it. CreatePlan then asks whether to switch to the build agent and start implementing."
+            : ""),
     )
   }
   if (names.has("plan_exit")) {
@@ -4647,6 +4797,7 @@ export async function refreshHeldSessionToolCatalog(
   callOptions: LanguageModelV3CallOptions,
 ): Promise<void> {
   const sessionKey = session.openCodeSessionId
+  const previousAdvertised = session.toolCatalog?.length ?? 0
   const incomingTools = extractTools(callOptions)
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
@@ -4700,6 +4851,31 @@ export async function refreshHeldSessionToolCatalog(
       ? incomingTools.map((tool) => tool.name).filter((name): name is string => !!name)
       : [],
   )
+  // The live Run already sent RequestContext; do not rewrite it. Grow the
+  // conversation overlay so the next user-turn Run reuses those bytes instead
+  // of rebuilding when MCP tools appeared on a continuation.
+  const conversationId = session.conversationId
+  const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+  if (
+    conversationId
+    && workspaceRoot
+    && cursorTools.length > previousAdvertised
+    && getFrozenRequestContext(conversationId)
+  ) {
+    const mergedConfig = {
+      mcp: Object.fromEntries((session.knownMcpServers ?? []).map((id) => [id, {}])),
+    } as OpencodeJson
+    await getOrBuildRequestContext(conversationId, {
+      workspaceRoot,
+      tools: cursorTools,
+      conversationId,
+      mergedConfig,
+    })
+    trace(
+      `request_context: held-run overlay grown conversationId=${conversationId} ` +
+        `tools=${previousAdvertised}→${cursorTools.length}`,
+    )
+  }
 }
 
 function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[] {
@@ -4876,6 +5052,7 @@ export function resetTurnStateForTests(): void {
   promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
   resetContextEpochsForTests()
+  resetFrozenRequestContextsForTests()
 }
 
 function extractUserText(lastUser: Record<string, unknown> | undefined): string {

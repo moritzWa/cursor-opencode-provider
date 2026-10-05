@@ -1926,7 +1926,7 @@ describe("unwrapReadOutput", () => {
 
   it("never throws on non-string / empty input", () => {
     expect(unwrapReadOutput("" as string)).toBe("")
-    expect(unwrapReadOutput(undefined as unknown as string)).toBe(undefined)
+    expect(unwrapReadOutput(undefined as unknown as string)).toBeUndefined()
   })
 
   it("strips an OpenCode 2 file page down to raw lines", () => {
@@ -3347,7 +3347,7 @@ describe("exec safety net (unmapped variants)", () => {
       s.tools.map((t) => t.tool_name),
     )
     expect(names).toContain("ab_secret")
-    expect(frozen.tools.map((t: { tool_name: string }) => t.tool_name)).not.toContain("ab_secret")
+    expect(frozen.tools.map((t) => t.tool_name)).not.toContain("ab_secret")
   })
 
   it("answers exec #36 with the aliased names the RequestContext advertises", () => {

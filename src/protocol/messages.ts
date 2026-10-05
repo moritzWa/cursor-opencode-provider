@@ -1581,10 +1581,24 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "selected_images", type: "SelectedImage", repeated: true },
   ])
 
+  // agent.v1.AgentMode — the client's current mode, sent on every user message.
+  root.add(new protobuf.Enum("AgentMode", {
+    AGENT_MODE_UNSPECIFIED: 0,
+    AGENT_MODE_AGENT: 1,
+    AGENT_MODE_ASK: 2,
+    AGENT_MODE_PLAN: 3,
+    AGENT_MODE_DEBUG: 4,
+    AGENT_MODE_TRIAGE: 5,
+    AGENT_MODE_PROJECT: 6,
+    AGENT_MODE_MULTITASK: 7,
+    AGENT_MODE_CUSTOM: 8,
+  }))
+
   addType(root, "UserMessage", [
     { id: 1, name: "text", type: "string" },
     { id: 2, name: "message_id", type: "string" },
     { id: 3, name: "selected_context", type: "SelectedContext" },
+    { id: 4, name: "mode", type: "AgentMode" },
   ])
 
   // RequestContext — UserMessageAction #2. Slim mcp_meta_tool_options names

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test"
+import { describe, it, expect, afterEach } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
   buildOpenCodeInteractionGuidance,
@@ -7,6 +7,7 @@ import {
   groundCheckpointTurnText,
 } from "../src/language-model.js"
 import { buildSeedConversationState } from "../src/protocol/request.js"
+import { resetHostAgentModeSwitchForTests, setHostAgentModeSwitch } from "../src/host-agent-mode.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 
 describe("estimateTokens", () => {
@@ -36,6 +37,33 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("Emit the actual tool call")
     expect(guidance).not.toContain("`plan_enter`")
     expect(guidance).not.toContain("`webfetch`")
+  })
+
+  describe("plan entry without plan_enter", () => {
+    afterEach(() => resetHostAgentModeSwitchForTests())
+    const tools = [{ name: "question" }, { name: "read" }]
+
+    it("names SwitchMode as the direct way in", () => {
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("call the Cursor-native SwitchMode tool with target_mode_id `plan`")
+      expect(guidance).toContain("not in the OpenCode list or the `cursor` GetDynamicTools namespace")
+      expect(guidance).not.toContain("moves the session to its `plan` agent")
+    })
+
+    it("says the plan agent continues the turn when the host switch resumes it", () => {
+      setHostAgentModeSwitch(() => {}, { resumesTurn: true })
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("moves the session to its `plan` agent when this turn ends and continues there")
+    })
+
+    it("records CreatePlan in the SwitchMode turn when the host only switches agents", () => {
+      setHostAgentModeSwitch(() => {})
+      const guidance = buildOpenCodeInteractionGuidance(tools, false, "/workspace/project")!
+      expect(guidance).toContain("record the plan with CreatePlan in this same turn")
+      expect(guidance).toContain("will not start a later plan turn")
+      expect(guidance).not.toContain("end the turn after the switch")
+      expect(guidance).not.toContain("the next turn runs under the plan agent")
+    })
   })
 
   it("tells a staged plan to follow the host approval call", () => {
