@@ -10,7 +10,7 @@ import {
   normalizeAgentRunOrigin,
   type BidiStream,
 } from "./transport/connect.js"
-import { trace, traceRequestContextPaths } from "./debug.js"
+import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
 import { buildRunRequest, buildHeartbeat } from "./protocol/request.js"
@@ -203,7 +203,7 @@ import {
   consumeCursorShellResult,
   registerCursorShellCall,
 } from "./shell-timeout.js"
-import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
+import { analyzeReplayFrame, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
   cursorUsageCountersFromTurnEnded,
@@ -216,6 +216,9 @@ import {
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "./usage.js"
+
+/** Unknown frame layouts already traced in this process; each is logged once. */
+const unknownFrameLayouts = new Set<string>()
 
 let _availableModels: ModelInfo[] | undefined
 // mtime of the cache file the last time we loaded it. Compared on each call
@@ -2096,8 +2099,16 @@ export async function drainSessionUntilTurnEnded(
         continue
       }
 
-      // Text/thinking/heartbeat/partial display updates can be ignored while draining.
-      if (iu?.text_delta || iu?.thinking_delta || iu?.heartbeat || iu?.partial_tool_call || iu?.step_started || iu?.step_completed) {
+      // The model is answering in a Run the host no longer reads: that output
+      // would never be shown, and the new Run produces it again. Give up at
+      // once instead of paying for (and waiting on) an invisible answer; only
+      // the control tail of a turn that is already ending is worth draining.
+      if (iu?.text_delta || iu?.thinking_delta || iu?.partial_tool_call) {
+        trace(`fresh turn drain: model output resumed sessionId=${session.sessionId}`)
+        outcome = "busy"
+        break
+      }
+      if (iu?.heartbeat || iu?.step_started || iu?.step_completed) {
         sessionManager.recordSemanticProgress(session)
         continue
       }
@@ -3291,6 +3302,13 @@ export async function pump(
     if (replayFrame.semanticProgress) {
       sessionManager.recordSemanticProgress(session)
     }
+    if (replayFrame.barrier === "unknown-or-malformed-frame" && isDebugEnabled()) {
+      const layout = describeFrameLayout(payload)
+      if (!unknownFrameLayouts.has(layout)) {
+        unknownFrameLayouts.add(layout)
+        trace(`replay frame unknown: layout=${layout} bytes=${payload.length}`)
+      }
+    }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
@@ -4032,10 +4050,11 @@ export async function pump(
         return
       }
       if (handled.outcome === "approved" && handled.switchMode) {
-        // Entering plan mode without a host plan tool: Cursor was already
-        // released with approved{} above, and the behavioural contract travels
-        // as the <system_reminder> injected on subsequent Runs. Nothing is
-        // pending, so keep pumping this Run rather than ending doStream.
+        // Approved without a host tool (entering plan without one, the mode
+        // already in effect, or leaving a plan the host does not own): Cursor
+        // was already released with approved{} above, and the behavioural
+        // contract travels as the <system_reminder> injected on subsequent
+        // Runs. Nothing is pending, so keep pumping this Run.
         const sw = handled.switchMode
         setActiveCursorMode(session.openCodeSessionId, sw.args.targetModeId, {
           bridgedPlanEntered: false,
@@ -4050,7 +4069,7 @@ export async function pump(
           : false
         trace(
           `interaction_query: APPROVED switch_mode id=${handled.id} ` +
-            `target=${JSON.stringify(sw.args.targetModeId)} (no host plan tool; ` +
+            `target=${JSON.stringify(sw.args.targetModeId)} (approved without a host tool; ` +
             `${hostAgentSwitchQueued ? "native host-agent switch queued" : "provider-owned fallback"}) ` +
             `cursorToolCallId=${sw.toolCallId || "(none)"}`,
         )

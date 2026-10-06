@@ -275,6 +275,22 @@ describe("in-session helper catalog isolation", () => {
     expect(parent.closed).toBe(true)
   })
 
+  it("stops draining as soon as the model answers in the abandoned Run", async () => {
+    // Live: a delivered helper result made Cursor write its whole answer in
+    // the old Run for ~8 s before the drain gave up; nobody could see it.
+    let reads = 0
+    const answer = encodeMessage("AgentServerMessage", {
+      interaction_update: { text_delta: { text: "Reply continue to run steps 8–10." } },
+    })
+    const session = fakeSessionWithPayloads([answer, answer, turnEndedPayload(100, 80)])
+    const next = session.frames.next.bind(session.frames)
+    session.frames = { next: async () => { reads++; return next() } } as never
+    expect(await drainSessionUntilTurnEnded(session, { timeoutMs: 1_000 })).toBe("busy")
+    expect(reads).toBe(1)
+    expect(session.closed).toBe(false)
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
   it("stops draining when Cursor starts a new tool", async () => {
     const startDisplay = encodeMessage("AgentServerMessage", {
       interaction_update: {

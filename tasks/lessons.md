@@ -1,5 +1,35 @@
 # Lessons
 
+- A diagnostic must apply the same bounds as the value it checks.
+  `occupancyValidationCounters` used the prior checkpoint size as the cached
+  prefix unclamped; the usage builder clamps it to the input. When Cursor's
+  context shrank (26,823 → 26,766) the validator reported `status=mismatch`
+  (`rawCachedRatio=100.2%`) for correct usage.
+
+- A strict wire classifier must follow the extracted proto, not only the
+  fields it was written against. `KvServerMessage` carries
+  `span_context` (#4); `validKvWire` counted it as a second variant, so every
+  live Run hit `replay barrier: reason=unknown-or-malformed-frame` on its
+  first KV frame and lost automatic retry. The exec analyzer already skipped
+  its own `span_context` (#19). When a barrier fires on every Run, read the
+  frame against `agent.proto` before trusting the label.
+- Same class, next run: `InteractionUpdate` members `thinking_completed` #5
+  and `token_delta` #8 were not in the classifier's set, and
+  `ThinkingDeltaUpdate.thinking_style` #2 failed the one-field check. After
+  the KV fix they became the first barrier after every continuation write.
+  Admit only documented members that carry no output or state; keep the rest
+  as barriers.
+- The extracted proto can lag the live server: after that fix, 7-byte
+  `interaction_update` frames right after each tool-result write still
+  failed, and no declared member matched. Guessing field numbers wasted a
+  round. Debug runs now trace `replay frame unknown: layout=…` (field numbers
+  and wire types only) once per layout; read that before changing the set.
+- The layout trace resolved it in one run: `InteractionUpdate`
+  `message_started_at_ms` #25 beside the oneof, `tool_requests_listed` #27,
+  `tool_call_delta` #15, and top-level `AgentServerMessage.ttft_breakdown` #8.
+  The installed Cursor CLI bundle (`index.js`, `"InteractionUpdate|…"`
+  descriptors) has the current schema; the extracted agent.proto does not.
+
 - TurnEnded on a held Run is cumulative across every tool step, but the host
   finish only spans the last generation slice. Emitting `output_tokens` /
   `reasoning_tokens` there made Kilo tok/s (`(output+reasoning)/elapsed`) hit

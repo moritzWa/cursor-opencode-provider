@@ -221,6 +221,18 @@ describe("occupancyUsageFromTokenDetails", () => {
     expect(validation).toContain("opencodeProjectedTotal=153744")
   })
 
+  it("validates ok when Cursor's context shrank since the prior checkpoint", () => {
+    // Live: prior checkpoint 26,823 tokens, current 26,766.
+    const details = { usedTokens: 26_766, maxTokens: 256_000 }
+    const prior = { usedTokens: 26_823, maxTokens: 256_000 }
+    const usage = occupancyUsageFromTokenDetails(details, prior)
+    expect(usage.inputTokens?.total).toBe(26_765)
+    expect(usage.inputTokens?.cacheRead).toBe(26_765)
+    const validation = formatTurnUsageValidation(occupancyValidationCounters(details, prior), usage, details, "checkpoint-current-run")
+    expect(validation).toContain("status=ok")
+    expect(validation).toContain("cacheRatioMatch=true")
+  })
+
   it("still totals usedTokens when no prior occupancy is known", () => {
     const usage = occupancyUsageFromTokenDetails({ usedTokens: 40, maxTokens: 256_000 })
     expect(usage.outputTokens?.total).toBe(1)

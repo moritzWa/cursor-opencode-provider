@@ -16,7 +16,7 @@
 - On OpenCode 2.0, an approved plan starts implementing and plans land in the Plan directory even after the plugin is set up for several locations or reloaded; before, disposing an older setup removed the newer one's agent switch and the session stopped after approval
 - Assistant text before and after a tool call or plan review is separated into paragraphs instead of running together, so a shown plan's heading renders
 - Session titles and summaries contain only the model's answer, not its narration before tools it could not use
-- A new message that arrives with a plan approval or plan-mode switch no longer discards the Cursor turn that raised it
+- A new message that arrives with a plan approval or plan-mode switch no longer discards the Cursor turn that raised it, and one that arrives while Cursor is still answering no longer waits for that unseen answer before starting over
 - A new message sent while a plan review, question, or mode switch is still open declines it instead of leaving the earlier Cursor run open
 - A pending tool result in a new message reaches its Cursor run before helper detection, so the conversation is kept even when the tool catalog shrank
 - Approving a plan is not undone by plan-mode reminders the host appends after the answer, and a failed approval delivery no longer changes the mode or starts implementing
@@ -25,6 +25,8 @@
 - Where OpenCode offers no `plan_enter`, the model is told to enter plan mode with Cursor's SwitchMode directly instead of concluding plan mode is unavailable
 - With a host plan-stage tool, plan mode is kept while the host still advertises `plan_enter`
 - After MCP tools appear mid-turn, the next user message reuses RequestContext instead of rebuilding it
+- A Cursor run that fails before showing any output can be retried automatically again: timing, tracing, and progress fields Cursor now sends on ordinary updates no longer mark every run unsafe to retry
+- The debug log's turn usage validation no longer reports `status=mismatch` when Cursor's context shrinks between steps
 
 ## [0.8.0] - 2026-10-04
 

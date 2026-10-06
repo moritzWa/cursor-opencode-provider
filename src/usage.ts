@@ -362,7 +362,9 @@ export function occupancyValidationCounters(
   return {
     inputTokens: used,
     outputTokens: used > 0 ? 1 : 0,
-    cacheRead: Math.max(0, Math.trunc(prior?.usedTokens ?? 0)),
+    // Cursor can shrink the context between checkpoints; the prior prefix
+    // cannot be larger than what is in context now.
+    cacheRead: Math.min(used, Math.max(0, Math.trunc(prior?.usedTokens ?? 0))),
     cacheWrite: 0,
     reasoningTokens: 0,
   }
