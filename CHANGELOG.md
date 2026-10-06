@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A slow or failed health-check ping on the shared Cursor connection no longer aborts other chats streaming on it with "automatic retry unsafe"
+- A slow or failed health-check ping on the shared Cursor connection no longer aborts other chats streaming on it with "automatic retry unsafe" ([#47](https://github.com/oakimov/cursor-opencode-provider/pull/47) by [@moritzWa](https://github.com/moritzWa))
 
 ## [0.8.0] - 2026-10-04
 
