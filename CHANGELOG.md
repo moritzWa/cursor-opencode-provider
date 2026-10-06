@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A slow or failed health-check ping on the shared Cursor connection no longer aborts other chats streaming on it with "automatic retry unsafe"
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
