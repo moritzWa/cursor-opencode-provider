@@ -397,7 +397,7 @@ function retryDelayMs(error: CursorProviderError, attempt: number, policy: Curso
 }
 
 /** How long a turn waits for Cursor to become reachable again before failing. */
-export const OFFLINE_RETRY_WINDOW_MS = 30 * 60_000
+export const OFFLINE_RETRY_WINDOW_MS = 6 * 60 * 60_000
 
 const CONNECTIVITY_ERROR_CODES = new Set([
   "ENOTFOUND",
