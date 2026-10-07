@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test"
-import { MAX_SEMANTIC_WAIT_MS, SessionManager, type CursorSession } from "../src/session.js"
+import { GENERATION_IDLE_MS, MAX_SEMANTIC_WAIT_MS, SessionManager, type CursorSession } from "../src/session.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
 
@@ -76,6 +76,20 @@ describe("SessionManager", () => {
     expect(s.semanticDeadlineAt).toBe(now + 40 * 60_000 + idle)
     mgr.allowSemanticWait(s, 3 * 24 * 60 * 60_000)
     expect(s.semanticDeadlineAt).toBe(now + MAX_SEMANTIC_WAIT_MS + idle)
+  })
+
+  it("allows a long silence after model output and the normal budget after anything else", () => {
+    let now = 1_000
+    const mgr = new SessionManager({ now: () => now })
+    const s = fakeSession()
+    mgr.registerSession(s)
+    mgr.recordSemanticProgress(s, undefined, true)
+    expect(s.semanticDeadlineAt).toBe(now + GENERATION_IDLE_MS)
+    expect(s.semanticIdleWindowMs).toBe(GENERATION_IDLE_MS)
+    now += 5_000
+    mgr.recordSemanticProgress(s)
+    expect(s.semanticDeadlineAt).toBe(now + s.policy.semanticIdleMs)
+    expect(s.semanticIdleWindowMs).toBe(s.policy.semanticIdleMs)
   })
 
   it("keeps a server-side wait through progress frames until the wait ends", () => {

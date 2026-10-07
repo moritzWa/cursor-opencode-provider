@@ -568,21 +568,38 @@ describe("interrupted Cursor Run handling", () => {
   })
 
   it("counts streamed tool arguments and step boundaries as progress", () => {
-    for (const update of [
-      { partial_tool_call: { call_id: "c", args_text_delta: "{\"content\":\"…" } },
-      { step_started: { step_id: 1 } },
-      { step_completed: { step_id: 1 } },
-    ]) {
+    for (const [update, modelOutput] of [
+      [{ partial_tool_call: { call_id: "c", args_text_delta: "{\"content\":\"…" } }, true],
+      [{ step_started: { step_id: 1 } }, false],
+      [{ step_completed: { step_id: 1 } }, false],
+    ] as const) {
       const message = { interaction_update: update }
       const payload = encodeMessage("AgentServerMessage", message)
       const decoded = decodeMessage<any>("AgentServerMessage", payload)
       const analysis = analyzeReplayFrame(payload, { interactionUpdate: decoded.interaction_update })
-      expect(analysis).toEqual({ semanticProgress: true, barrier: undefined })
+      expect(analysis).toEqual({ semanticProgress: true, modelOutput, barrier: undefined })
     }
     const heartbeat = encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })
     expect(analyzeReplayFrame(heartbeat, {
       interactionUpdate: decodeMessage<any>("AgentServerMessage", heartbeat).interaction_update,
     }).semanticProgress).toBe(false)
+  })
+
+  it("treats token counts and text as model output, not checkpoints or heartbeats", () => {
+    // InteractionUpdate.token_delta { tokens: 2 }, as captured from a live Run.
+    const tokenDelta = Uint8Array.from([0x0a, 0x04, 0x42, 0x02, 0x08, 0x02])
+    const decodedToken = decodeMessage<any>("AgentServerMessage", tokenDelta)
+    expect(analyzeReplayFrame(tokenDelta, { interactionUpdate: decodedToken.interaction_update }).modelOutput).toBe(true)
+    const text = encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "Writing" } } })
+    expect(analyzeReplayFrame(text, {
+      interactionUpdate: decodeMessage<any>("AgentServerMessage", text).interaction_update,
+    }).modelOutput).toBe(true)
+    const heartbeat = encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })
+    expect(analyzeReplayFrame(heartbeat, {
+      interactionUpdate: decodeMessage<any>("AgentServerMessage", heartbeat).interaction_update,
+    }).modelOutput).toBe(false)
+    expect(analyzeReplayFrame(Uint8Array.from([0x1a, 0x01, 0x00]), { checkpointBytes: Uint8Array.from([0]) }))
+      .toMatchObject({ semanticProgress: true, modelOutput: false })
   })
 
   it("seeds interrupted text for rebases and notes it on replays", () => {

@@ -36,6 +36,12 @@ export const DEFAULT_CONTINUATION_POLICY: Readonly<CursorContinuationPolicy> = {
 const MAX_TIMER_MS = 2_147_483_647
 /** Longest server-side wait honored before the idle budget applies again. */
 export const MAX_SEMANTIC_WAIT_MS = 24 * 60 * 60_000
+/**
+ * Idle window after model output. Cursor buffers a tool call until the model
+ * has generated all of it and sends only heartbeats meanwhile, so a large
+ * `write` is silent for minutes (30 KB measured at ~100 s).
+ */
+export const GENERATION_IDLE_MS = 20 * 60_000
 const DEFAULT_TOMBSTONE_TTL_MS = 15 * 60_000
 const DEFAULT_TOMBSTONE_LIMIT = 1_024
 // Well below Cursor's server-side concurrent-Run ceiling per HTTP/2 connection,
@@ -321,6 +327,8 @@ export type CursorSession = {
   semanticDeadlineAt: number
   /** Floor under semanticDeadlineAt while Cursor runs a server-side Await. */
   semanticWaitUntil?: number
+  /** Idle window armed by the latest progress frame. */
+  semanticIdleWindowMs?: number
   closeError: CursorProviderError | null
   closed: boolean
   reopenWithUserMessage?: (text: string) => Promise<void>
@@ -523,11 +531,15 @@ export class SessionManager {
     }
   }
 
-  recordSemanticProgress(session: CursorSession, at?: number): void {
+  recordSemanticProgress(session: CursorSession, at?: number, generating = false): void {
     if (session.closed) return
     const now = at ?? this.now()
+    const window = generating
+      ? Math.max(session.policy.semanticIdleMs, GENERATION_IDLE_MS)
+      : session.policy.semanticIdleMs
     session.lastInboundAt = now
-    session.semanticDeadlineAt = Math.max(now + session.policy.semanticIdleMs, session.semanticWaitUntil ?? 0)
+    session.semanticIdleWindowMs = window
+    session.semanticDeadlineAt = Math.max(now + window, session.semanticWaitUntil ?? 0)
   }
 
   /**
