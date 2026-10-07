@@ -41,8 +41,13 @@ export type DecodedReplayFrame = {
 
 export type ReplayFrameAnalysis = {
   semanticProgress: boolean
+  /** The model is mid-generation, so a long silence can be a buffered tool call. */
+  modelOutput: boolean
   barrier?: ReplayBarrierReason
 }
+
+/** InteractionUpdate.token_delta: a token count Cursor sends while the model generates. */
+const TOKEN_DELTA_FIELD = 8
 
 // Field numbers follow Cursor CLI 2026.09.28 `agent.v1`; the extracted
 // agent.proto lags the live server.
@@ -218,6 +223,17 @@ export function analyzeReplayFrame(
 
   return {
     semanticProgress: hasSemanticProgress(decoded),
+    modelOutput: hasModelOutput(topLevel, decoded),
     barrier,
   }
+}
+
+function hasModelOutput(topLevel: StrictRawField | undefined, decoded: DecodedReplayFrame): boolean {
+  const update = decoded.interactionUpdate
+  const text = (update?.text_delta as Record<string, unknown> | undefined)?.text
+  const thinking = (update?.thinking_delta as Record<string, unknown> | undefined)?.text
+  return (typeof text === "string" && text.length > 0)
+    || (typeof thinking === "string" && thinking.length > 0)
+    || !!update?.partial_tool_call
+    || nestedFields(topLevel, 1).some((field) => field.fn === TOKEN_DELTA_FIELD)
 }

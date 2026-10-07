@@ -2766,7 +2766,7 @@ async function nextFrameWithSemanticDeadline(
   const remainingMs = session.semanticDeadlineAt - Date.now()
   if (remainingMs <= 0) {
     throw new CursorTransportError(
-      `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
+      `Cursor semantic-progress timeout after ${session.semanticIdleWindowMs ?? session.policy.semanticIdleMs}ms`,
       { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
     )
   }
@@ -2777,7 +2777,7 @@ async function nextFrameWithSemanticDeadline(
     timer = setTimeout(() => {
       reject(
         new CursorTransportError(
-          `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
+          `Cursor semantic-progress timeout after ${session.semanticIdleWindowMs ?? session.policy.semanticIdleMs}ms`,
           { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
         ),
       )
@@ -3660,8 +3660,8 @@ async function pumpFrames(
       interactionQuery,
       checkpointBytes: checkpointProgress,
     })
-    if (replayFrame.semanticProgress) {
-      sessionManager.recordSemanticProgress(session)
+    if (replayFrame.semanticProgress || replayFrame.modelOutput) {
+      sessionManager.recordSemanticProgress(session, undefined, replayFrame.modelOutput)
     }
     if (replayFrame.barrier === "unknown-or-malformed-frame" && isDebugEnabled()) {
       const layout = describeFrameLayout(payload)
