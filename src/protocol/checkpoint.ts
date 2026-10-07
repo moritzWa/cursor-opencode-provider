@@ -14,7 +14,7 @@ const byConversationId = new Map<string, Uint8Array>()
 export function setCheckpoint(conversationId: string, bytes: Uint8Array): void {
   if (!conversationId || bytes.length === 0) return
   // Copy so later mutations of the decode buffer can't corrupt the store.
-  byConversationId.set(conversationId, Uint8Array.from(bytes))
+  byConversationId.set(conversationId, new Uint8Array(bytes))
 }
 
 /** Last checkpoint for this conversation, if any. */

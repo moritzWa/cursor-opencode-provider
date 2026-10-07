@@ -34,6 +34,8 @@ export const DEFAULT_CONTINUATION_POLICY: Readonly<CursorContinuationPolicy> = {
 }
 
 const MAX_TIMER_MS = 2_147_483_647
+/** Longest server-side wait honored before the idle budget applies again. */
+export const MAX_SEMANTIC_WAIT_MS = 24 * 60 * 60_000
 const DEFAULT_TOMBSTONE_TTL_MS = 15 * 60_000
 const DEFAULT_TOMBSTONE_LIMIT = 1_024
 // Well below Cursor's server-side concurrent-Run ceiling per HTTP/2 connection,
@@ -253,6 +255,12 @@ export type CursorSession = {
    * lets the pump expose the final mutation to OpenCode as a targeted edit.
    */
   editToolCalls?: Map<string, { path: string; completeRead?: boolean }>
+  /**
+   * Content hashes of the images this Run attached as `selected_images`.
+   * Cursor writes each attachment into the project `assets/` folder; those
+   * writes are the provider's own bookkeeping, not model output.
+   */
+  attachedImageHashes?: ReadonlySet<string>
   /** Monotonic synthetic exec ids for bridged (display-only) OpenCode tool calls. */
   nextBridgedExecId: number
   /** KV blob store: blob_id (hex) → data, for Cursor's out-of-band payload channel. */
@@ -311,6 +319,8 @@ export type CursorSession = {
   lastInboundAt: number
   lastHeartbeatWriteAt: number
   semanticDeadlineAt: number
+  /** Floor under semanticDeadlineAt while Cursor runs a server-side Await. */
+  semanticWaitUntil?: number
   closeError: CursorProviderError | null
   closed: boolean
   reopenWithUserMessage?: (text: string) => Promise<void>
@@ -517,7 +527,27 @@ export class SessionManager {
     if (session.closed) return
     const now = at ?? this.now()
     session.lastInboundAt = now
-    session.semanticDeadlineAt = now + session.policy.semanticIdleMs
+    session.semanticDeadlineAt = Math.max(now + session.policy.semanticIdleMs, session.semanticWaitUntil ?? 0)
+  }
+
+  /**
+   * Allow `waitMs` of silence on top of the idle budget, for work Cursor does
+   * on its own side without streaming anything (a native Await the model sized
+   * itself, e.g. a 40-minute build). Other progress frames during the wait do
+   * not shorten it; endSemanticWait does once the Await completes.
+   */
+  allowSemanticWait(session: CursorSession, waitMs: number): void {
+    if (session.closed) return
+    const wait = Math.min(Math.max(0, waitMs), MAX_SEMANTIC_WAIT_MS)
+    const until = this.now() + wait + session.policy.semanticIdleMs
+    session.semanticWaitUntil = Math.max(until, session.semanticWaitUntil ?? 0)
+    if (until > session.semanticDeadlineAt) session.semanticDeadlineAt = until
+  }
+
+  endSemanticWait(session: CursorSession): void {
+    if (session.semanticWaitUntil === undefined) return
+    session.semanticWaitUntil = undefined
+    this.recordSemanticProgress(session)
   }
 
   recordHeartbeatWrite(session: CursorSession): void {

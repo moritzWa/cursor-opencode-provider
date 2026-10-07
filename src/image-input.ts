@@ -52,7 +52,7 @@ function decodeBase64(value: string): Uint8Array {
   if (!normalized || !/^[A-Za-z0-9+/_-]*={0,2}$/.test(normalized)) {
     return unsupported("image input", "Cursor provider received invalid base64 image data")
   }
-  const data = Uint8Array.from(Buffer.from(normalized, "base64"))
+  const data = new Uint8Array(Buffer.from(normalized, "base64"))
   if (data.length === 0) {
     return unsupported("image input", "Cursor provider received an empty image")
   }
@@ -124,7 +124,7 @@ function cursorImageBudget(value: number): number {
   return Math.min(MAX_CURSOR_IMAGE_INPUT_BYTES, Math.max(0, Math.floor(value)))
 }
 
-function imageContentHash(data: Uint8Array): string {
+export function imageContentHash(data: Uint8Array): string {
   return createHash("sha256").update(data).digest("hex")
 }
 
@@ -171,7 +171,7 @@ async function resolveImageData(
   remaining: number,
   signal?: AbortSignal,
 ): Promise<{ data: Uint8Array; mimeType?: string; filename?: string }> {
-  if (value instanceof Uint8Array) return { data: Uint8Array.from(value) }
+  if (value instanceof Uint8Array) return { data: new Uint8Array(value) }
   if (typeof value === "string") {
     return value.startsWith("data:") ? decodeDataUrl(value) : { data: decodeBase64(value) }
   }
@@ -180,7 +180,7 @@ async function resolveImageData(
     const filePath = fileURLToPath(value)
     const info = await stat(filePath)
     assertImageSize(info.size, remaining)
-    return { data: Uint8Array.from(await readFile(filePath)), filename: path.basename(filePath) }
+    return { data: new Uint8Array(await readFile(filePath)), filename: path.basename(filePath) }
   }
   if (value.protocol !== "http:" && value.protocol !== "https:") {
     return unsupported(

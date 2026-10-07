@@ -43,7 +43,7 @@ export function setConversationBlob(
 ): string {
   const key = hex(blobId)
   // Copy so decode buffers can't mutate the store later.
-  bucket(conversationId).set(key, Uint8Array.from(blobData))
+  bucket(conversationId).set(key, new Uint8Array(blobData))
   return key
 }
 
@@ -120,7 +120,7 @@ export function inspectConversationBlobGraph(
 export function snapshotConversationBlobs(conversationId: string): ConversationBlobSnapshot[] {
   return [...(byConversation.get(conversationId) ?? [])].map(([id, data]) => ({
     id,
-    data: Uint8Array.from(data),
+    data: new Uint8Array(data),
   }))
 }
 
@@ -184,7 +184,7 @@ export function restoreConversationBlobs(
   const restored = new Map<string, Uint8Array>()
   for (const blob of blobs) {
     if (!/^(?:[0-9a-f]{2})+$/i.test(blob.id)) continue
-    restored.set(blob.id.toLowerCase(), Uint8Array.from(blob.data))
+    restored.set(blob.id.toLowerCase(), new Uint8Array(blob.data))
   }
   if (restored.size > 0) byConversation.set(conversationId, restored)
   else byConversation.delete(conversationId)

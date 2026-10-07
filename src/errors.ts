@@ -31,6 +31,11 @@ export class CursorProviderError extends Error {
    * Recovery must reseed a new conversation instead of resuming that checkpoint.
    */
   checkpointUnusable?: boolean
+  /**
+   * Assistant text the failed attempt already streamed to the host. Recovery
+   * shows it to the model so the next Run continues instead of repeating it.
+   */
+  partialText?: string
   readonly statusCode?: number
   readonly grpcStatus?: number | string
   readonly rstCode?: number

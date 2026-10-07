@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
 import { chmod, link, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises"
-import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib"
+import { promisify } from "node:util"
+import { constants as zlibConstants, gunzip, gzipSync } from "node:zlib"
 import protobuf from "protobufjs"
 import {
   CONVERSATION_CACHE_DIR,
@@ -80,8 +81,8 @@ export function conversationCacheFilePath(cacheDir: string, sessionKey: string):
 function cloneConversation(value: PersistedConversation): PersistedConversation {
   return {
     ...value,
-    checkpoint: value.checkpoint ? Uint8Array.from(value.checkpoint) : undefined,
-    blobs: value.blobs.map((blob) => ({ id: blob.id, data: Uint8Array.from(blob.data) })),
+    checkpoint: value.checkpoint ? new Uint8Array(value.checkpoint) : undefined,
+    blobs: value.blobs.map((blob) => ({ id: blob.id, data: new Uint8Array(blob.data) })),
     requestContext: structuredClone(value.requestContext),
     toolCatalog: structuredClone(value.toolCatalog),
     postCompactionRebase: value.postCompactionRebase,
@@ -137,7 +138,7 @@ function readBlob(encoded: Uint8Array): ConversationBlobSnapshot {
     }
   }
   if (!id || id.length === 0 || !blobData) throw new Error("incomplete blob")
-  return { id: bytesToHex(id), data: Uint8Array.from(blobData) }
+  return { id: bytesToHex(id), data: new Uint8Array(blobData) }
 }
 
 function readTool(data: Uint8Array): OpencodeToolDef {
@@ -257,7 +258,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         break
       case 5:
         if (wireType !== 2) throw new Error("invalid checkpoint")
-        checkpoint = Uint8Array.from(reader.bytes())
+        checkpoint = new Uint8Array(reader.bytes())
         break
       case 6:
         if (wireType !== 2) throw new Error("invalid blob")
@@ -315,10 +316,15 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   }
 }
 
-function decodeCacheFile(compressed: Uint8Array, expectedSessionKey?: string): PersistedConversation | undefined {
+const gunzipAsync = promisify(gunzip)
+
+async function decodeCacheFile(
+  compressed: Uint8Array,
+  expectedSessionKey?: string,
+): Promise<PersistedConversation | undefined> {
   try {
     if (compressed.length > MAX_CONVERSATION_CACHE_BYTES) return undefined
-    const protobufBytes = gunzipSync(compressed, { maxOutputLength: MAX_CONVERSATION_CACHE_BYTES })
+    const protobufBytes = await gunzipAsync(compressed, { maxOutputLength: MAX_CONVERSATION_CACHE_BYTES })
     const conversation = decodeProtobuf(protobufBytes)
     if (expectedSessionKey && conversation.sessionKey !== expectedSessionKey) return undefined
     return conversation
@@ -336,7 +342,7 @@ async function readConversationFile(
   expectedSessionKey?: string,
 ): Promise<PersistedConversation | undefined> {
   try {
-    return decodeCacheFile(await readFile(filePath), expectedSessionKey)
+    return await decodeCacheFile(await readFile(filePath), expectedSessionKey)
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error
       ? (error as { code?: unknown }).code
@@ -351,7 +357,7 @@ async function readConversationFileWithStatus(
   expectedSessionKey?: string,
 ): Promise<PersistedConversationLoad> {
   try {
-    const value = decodeCacheFile(await readFile(filePath), expectedSessionKey)
+    const value = await decodeCacheFile(await readFile(filePath), expectedSessionKey)
     return value ? { status: "restored", value } : { status: "invalid" }
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error

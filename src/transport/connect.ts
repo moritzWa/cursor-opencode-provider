@@ -353,6 +353,7 @@ const CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_SESSION_PING_TIMEOUT_MS = 5_000
 const DEFAULT_READ_IDLE_MS = 120_000
 const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
+export const CURSOR_CONNECT_TIMEOUT_CODE = "CURSOR_CONNECT_TIMEOUT"
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
 
 export function shouldReuseHttp2Session(
@@ -577,7 +578,11 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       resolve(session)
     }
     const timer = setTimeout(() => {
-      fail(new CursorTransportError(`HTTP/2 connect to ${origin} timed out after ${CONNECT_TIMEOUT_MS}ms`))
+      fail(new CursorTransportError(`HTTP/2 connect to ${origin} timed out after ${CONNECT_TIMEOUT_MS}ms`, {
+        transient: true,
+        replaySafe: true,
+        code: CURSOR_CONNECT_TIMEOUT_CODE,
+      }))
     }, CONNECT_TIMEOUT_MS)
     timer.unref?.()
 
@@ -987,7 +992,7 @@ export async function bidiRunStream(
         const timer = setTimeout(() => {
           streamFailure ??= new CursorTransportError(
             `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
-            { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
+            { transient: true, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
           )
           finish(streamFailure)
           try { stream.destroy(streamFailure) } catch { /* already closing */ }
