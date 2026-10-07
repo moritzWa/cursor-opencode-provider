@@ -134,7 +134,7 @@ function cursorImageBudget(value: number): number {
   return Math.min(MAX_CURSOR_IMAGE_INPUT_BYTES, Math.max(0, Math.floor(value)))
 }
 
-function imageContentHash(data: Uint8Array): string {
+export function imageContentHash(data: Uint8Array): string {
   return createHash("sha256").update(data).digest("hex")
 }
 

@@ -19,6 +19,7 @@ import {
 } from "./parallel-step.js"
 import {
   bidiRunStream,
+  CURSOR_CONNECT_TIMEOUT_CODE,
   CursorRunInterruptedError,
   normalizeAgentRunOrigin,
   type BidiStream,
@@ -130,6 +131,7 @@ import {
   queueHostAgentModeSwitch,
 } from "./host-agent-mode.js"
 import {
+  CURSOR_IMAGE_ASSETS_DIR,
   CURSOR_IMAGE_SAVE_TOOL,
   imageMimeForPath,
   remapCursorImageWritePath,
@@ -156,6 +158,7 @@ import {
 import {
   beginEmittedStep,
   detectForeignHistory,
+  rebindTurnProvenance,
   recordEmittedPart,
   trackTurnProvenance,
   type ForeignHistoryReason,
@@ -185,7 +188,6 @@ import {
   CursorTransportError,
   isRejectedCredentialError,
   isTransientGrpcStatus,
-  retrySuppressedError,
   toCursorProviderError,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
@@ -220,6 +222,7 @@ import {
   assertCursorUserImageSupport,
   extractCursorPromptImages,
   extractCursorToolResultImages,
+  imageContentHash,
   MAX_CURSOR_IMAGE_INPUT_BYTES,
   type CursorImageInput,
 } from "./image-input.js"
@@ -391,6 +394,33 @@ function retryDelayMs(error: CursorProviderError, attempt: number, policy: Curso
   if (error.retryAfterMs !== undefined) return Math.min(MAX_RETRY_DELAY_MS, error.retryAfterMs)
   const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, attempt - 1))
   return Math.floor(Math.random() * ceiling)
+}
+
+/** How long a turn waits for Cursor to become reachable again before failing. */
+export const OFFLINE_RETRY_WINDOW_MS = 30 * 60_000
+
+const CONNECTIVITY_ERROR_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "ETIMEDOUT",
+  // Bun's fetch reports DNS and connect failures with these names.
+  "ConnectionRefused",
+  "ConnectionClosed",
+  "FailedToOpenSocket",
+  CURSOR_CONNECT_TIMEOUT_CODE,
+  "CURSOR_AGENT_URL_TIMEOUT",
+  "CURSOR_PROXY_CONNECT_FAILED",
+])
+
+/** True when the failure means Cursor could not be reached at all. */
+export function isConnectivityFailure(error: CursorProviderError): boolean {
+  return error.origin === "transport" && !!error.code && CONNECTIVITY_ERROR_CODES.has(error.code)
 }
 
 function sleepForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
@@ -930,6 +960,7 @@ export async function pumpWithRecovery(input: {
    * not count against the transient-failure budget.
    */
   renewRejectedCredential?: () => void
+  offlineRetryWindowMs?: number
 }): Promise<CursorSession> {
   let session = input.initialSession
   const retryPolicy = input.retryPolicy ?? {
@@ -938,19 +969,12 @@ export async function pumpWithRecovery(input: {
   }
   const maxRecoveries = retryPolicy.maxAttempts - 1
   let credentialRenewed = false
+  // Text earlier failed attempts of this turn streamed to the host. It is not
+  // in the host prompt yet, so recovery must hand it to the model itself.
+  let interruptedText = ""
   input.onSession?.(session)
 
-  const reopen = async (pumpedSession: CursorSession, failure: CursorProviderError) => {
-    const checkpoint = pumpedSession.resumeCheckpoint
-    const recovery: CursorRunRecovery = failure.checkpointUnusable
-      ? { kind: "rebase", reason: "checkpoint-unusable" }
-      : checkpoint
-        ? {
-            kind: "resume",
-            conversationId: pumpedSession.conversationId,
-            checkpoint: Uint8Array.from(checkpoint),
-          }
-        : { kind: "rebase" }
+  const reopen = async (pumpedSession: CursorSession, recovery: CursorRunRecovery) => {
     const next = await input.recover(recovery)
     if (recovery.kind === "resume") {
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -995,32 +1019,60 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
-        session = await reopen(pumpedSession, failure)
+        session = await reopen(pumpedSession, recoveryAfterFailure(pumpedSession, failure, interruptedText))
         attempt--
         continue
       }
       if (!failure.transient) throw failure
-      const checkpoint = pumpedSession.resumeCheckpoint
-      if (!failure.replaySafe && !checkpoint) {
-        throw retrySuppressedError(
-          failure,
-          "after visible output or stateful server activity",
-          attempt + 1,
-          maxRecoveries + 1,
-        )
-      }
       if (attempt >= maxRecoveries) {
         throw new CursorRetryExhaustedError(attempt + 1, failure)
       }
+      interruptedText += failure.partialText ?? ""
+      const recovery = recoveryAfterFailure(pumpedSession, failure, interruptedText)
+      // Cursor's checkpoint carries its own record of the turn.
+      if (recovery.kind === "resume") interruptedText = ""
       trace(
         `Run interrupted: sessionId=${pumpedSession.sessionId} attempt=${attempt + 1}/${maxRecoveries} ` +
-          `err=${failure.message} — ${checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"}`,
+          `replaySafe=${failure.replaySafe} err=${failure.message} — ${describeRecovery(recovery)}`,
       )
       sessionManager.close(pumpedSession, "remote-error", failure)
-      const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
-      trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
-      await sleepForRetry(delayMs, input.abortSignal)
-      session = await reopen(pumpedSession, failure)
+      let lastFailure = failure
+      let offlineSince: number | undefined
+      let offlineRetries = 0
+      for (;;) {
+        const delayMs = retryDelayMs(lastFailure, attempt + 1 + offlineRetries, retryPolicy)
+        trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
+        await sleepForRetry(delayMs, input.abortSignal)
+        try {
+          session = await reopen(pumpedSession, recovery)
+          break
+        } catch (error) {
+          // Opening the replacement Run is an attempt of its own: a network
+          // blip that outlasts one reconnect must not end the turn early.
+          const openFailure = toCursorProviderError(error, {
+            replaySafe: true,
+            fallback: "Cursor Run reopen failed",
+          })
+          if (!openFailure.transient) throw openFailure
+          lastFailure = openFailure
+          // No Run was opened, so nothing was replayed: an outage only delays
+          // the turn. Wait for the network instead of spending the budget.
+          if (isConnectivityFailure(openFailure)) {
+            offlineSince ??= Date.now()
+            if (Date.now() - offlineSince < (input.offlineRetryWindowMs ?? OFFLINE_RETRY_WINDOW_MS)) {
+              offlineRetries++
+              trace(
+                `Run reopen offline: offlineMs=${Date.now() - offlineSince} ` +
+                  `code=${openFailure.code} err=${openFailure.message}`,
+              )
+              continue
+            }
+          }
+          attempt++
+          if (attempt >= maxRecoveries) throw new CursorRetryExhaustedError(attempt + 1, openFailure)
+          trace(`Run reopen failed: attempt=${attempt + 1}/${maxRecoveries} err=${openFailure.message}`)
+        }
+      }
     } finally {
       // Cancellation cleanup inside pump() must keep an active owner alive.
       // Retry after releasing this owner so a stopped consumer with no pending
@@ -1033,9 +1085,51 @@ export async function pumpWithRecovery(input: {
   }
 }
 
+/**
+ * How to reopen an interrupted Run:
+ * - resume: continue the conversation from Cursor's newest checkpoint;
+ * - replay: resend the same user turn on the same checkpoint (the Run failed
+ *   in its first step, before Cursor checkpointed anything newer);
+ * - rebase: seed a new conversation from the host history.
+ * `interruptedText` is assistant text the host already showed; replay and
+ * rebase give it to the model so it continues instead of starting over.
+ */
 export type CursorRunRecovery =
-  | { kind: "rebase"; reason?: "checkpoint-unusable" }
+  | { kind: "rebase"; reason?: "checkpoint-unusable"; interruptedText?: string }
+  | { kind: "replay"; interruptedText?: string }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
+
+export function recoveryAfterFailure(
+  session: CursorSession,
+  failure: CursorProviderError,
+  interruptedText: string,
+): CursorRunRecovery {
+  if (failure.checkpointUnusable) return { kind: "rebase", reason: "checkpoint-unusable" }
+  const checkpoint = session.resumeCheckpoint
+  if (checkpoint) {
+    return {
+      kind: "resume",
+      conversationId: session.conversationId,
+      checkpoint: new Uint8Array(checkpoint),
+    }
+  }
+  const text = interruptedText ? { interruptedText } : {}
+  // Only the first step of a turn opened on a stored checkpoint can be resent
+  // as is; later steps carry tool results Cursor never checkpointed.
+  if (session.checkpointRebaseEligible === true && session.cacheDiagnostics?.pumpPasses === 1) {
+    return { kind: "replay", ...text }
+  }
+  return { kind: "rebase", ...text }
+}
+
+function describeRecovery(recovery: CursorRunRecovery): string {
+  const carried = recovery.kind !== "resume" && recovery.interruptedText
+    ? ` with ${recovery.interruptedText.length} chars of interrupted text`
+    : ""
+  if (recovery.kind === "resume") return `resuming ${recovery.checkpoint.length}B checkpoint`
+  if (recovery.kind === "replay") return `replaying the turn on its checkpoint${carried}`
+  return `rebasing fresh Run${carried}`
+}
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
 const heartbeatGenerationBySession = new WeakMap<CursorSession, number>()
@@ -1159,7 +1253,11 @@ async function startSession(
   }
   const allowTools = toolState.allowTools
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
-  let recovery = startOptions?.recovery
+  // A replay opens the turn exactly as the failed attempt did, plus a note.
+  const replay = startOptions?.recovery?.kind === "replay" ? startOptions.recovery : undefined
+  const recovery = startOptions?.recovery?.kind === "replay" ? undefined : startOptions?.recovery
+  const interruptedText = replay?.interruptedText
+    ?? (recovery?.kind === "rebase" ? recovery.interruptedText : undefined)
   let resumeRecovery = recovery?.kind === "resume" ? recovery : undefined
   let resuming = !!resumeRecovery
   const lifecycle = !allowTools && !isCompaction && !recovery
@@ -1201,8 +1299,9 @@ async function startSession(
   // Another model (other provider or a local model) answered since this
   // conversation's last checkpoint: resuming it would hide that work from Cursor.
   // A Cursor-to-Cursor model switch resumes the same conversation, as in the CLI.
+  // A replay already passed this check; its own interrupted text would now fail it.
   const foreignHistory: ForeignHistoryReason | undefined =
-    sessionKey && !resuming && !ephemeralRun && !resetState.reset && recovery?.kind !== "rebase"
+    sessionKey && !resuming && !ephemeralRun && !resetState.reset && recovery?.kind !== "rebase" && !replay
       ? detectForeignHistory({
           sessionKey,
           conversationId: peekConversationId(sessionKey),
@@ -1218,7 +1317,10 @@ async function startSession(
         reset: resetState.reset || recovery?.kind === "rebase" || !!foreignHistory,
         ephemeral: ephemeralRun,
       })
-  if (sessionKey && !ephemeralRun) trackTurnProvenance(sessionKey, bound.conversationId)
+  if (sessionKey && !ephemeralRun) {
+    if (recovery?.kind === "rebase") rebindTurnProvenance(sessionKey, bound.conversationId)
+    else trackTurnProvenance(sessionKey, bound.conversationId)
+  }
   let conversationState = ephemeralRun
     ? undefined
     : resuming
@@ -1261,7 +1363,10 @@ async function startSession(
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
   let userText = recovery?.kind === "rebase" && !checkpointUnusable
-    ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
+    ? interruptedText
+      ? "Your last reply above was cut off by a connection failure, and the user already saw it. " +
+        "Continue from exactly where it stopped: do not repeat that text or redo completed work."
+      : "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
@@ -1357,14 +1462,21 @@ async function startSession(
     // exists only in OpenCode history, never in a Cursor checkpoint.
     toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
   })
-
+  if (recovery?.kind === "rebase" && interruptedText) {
+    appendSeedHistory(history, "assistant", interruptedTextTail(interruptedText))
+  }
+  if (replay && interruptedText) {
+    userText = appendInterruptedReplyNote(userText, interruptedText)
+  }
+  // Explicit agent host overrides skip GetServerConfig but still go through the
+  // Cursor agent-host allowlist, before any network call.
+  const explicitAgentBaseUrl = resolveExplicitAgentBaseURL(options)
   await loadAvailableModels()
 
   // Resolve the region-specific Run stream origin once per process (memoized
-  // in agent-url.ts). Explicit agent host overrides skip GetServerConfig but
-  // still go through the Cursor agent-host allowlist.
+  // in agent-url.ts).
   const agentBaseUrl =
-    resolveExplicitAgentBaseURL(options) ??
+    explicitAgentBaseUrl ??
     (await resolveAgentUrl(token, {
       apiBaseURL: resolveApiBaseURL(options),
       telemetryEnabled: resolveTelemetryEnabled(options),
@@ -1400,7 +1512,7 @@ async function startSession(
           // history does not re-upload old screenshots. A recovery or
           // foreign-history rebase opens a new Cursor conversation, so it must
           // resend the same payload.
-          seenHistoryHashes: recovery?.kind === "rebase" || foreignHistory
+          seenHistoryHashes: recovery?.kind === "rebase" || foreignHistory || replay
             ? undefined
             : sentHistoryImageHashes(sessionKey),
           signal: callOptions.abortSignal,
@@ -1580,7 +1692,9 @@ async function startSession(
     runId,
     conversationId,
     cacheDir,
-    resumeCheckpoint: undefined,
+    // A resumed Run that fails before Cursor checkpoints again can resume the
+    // same checkpoint once more.
+    resumeCheckpoint: resuming && conversationState ? new Uint8Array(conversationState) : undefined,
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
     cacheDiagnostics: {
@@ -1616,6 +1730,7 @@ async function startSession(
     pending: new Map(),
     displayToolCalls: new Map(),
     editToolCalls: new Map(),
+    attachedImageHashes: new Set(images.map((image) => imageContentHash(image.data))),
     // Seed from the per-OpenCode-session copy: merges in this turn (and after
     // checkpoint resumes/rebases, which rebuild the session here) expand
     // against the last observed host list, not an empty one.
@@ -1996,7 +2111,7 @@ export async function drainSessionUntilTurnEnded(
         if (bytes && bytes.length > 0) {
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
-          session.resumeCheckpoint = Uint8Array.from(bytes)
+          session.resumeCheckpoint = new Uint8Array(bytes)
           const tokenDetails = decodeConversationTokenDetails(bytes)
           if (tokenDetails) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -2642,9 +2757,12 @@ async function writeWithBackpressureNow(
   }
 }
 
+const SEMANTIC_WAIT_ABORTED = Symbol("semantic-wait-aborted")
+
 async function nextFrameWithSemanticDeadline(
   session: CursorSession,
-): Promise<IteratorResult<Frame>> {
+  abortSignal?: AbortSignal,
+): Promise<IteratorResult<Frame> | typeof SEMANTIC_WAIT_ABORTED> {
   const remainingMs = session.semanticDeadlineAt - Date.now()
   if (remainingMs <= 0) {
     throw new CursorTransportError(
@@ -2674,10 +2792,22 @@ async function nextFrameWithSemanticDeadline(
       }),
     )
   }
+  // A server-side Await can hold the stream silent for hours; a user abort must
+  // not have to outlast it. Outside an Await, aborts are handled between frames
+  // because OpenCode also aborts after every tool-call step.
+  let onAbort: (() => void) | undefined
+  const aborted = abortSignal && session.semanticWaitUntil !== undefined
+    ? new Promise<typeof SEMANTIC_WAIT_ABORTED>((resolve) => {
+        onAbort = () => resolve(SEMANTIC_WAIT_ABORTED)
+        if (abortSignal.aborted) onAbort()
+        else abortSignal.addEventListener("abort", onAbort, { once: true })
+      })
+    : undefined
   try {
-    return await Promise.race([readSessionFrame(session), deadline])
+    return await Promise.race([readSessionFrame(session), deadline, ...(aborted ? [aborted] : [])])
   } finally {
     if (timer) clearTimeout(timer)
+    if (onAbort) abortSignal?.removeEventListener("abort", onAbort)
     session.semanticDeadlineCancel = null
   }
 }
@@ -2701,6 +2831,27 @@ export async function pump(
     reasoningId: string
   },
   abortSignal?: AbortSignal,
+): Promise<void> {
+  // Reply writes rethrow transport failures from deep inside frame handling;
+  // every one must still carry this attempt's replay barrier and shown text.
+  const attempt = { finalize: (failure: CursorProviderError) => failure }
+  try {
+    await pumpFrames(session, controller, ids, abortSignal, attempt)
+  } catch (error) {
+    if (error instanceof CursorProviderError) throw attempt.finalize(error)
+    throw error
+  }
+}
+
+async function pumpFrames(
+  session: CursorSession,
+  controller: ReadableStreamDefaultController<V3Part>,
+  ids: {
+    textId: string
+    reasoningId: string
+  },
+  abortSignal: AbortSignal | undefined,
+  attempt: { finalize: (failure: CursorProviderError) => CursorProviderError },
 ): Promise<void> {
   sessionManager.registerSession(session)
   const cacheDiagnostics = session.cacheDiagnostics ??= {
@@ -2728,7 +2879,10 @@ export async function pump(
     && cacheDiagnostics.pumpPasses === 1
   let blobMiss = false
   let onlyControlFrames = true
+  // Unlike assistantText, never reset: everything here is already on screen.
+  let streamedText = ""
   const finalizeFailure = (failure: CursorProviderError): CursorProviderError => {
+    if (streamedText) failure.partialText = streamedText
     if (checkpointRebaseCandidate && blobMiss && onlyControlFrames && failure.transient) {
       trace(
         `checkpoint unusable: Run failed after missing KV blobs before any output ` +
@@ -2758,6 +2912,7 @@ export async function pump(
   let emittedHostTools = 0
   let planHandoffCancellationRequested = false
   const replaySafety = new AttemptReplaySafety(session.sessionId)
+  attempt.finalize = finalizeFailure
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
     const error = new CursorProtocolError(message, { code })
@@ -2940,6 +3095,46 @@ export async function pump(
     clearParallelStep()
     emitFinish(undefined, { unified: "tool-calls", raw: undefined })
     return true
+  }
+
+  /**
+   * Cursor writes every `selected_images` attachment into `<project>/assets/`
+   * right after the Run opens. Surfacing that as a host tool call ends the step
+   * and makes the model re-read the image, so the bytes this provider attached
+   * are written into the provider-owned project folder and answered directly.
+   */
+  const persistAttachedImageWrite = async (
+    parsed: ParsedExecRequest,
+    binaryWrite: { path: string; data: Uint8Array },
+  ): Promise<boolean> => {
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    const projectDir = path.resolve(ensureOpencodeProjectDir(workspaceRoot))
+    const remapped = remapCursorImageWritePath(binaryWrite.path, { workspaceRoot, projectDir })
+    const relative = path.relative(projectDir, remapped)
+    const target = relative && !relative.startsWith("..") && !path.isAbsolute(relative)
+      ? remapped
+      : path.join(projectDir, CURSOR_IMAGE_ASSETS_DIR, path.basename(remapped))
+    try {
+      await fs.promises.mkdir(path.dirname(target), { recursive: true })
+      await fs.promises.writeFile(target, binaryWrite.data)
+    } catch (error) {
+      return rejectExec(parsed, `Failed to store attached image: ${(error as Error).message}`, "attached image write")
+    }
+    trace(
+      `exec: attached image write stored id=${parsed.id} ` +
+        `requested=${JSON.stringify(binaryWrite.path)} target=${JSON.stringify(target)} bytes=${binaryWrite.data.length}`,
+    )
+    return writeExecFrames(
+      [encodeMessage("AgentClientMessage", {
+        exec_client_message: {
+          id: parsed.id,
+          write_result: {
+            success: { path: target, lines_created: 0, file_size: binaryWrite.data.length },
+          },
+        },
+      })],
+      `attached image write id=${parsed.id}`,
+    )
   }
 
   /**
@@ -3150,6 +3345,7 @@ export async function pump(
   const emitVisibleText = (input: string) => {
     const text = withParagraphBreak(assistantText, input)
     assistantText += text
+    streamedText += text
     replaySafety.markBarrier("visible-text")
     // Close reasoning before text (hosts expect reasoning-end before text-start).
     if (reasoningStarted && !textStarted) {
@@ -3349,9 +3545,16 @@ export async function pump(
         }
         next = result
       } else {
-        next = session.pending.size === 0
-          ? await nextFrameWithSemanticDeadline(session)
+        const read = session.pending.size === 0
+          ? await nextFrameWithSemanticDeadline(session, abortSignal)
           : await readSessionFrame(session)
+        if (read === SEMANTIC_WAIT_ABORTED) {
+          trace(`pump: abortSignal aborted during server-side Await sessionId=${session.sessionId}`)
+          closeOpenSpans()
+          sessionManager.close(session, "ordinary-cleanup")
+          return
+        }
+        next = read
       }
     } catch (error) {
       closeOpenSpans()
@@ -3513,7 +3716,7 @@ export async function pump(
       if (bytes && bytes.length > 0) {
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
-        session.resumeCheckpoint = Uint8Array.from(bytes)
+        session.resumeCheckpoint = new Uint8Array(bytes)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
@@ -3612,6 +3815,15 @@ export async function pump(
           }
         }
         trace(`display tool_call_started: callId=${callIdLog} variant=${variant}${wireFields}`)
+        if (variant === "await_tool_call") {
+          // Cursor runs Await itself and streams nothing until it returns.
+          const awaitCall = toolCall.await_tool_call as Record<string, unknown> | undefined
+          const args = awaitCall?.args as Record<string, unknown> | undefined
+          const blockMs = Number(args?.block_until_ms ?? 0)
+          const waitMs = Number.isFinite(blockMs) && blockMs > 0 ? blockMs : session.policy.hardCapMs
+          sessionManager.allowSemanticWait(session, waitMs)
+          trace(`display await: allowing ${waitMs}ms of server-side wait callId=${callIdLog}`)
+        }
       }
     } else if (iu?.tool_call_completed) {
       const completed = iu.tool_call_completed as Record<string, unknown>
@@ -3625,6 +3837,9 @@ export async function pump(
         trace(`display tool_call_completed: ERROR variant=get_mcp_tools_tool_call callId=${JSON.stringify(callId)} error=${JSON.stringify(discoveryError)}`)
       }
       if (callId) session.editToolCalls?.delete(callId)
+      const completedCall = (completed.tool_call ?? session.displayToolCalls.get(callId)) as
+        Record<string, unknown> | undefined
+      if (completedCall?.await_tool_call) sessionManager.endSemanticWait(session)
       // If exec already claimed this call_id, display map entry is gone — skip.
       if (callId && session.priorParallelStepCallIds?.has(callId)) {
         session.displayToolCalls.delete(callId)
@@ -3940,6 +4155,10 @@ export async function pump(
           // string, so those bytes are staged and committed by the host tool
           // that can raise the `edit` permission before anything hits disk.
           const binaryWrite = binaryWritePayload(parsed)
+          if (binaryWrite && session.attachedImageHashes?.has(imageContentHash(binaryWrite.data))) {
+            if (!await persistAttachedImageWrite(parsed, binaryWrite)) return
+            continue
+          }
           if (binaryWrite) {
             if (!advertisedToolNameSet.has(CURSOR_IMAGE_SAVE_TOOL)) {
               const reason =
@@ -5150,6 +5369,23 @@ function extractAssistantHistoryText(msg: Record<string, unknown>): string {
     }
   }
   return texts.join("\n")
+}
+
+/** The end of an interrupted reply is what the model needs to pick up from. */
+const MAX_INTERRUPTED_TEXT_CHARS = 16_000
+
+export function interruptedTextTail(text: string): string {
+  return text.length > MAX_INTERRUPTED_TEXT_CHARS
+    ? `…${text.slice(-MAX_INTERRUPTED_TEXT_CHARS)}`
+    : text
+}
+
+/** Tell a replayed turn what its interrupted attempt already showed the user. */
+export function appendInterruptedReplyNote(userText: string, interruptedText: string): string {
+  return `${userText}\n\n<system_reminder>A previous attempt at replying to this message was cut off ` +
+    `by a connection failure after streaming the text below, which the user already saw. Continue from ` +
+    `exactly where it stopped: do not repeat that text, and do not redo work it describes as done.\n` +
+    `<interrupted_reply>\n${interruptedTextTail(interruptedText)}\n</interrupted_reply></system_reminder>`
 }
 
 function appendSeedHistory(

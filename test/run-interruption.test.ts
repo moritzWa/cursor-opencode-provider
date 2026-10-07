@@ -1,19 +1,24 @@
 import { describe, expect, it } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
+  appendInterruptedReplyNote,
   checkpointBlobGraphConcern,
   checkpointBlobGraphRequiresRebase,
+  type CursorRunRecovery,
   extractPromptHistory,
+  interruptedTextTail,
   MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
   pump,
   pumpWithRecovery,
+  recoveryAfterFailure,
   rememberMirroredTodos,
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { analyzeReplayFrame } from "../src/replay-safety.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorTransportError } from "../src/errors.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -472,26 +477,202 @@ describe("interrupted Cursor Run handling", () => {
     expect(recoveries).toBe(2)
   })
 
-  it("does not recover after visible output because replay could duplicate text", async () => {
-    let recoveries = 0
+  it("rebases after visible output with the text the host already showed", async () => {
+    const recoveries: CursorRunRecovery[] = []
     const parts: any[] = []
-    await expect(
-      pumpWithRecovery({
-        initialSession: fakeSession("partial", [
-          serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
-        ]),
-        controller: controller(parts),
-        recover: async () => {
-          recoveries++
-          return fakeSession("unused", [])
-        },
-      }),
-    ).rejects.toThrow("automatic retry unsafe")
-    expect(recoveries).toBe(0)
-    expect(parts.some((part) => part.type === "text-delta" && part.delta === "partial")).toBe(true)
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("partial", [
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+      ]),
+      controller: controller(parts),
+      retryPolicy: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return recoveries.length === 1
+          ? fakeSession("second", [serverFrame({ interaction_update: { text_delta: { text: " more" } } })])
+          : fakeSession("third", [
+              serverFrame({ interaction_update: { text_delta: { text: " done" } } }),
+              turnEnded(),
+            ])
+      },
+    })
+    expect(finalSession.sessionId).toBe("third")
+    // Each recovery carries everything shown so far, not only the last attempt.
+    expect(recoveries).toEqual([
+      { kind: "rebase", interruptedText: "partial" },
+      { kind: "rebase", interruptedText: "partial more" },
+    ])
+    expect(parts.filter((part) => part.type === "text-delta").map((part) => part.delta)).toEqual([
+      "partial",
+      " more",
+      " done",
+    ])
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
   })
 
-  it("replies to decoded KV requests with unknown fields, then suppresses replay", async () => {
+  it("replays a first step opened on a stored checkpoint instead of reseeding", async () => {
+    const interrupted = fakeSession("first-step", [
+      serverFrame({ interaction_update: { text_delta: { text: "Waiting on the build:" } } }),
+      serverFrame({ interaction_update: { tool_call_started: {
+        call_id: "await-1",
+        tool_call: { await_tool_call: { args: { block_until_ms: 1000 } } },
+      } } }),
+    ])
+    interrupted.checkpointRebaseEligible = true
+    const recoveries: CursorRunRecovery[] = []
+    await pumpWithRecovery({
+      initialSession: interrupted,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("replayed", [turnEnded()])
+      },
+    })
+    expect(recoveries).toEqual([{ kind: "replay", interruptedText: "Waiting on the build:" }])
+  })
+
+  it("holds a server-side Await open through progress frames until it completes", async () => {
+    const awaitCall = { await_tool_call: { args: { block_until_ms: 40 * 60_000 } } }
+    const waiting = fakeSession("awaiting", [
+      serverFrame({ interaction_update: { tool_call_started: { call_id: "await-1", tool_call: awaitCall } } }),
+      serverFrame({ interaction_update: { step_completed: {} } }),
+    ])
+    await pump(waiting, controller([]), { textId: "t", reasoningId: "r" }).catch(() => undefined)
+    expect(waiting.semanticDeadlineAt).toBeGreaterThan(Date.now() + 39 * 60_000)
+
+    const finished = fakeSession("awaited", [
+      serverFrame({ interaction_update: { tool_call_started: { call_id: "await-2", tool_call: awaitCall } } }),
+      serverFrame({ interaction_update: { tool_call_completed: { call_id: "await-2", tool_call: awaitCall } } }),
+    ])
+    await pump(finished, controller([]), { textId: "t", reasoningId: "r" }).catch(() => undefined)
+    expect(finished.semanticDeadlineAt).toBeLessThanOrEqual(Date.now() + finished.policy.semanticIdleMs)
+  })
+
+  it("stops a server-side Await as soon as the user aborts", async () => {
+    const awaitCall = { await_tool_call: { args: { block_until_ms: 24 * 60 * 60_000 } } }
+    const session = fakeSession("abort-await", [])
+    let served = false
+    session.frames = {
+      next: () => {
+        if (served) return new Promise<IteratorResult<Frame>>(() => {})
+        served = true
+        return Promise.resolve({
+          done: false,
+          value: serverFrame({ interaction_update: { tool_call_started: { call_id: "await-1", tool_call: awaitCall } } }),
+        })
+      },
+    } as CursorSession["frames"]
+    const abort = new AbortController()
+    setTimeout(() => abort.abort(), 20)
+    await pump(session, controller([]), { textId: "t", reasoningId: "r" }, abort.signal)
+    expect(session.closed).toBe(true)
+  })
+
+  it("rebases a later step of a held Run that has no checkpoint", () => {
+    const session = fakeSession("held", [])
+    session.checkpointRebaseEligible = true
+    session.cacheDiagnostics = { pumpPasses: 2 } as CursorSession["cacheDiagnostics"]
+    const failure = new CursorRunInterruptedError()
+    expect(recoveryAfterFailure(session, failure, "shown")).toEqual({ kind: "rebase", interruptedText: "shown" })
+    session.resumeCheckpoint = Uint8Array.of(1)
+    expect(recoveryAfterFailure(session, failure, "shown")).toMatchObject({ kind: "resume" })
+  })
+
+  it("retries a failed reopen within the attempt budget", async () => {
+    let opens = 0
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("dropped", []),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        opens++
+        if (opens === 1) throw new CursorTransportError("Cursor HTTP/2 connection failed", {
+          transient: true,
+          replaySafe: true,
+          code: "ENOTFOUND",
+        })
+        return fakeSession("reconnected", [turnEnded()])
+      },
+    })
+    expect(finalSession.sessionId).toBe("reconnected")
+    expect(opens).toBe(2)
+
+    let failingOpens = 0
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("offline", []),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        failingOpens++
+        throw new CursorTransportError("Cursor HTTP/2 connection failed", { transient: true, replaySafe: true })
+      },
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+    expect(failingOpens).toBe(2)
+  })
+
+  it("waits out a network outage without spending the attempt budget", async () => {
+    const offline = () => new CursorTransportError("Cursor HTTP/2 connection failed", {
+      transient: true,
+      replaySafe: true,
+      code: "ENOTFOUND",
+    })
+    let opens = 0
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("dropped", []),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      recover: async () => {
+        opens++
+        if (opens <= 8) throw offline()
+        return fakeSession("back-online", [turnEnded()])
+      },
+    })
+    expect(finalSession.sessionId).toBe("back-online")
+    expect(opens).toBe(9)
+
+    let failingOpens = 0
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("still-offline", []),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      offlineRetryWindowMs: 20,
+      recover: async () => {
+        failingOpens++
+        throw offline()
+      },
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+    expect(failingOpens).toBeGreaterThan(2)
+  })
+
+  it("counts streamed tool arguments and step boundaries as progress", () => {
+    for (const update of [
+      { partial_tool_call: { call_id: "c", args_text_delta: "{\"content\":\"…" } },
+      { step_started: { step_id: 1 } },
+      { step_completed: { step_id: 1 } },
+    ]) {
+      const message = { interaction_update: update }
+      const payload = encodeMessage("AgentServerMessage", message)
+      const decoded = decodeMessage<any>("AgentServerMessage", payload)
+      const analysis = analyzeReplayFrame(payload, { interactionUpdate: decoded.interaction_update })
+      expect(analysis).toEqual({ semanticProgress: true, barrier: undefined })
+    }
+    const heartbeat = encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })
+    expect(analyzeReplayFrame(heartbeat, {
+      interactionUpdate: decodeMessage<any>("AgentServerMessage", heartbeat).interaction_update,
+    }).semanticProgress).toBe(false)
+  })
+
+  it("seeds interrupted text for rebases and notes it on replays", () => {
+    const note = appendInterruptedReplyNote("fix the bug", "I found it in")
+    expect(note.startsWith("fix the bug\n\n<system_reminder>")).toBe(true)
+    expect(note).toContain("<interrupted_reply>\nI found it in\n</interrupted_reply>")
+    const long = "a".repeat(20_000) + "END"
+    expect(interruptedTextTail(long).endsWith("END")).toBe(true)
+    expect(interruptedTextTail(long).length).toBe(16_001)
+  })
+
+  it("replies to decoded KV requests with unknown fields, then rebases instead of replaying", async () => {
     const writes: Uint8Array[] = []
     const getBlob = lengthDelimitedField(1, new TextEncoder().encode("inline blob"))
     const getWithUnknownField = Uint8Array.from([
@@ -518,14 +699,15 @@ describe("interrupted Cursor Run handling", () => {
         ], writes),
         controller: controller([]),
         retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
-        recover: async () => {
+        recover: async (recovery) => {
           recoveries++
+          expect(recovery).toEqual({ kind: "rebase" })
           return fakeSession("unused", [])
         },
       }),
-    ).rejects.toThrow("automatic retry unsafe")
+    ).rejects.toBeInstanceOf(CursorRetryExhaustedError)
 
-    expect(recoveries).toBe(0)
+    expect(recoveries).toBe(1)
     expect(writes).toHaveLength(2)
     const getReply = decodeMessage<any>("AgentClientMessage", writes[0]!).kv_client_message
     expect(getReply.id).toBe(15)
@@ -559,10 +741,10 @@ describe("interrupted Cursor Run handling", () => {
             return fakeSession("unused", [])
           },
         }),
-      ).rejects.toThrow("automatic retry unsafe")
+      ).rejects.toBeInstanceOf(CursorRetryExhaustedError)
 
       expect(writes).toHaveLength(1)
-      expect(recoveries).toBe(0)
+      expect(recoveries).toBe(1)
       const reply = decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message
       expect(reply.id).toBe(16)
       expect(reply[resultField].success).toBeDefined()

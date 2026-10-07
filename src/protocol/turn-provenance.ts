@@ -115,6 +115,20 @@ export function trackTurnProvenance(sessionKey: string, conversationId: string):
   entryFor(sessionKey, conversationId)
 }
 
+/**
+ * Move the record onto the conversation a recovery rebase opened mid-step. The
+ * host still shows one assistant message made of every attempt's output, so
+ * the step keeps accumulating instead of restarting empty.
+ */
+export function rebindTurnProvenance(sessionKey: string, conversationId: string): void {
+  const existing = provenanceBySession.get(sessionKey)
+  if (!existing) {
+    entryFor(sessionKey, conversationId)
+    return
+  }
+  touch(sessionKey, { ...existing, conversationId })
+}
+
 export function getTurnProvenance(sessionKey: string): TurnProvenance | undefined {
   const entry = provenanceBySession.get(sessionKey)
   if (!entry) return undefined

@@ -154,11 +154,16 @@ function hasSemanticProgress(decoded: DecodedReplayFrame): boolean {
   const update = decoded.interactionUpdate
   const text = (update?.text_delta as Record<string, unknown> | undefined)?.text
   const thinking = (update?.thinking_delta as Record<string, unknown> | undefined)?.text
+  // Streamed tool arguments and step boundaries are model output too: a long
+  // `write` streams only partial_tool_call frames until its exec arrives.
   return (typeof text === "string" && text.length > 0)
     || (typeof thinking === "string" && thinking.length > 0)
     || !!update?.turn_ended
     || !!update?.tool_call_started
     || !!update?.tool_call_completed
+    || !!update?.partial_tool_call
+    || !!update?.step_started
+    || !!update?.step_completed
     || !!decoded.exec
     || !!decoded.kv
     || !!decoded.execControl

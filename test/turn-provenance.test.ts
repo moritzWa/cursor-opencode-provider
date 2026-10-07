@@ -9,6 +9,7 @@ import {
   getTurnProvenance,
   MAX_PROVENANCE_SESSIONS,
   parseTurnProvenance,
+  rebindTurnProvenance,
   recordEmittedPart,
   resetTurnProvenanceForTests,
   serializeTurnProvenance,
@@ -86,6 +87,16 @@ describe("detectForeignHistory", () => {
     trackTurnProvenance(SESSION, CONVERSATION)
     recordEmittedPart(SESSION, CONVERSATION, { type: "tool-call", toolCallId: "call_ours" })
     expect(detect(promptEndingWith(assistantToolCall("call_ours", "Reading it")))).toBeUndefined()
+  })
+
+  it("accepts a turn whose Run was interrupted and rebased onto a new conversation", () => {
+    trackTurnProvenance(SESSION, "conv-interrupted")
+    beginEmittedStep(SESSION, "conv-interrupted")
+    recordEmittedPart(SESSION, "conv-interrupted", { type: "text-delta", delta: "1\n2\n3\n" })
+    rebindTurnProvenance(SESSION, CONVERSATION)
+    recordEmittedPart(SESSION, CONVERSATION, { type: "text-delta", delta: "4\n5" })
+    expect(detect(promptEndingWith(assistantText("1\n2\n3\n4\n5")))).toBeUndefined()
+    expect(detect(promptEndingWith(assistantText("4\n5")))).toBe("foreign-assistant")
   })
 
   it("flags an assistant turn another model produced", () => {

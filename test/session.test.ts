@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test"
-import { SessionManager, type CursorSession } from "../src/session.js"
+import { MAX_SEMANTIC_WAIT_MS, SessionManager, type CursorSession } from "../src/session.js"
 import { CursorProtocolError } from "../src/errors.js"
 import type { BidiStream, BidiTerminalEvent } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -57,6 +57,39 @@ describe("SessionManager", () => {
       state: "pending",
     })
     expect(mgr.findByExecIds(s.sessionId, [900_001])).toBe(s)
+  })
+
+  it("lets a server-side wait outlast the semantic idle budget and the hard cap, up to a day", () => {
+    let now = 1_000
+    const mgr = new SessionManager({ now: () => now })
+    const s = fakeSession()
+    mgr.registerSession(s)
+    const idle = s.policy.semanticIdleMs
+    mgr.recordSemanticProgress(s)
+    expect(s.semanticDeadlineAt).toBe(now + idle)
+    mgr.allowSemanticWait(s, 300_000)
+    expect(s.semanticDeadlineAt).toBe(now + 300_000 + idle)
+    mgr.allowSemanticWait(s, 1_000)
+    expect(s.semanticDeadlineAt).toBe(now + 300_000 + idle)
+    now += 10
+    mgr.allowSemanticWait(s, 40 * 60_000)
+    expect(s.semanticDeadlineAt).toBe(now + 40 * 60_000 + idle)
+    mgr.allowSemanticWait(s, 3 * 24 * 60 * 60_000)
+    expect(s.semanticDeadlineAt).toBe(now + MAX_SEMANTIC_WAIT_MS + idle)
+  })
+
+  it("keeps a server-side wait through progress frames until the wait ends", () => {
+    let now = 1_000
+    const mgr = new SessionManager({ now: () => now })
+    const s = fakeSession()
+    mgr.registerSession(s)
+    const idle = s.policy.semanticIdleMs
+    mgr.allowSemanticWait(s, 40 * 60_000)
+    now += 1_000
+    mgr.recordSemanticProgress(s)
+    expect(s.semanticDeadlineAt).toBe(1_000 + 40 * 60_000 + idle)
+    mgr.endSemanticWait(s)
+    expect(s.semanticDeadlineAt).toBe(now + idle)
   })
 
   it("resolves an exec id so it is no longer found", () => {

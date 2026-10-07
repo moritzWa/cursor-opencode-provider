@@ -122,7 +122,7 @@ export function transferFrozenRequestContext(
   if (materialized) {
     materializedByConversationId.set(nextConversationId, {
       context: materialized.context,
-      bytes: Uint8Array.from(materialized.bytes),
+      bytes: new Uint8Array(materialized.bytes),
     })
   }
   return true
@@ -169,7 +169,7 @@ function rememberMaterialized(
   const frozen = freezeSnapshot(structuredClone(context))
   materializedByConversationId.set(conversationId, {
     context: frozen,
-    bytes: Uint8Array.from(bytes),
+    bytes: new Uint8Array(bytes),
   })
   return { context: frozen, reused: false }
 }
