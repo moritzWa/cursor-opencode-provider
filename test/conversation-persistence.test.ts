@@ -46,6 +46,7 @@ import {
   restoreTurnToolCatalog,
 } from "../src/language-model.js"
 import type { CursorSession, Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
 const roots: string[] = []
 
@@ -77,7 +78,7 @@ function turnEndedSession(root: string, checkpoint: Uint8Array): CursorSession {
       ? { done: false, value: { flags: 0, payload: payloads[index++]! } }
       : { done: true, value: undefined },
   }
-  return {
+  return sessionFixture({
     sessionId: "turn-ended-persistence",
     conversationId: "turn-ended-conversation",
     cacheDir: root,
@@ -87,7 +88,9 @@ function turnEndedSession(root: string, checkpoint: Uint8Array): CursorSession {
       end() {},
       destroy() {},
       frames: () => ({ [Symbol.asyncIterator]: () => frames }),
-    } as CursorSession["stream"],
+      isClosed: () => false,
+      onTerminal: () => () => {},
+    },
     frames,
     pending: new Map(),
     displayToolCalls: new Map(),
@@ -105,8 +108,7 @@ function turnEndedSession(root: string, checkpoint: Uint8Array): CursorSession {
     },
     pumpActive: true,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  } as CursorSession
+  })
 }
 
 describe("conversation restart persistence", () => {
@@ -158,13 +160,14 @@ describe("conversation restart persistence", () => {
     expect(hydrated?.hostAgent).toBe("plan")
     expect(hydrated?.systemPromptHash).toBe("stable-prompt-hash")
     restoreTurnToolCatalog(sessionKey, hydrated!.toolCatalog)
-    // A hydrated catalog is re-advertised on every lifecycle turn so the
-    // RequestContext keeps its shape and the prompt cache survives; execution
-    // stays refused until a turn actually arrives with tools.
+    // Host-empty lifecycle turns advertise [] (title / OC1 compaction). The
+    // hydrated catalog is still available for the next nonempty turn.
     expect(await resolveTurnToolState({ sessionKey, incomingTools: [], isCompaction: false }))
-      .toEqual({ advertisedTools: toolCatalog, allowTools: false })
+      .toEqual({ advertisedTools: [], allowTools: false })
     expect(await resolveTurnToolState({ sessionKey, incomingTools: [], isCompaction: true }))
-      .toEqual({ advertisedTools: toolCatalog, allowTools: false })
+      .toEqual({ advertisedTools: [], allowTools: false })
+    expect(await resolveTurnToolState({ sessionKey, incomingTools: toolCatalog, isCompaction: false }))
+      .toEqual({ advertisedTools: toolCatalog, allowTools: true })
     expect(bindConversationId(sessionKey).conversationId).toBe(conversationId)
     expect(getCheckpoint(conversationId)).toEqual(checkpoint)
     expect(getConversationBlob(conversationId, blobId)).toEqual(blobData)
@@ -186,7 +189,7 @@ describe("conversation restart persistence", () => {
     await pump(session, {
       enqueue(part: unknown) { parts.push(part) },
       error(error: unknown) { throw error },
-    } as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
 
     clearMemory()
     const restored = await getPersistedConversation(root, "ses_turn_ended")

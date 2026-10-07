@@ -7,6 +7,15 @@ import {
 import { readAllFields } from "../src/protocol/struct.js"
 
 describe("message round-trip", () => {
+  it("encodes cancellation reason at the CLI's field number", () => {
+    const data = encodeMessage("CancelAction", { reason: "host_plan_agent_handoff" })
+    const fields = readAllFields(data)
+    expect(fields).toHaveLength(1)
+    expect(fields[0]?.fn).toBe(1)
+    expect(fields[0]?.wt).toBe(2)
+    expect(new TextDecoder().decode(fields[0]?.bytes)).toBe("host_plan_agent_handoff")
+    expect(decodeMessage<any>("CancelAction", data).reason).toBe("host_plan_agent_handoff")
+  })
   it("ParameterValue", () => {
     const msg = { id: "effort", value: "high" }
     const data = encodeMessage("ParameterValue", msg)
@@ -248,6 +257,27 @@ describe("message schema accuracy", () => {
     expect(fields).toContain("partial_tool_call")
     expect(fields).toContain("heartbeat")
     expect(fields).toContain("turn_ended")
+    expect(fields).toContain("tool_requests_listed")
+  })
+
+  it("InteractionUpdate decodes tool_requests_listed call_count", () => {
+    // Independent CLI wire fixture: InteractionUpdate #27, uint32 count #1.
+    const data = Uint8Array.of(0xda, 0x01, 0x02, 0x08, 0x03)
+    const decoded = decodeMessage<any>("InteractionUpdate", data)
+    expect(decoded.tool_requests_listed?.call_count).toBe(3)
+  })
+
+  it("decodes a zero count omitted from the ToolRequestsListedUpdate body", () => {
+    const decoded = decodeMessage<any>("InteractionUpdate", Uint8Array.of(0xda, 0x01, 0x00))
+    expect(decoded.tool_requests_listed?.call_count).toBe(0)
+  })
+
+  it("decodes CLI field 15 tool deltas without interpreting their nested content", () => {
+    const decoded = decodeMessage<any>("InteractionUpdate", Uint8Array.of(
+      0x7a, 0x07, 0x0a, 0x01, 0x61, 0x12, 0x02, 0x1a, 0x00,
+    ))
+    expect(decoded.tool_call_delta.call_id).toBe("a")
+    expect(decoded.tool_call_delta.tool_call_delta).toEqual(Uint8Array.of(0x1a, 0x00))
   })
 
   it("ExecServerMessage has all tool variants", () => {

@@ -15,6 +15,13 @@ import { collectProjectLayout } from "./layout.js"
 import { buildEnv } from "./env.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
 import { holdCapabilityOverlay } from "./overlay.js"
+import {
+  agentSkillsForCursor,
+  applyAgentSkillsToContext,
+  hostSkillFiles,
+  loadBridgeSkills,
+  skillToolAdvertised,
+} from "./skills.js"
 import { traceRequestContextPaths } from "../debug.js"
 
 export type BuildRequestContextInput = {
@@ -30,6 +37,8 @@ export type BuildRequestContextInput = {
   mergedConfig?: OpencodeJson
   /** Host system context to deliver as the frozen system-instructions rule. */
   systemInstructions?: SystemInstructions
+  /** Optional host session id for `opencode.host.skills` list(). */
+  sessionID?: string
 }
 
 /**
@@ -119,8 +128,8 @@ export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
 export type DynamicRequestContextKey = typeof DYNAMIC_REQUEST_CONTEXT_KEYS[number]
 
 /**
- * The host system context (delivered as the system-instructions rule) already
- * carries these; never keep them on a frozen base.
+ * Derived from the system-instructions rule on every materialization (see
+ * `skills.ts`); never kept on a frozen base.
  */
 export const HOST_DUPLICATED_REQUEST_CONTEXT_KEYS = [
   "agent_skills",
@@ -176,10 +185,29 @@ export async function buildRequestContext(
     git_status_info_complete: true,
   }
   const base = withSystemInstructions(workspace, input.systemInstructions)
-  const ctx = materializeRequestContext(base, dynamic)
+  const skillLocations = await resolveSkillLocations(input, workspaceRoot)
+  const ctx = materializeRequestContext(base, dynamic, {
+    tools: input.tools,
+    ...skillLocations,
+  })
 
   traceRequestContextPaths("buildRequestContext", ctx)
   return ctx
+}
+
+/** Locations for path-desc materialization (bridge, then remembered OC2 files). */
+export async function resolveSkillLocations(
+  input: Pick<BuildRequestContextInput, "tools" | "sessionID">,
+  workspaceRoot: string,
+): Promise<{ bridgeSkills?: Awaited<ReturnType<typeof loadBridgeSkills>>; skillFiles?: ReturnType<typeof hostSkillFiles> }> {
+  if (!skillToolAdvertised(input.tools)) return {}
+  return {
+    bridgeSkills: await loadBridgeSkills({
+      workspaceRoot,
+      sessionID: input.sessionID,
+    }),
+    skillFiles: hostSkillFiles(workspaceRoot),
+  }
 }
 
 async function buildDynamicRequestContextFromDiscovery(
@@ -253,10 +281,22 @@ export async function buildDynamicRequestContext(
   return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config)
 }
 
-/** Keep expensive workspace state frozen while replacing every live capability field. */
+export type MaterializeRequestContextOptions = {
+  tools?: OpencodeToolDef[]
+  skillFiles?: ReadonlyMap<string, string>
+  bridgeSkills?: Awaited<ReturnType<typeof loadBridgeSkills>>
+}
+
+/**
+ * Keep expensive workspace state frozen while replacing every live capability
+ * field. Skill locations (bridge / OpenCode 2 files / OpenCode 1 catalog
+ * paths) turn the skill catalog in the system-instructions rule into Cursor's
+ * path-desc `agent_skills`.
+ */
 export function materializeRequestContext(
   base: Record<string, unknown>,
   dynamic: Record<string, unknown>,
+  options?: MaterializeRequestContextOptions,
 ): Record<string, unknown> {
   const context = structuredClone(base)
   stripHostDuplicatedRequestContextFields(context)
@@ -264,6 +304,12 @@ export function materializeRequestContext(
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) {
     if (Object.hasOwn(dynamic, key)) context[key] = structuredClone(dynamic[key])
   }
+  const skills = agentSkillsForCursor(systemInstructionsRuleText(context), {
+    skillToolAdvertised: skillToolAdvertised(options?.tools),
+    skillFiles: options?.skillFiles,
+    bridgeSkills: options?.bridgeSkills,
+  })
+  applyAgentSkillsToContext(context, skills)
   return context
 }
 

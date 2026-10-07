@@ -9,6 +9,7 @@ import type {
   ToolAliasRegistry,
 } from "./protocol/tools.js"
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
+import type { ParallelStepState } from "./parallel-step.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -234,6 +235,20 @@ export type CursorSession = {
   knownMcpServers?: string[]
   stream: BidiStream
   frames: AsyncIterator<Frame>
+  /** An iterator read retained across an idle-guard timeout. */
+  pendingFrameRead?: Promise<IteratorResult<Frame>>
+  /**
+   * One-slot pushback for a terminal update that must start the next pump pass
+   * after the host settles emitted tools. Timed-out reads use pendingFrameRead.
+   */
+  pushbackFrame?: Frame
+  /**
+   * In-progress parallel tool-call step (field 27 hold). Cleared when the step
+   * finishes; added to priorParallelStepCallIds for late-completion filtering.
+   */
+  parallelStep?: ParallelStepState
+  /** Resolved call ids from prior steps of this Run — ignore late completions. */
+  priorParallelStepCallIds?: Set<string>
   pending: Map<number, PendingExec>
   /**
    * Cursor display tool calls (tool_call_started) awaiting either an exec or a
@@ -247,6 +262,11 @@ export type CursorSession = {
    * completed list so host todos still receive a replace-all snapshot.
    */
   mirroredTodos?: Array<Record<string, unknown>>
+  /**
+   * CreatePlan display calls whose plan was deferred to the host plan agent.
+   * Their completed display carries no recorded plan, so it is not mirrored.
+   */
+  deferredCreatePlanCalls?: Set<string>
   /**
    * Legacy edit calls whose authoritative exec path is still in progress.
    * Cursor implements these as read -> whole-file write; retaining the path
@@ -706,6 +726,10 @@ export class SessionManager {
     const old = session.stream
     session.stream = next
     session.frames = next.frames()[Symbol.asyncIterator]()
+    session.pendingFrameRead = undefined
+    session.pushbackFrame = undefined
+    session.parallelStep = undefined
+    session.priorParallelStepCallIds = undefined
     this.subscribeTerminal(session)
     try { old.destroy() } catch { /* already closed */ }
   }
@@ -752,6 +776,10 @@ export class SessionManager {
       if (this.isTerminalReason(reason)) this.putTombstone(key, reason)
     }
     session.pending.clear()
+    session.pendingFrameRead = undefined
+    session.pushbackFrame = undefined
+    session.parallelStep = undefined
+    session.priorParallelStepCallIds = undefined
     session.pumpOwner = null
     session.pumpActive = false
     session.displayToolCalls?.clear()
@@ -883,6 +911,50 @@ export class SessionManager {
 
   private isTerminalReason(reason: SessionCloseReason): reason is ContinuationTerminalReason {
     return !["ordinary-cleanup", "turn-ended", "initial-write-failed"].includes(reason)
+  }
+}
+
+/**
+ * Read one frame, retaining ownership of the iterator read when a timeout
+ * wins. Every reader uses this function so a continuation cannot overtake a
+ * late frame (or discard its EOF/error).
+ */
+export function readSessionFrame(session: CursorSession): Promise<IteratorResult<Frame>>
+export function readSessionFrame(
+  session: CursorSession,
+  timeoutMs: number,
+): Promise<IteratorResult<Frame> | { done: true; timedOut: true }>
+export async function readSessionFrame(
+  session: CursorSession,
+  timeoutMs?: number,
+): Promise<IteratorResult<Frame> | { done: true; timedOut: true }> {
+  if (session.pushbackFrame) {
+    const value = session.pushbackFrame
+    session.pushbackFrame = undefined
+    return { done: false, value }
+  }
+  const pending = session.pendingFrameRead ??= session.frames.next()
+  // A timed-out read can reject while no pump is consuming it. Preserve the
+  // rejection for the next reader without an unhandled detached promise.
+  void pending.catch(() => {})
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = timeoutMs === undefined ? await pending : await Promise.race([
+      pending,
+      new Promise<{ done: true; timedOut: true }>(resolve => {
+        timer = setTimeout(() => resolve({ done: true, timedOut: true }), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+    if (!("timedOut" in result) && session.pendingFrameRead === pending) {
+      session.pendingFrameRead = undefined
+    }
+    return result
+  } catch (error) {
+    if (session.pendingFrameRead === pending) session.pendingFrameRead = undefined
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 

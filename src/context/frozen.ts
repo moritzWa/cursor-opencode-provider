@@ -3,6 +3,7 @@ import {
   buildRequestContext,
   materializeRequestContext,
   requestContextBase,
+  resolveSkillLocations,
   withSystemInstructions,
   type BuildRequestContextInput,
 } from "./build.js"
@@ -202,9 +203,13 @@ export async function getOrBuildRequestContext(
         )
       }
       const dynamic = await buildDynamicRequestContext(scoped)
+      const skillLocations = await resolveSkillLocations(scoped, scoped.workspaceRoot)
       const materialized = rememberMaterialized(
         conversationId,
-        materializeRequestContext(base, dynamic),
+        materializeRequestContext(base, dynamic, {
+          tools: scoped.tools,
+          ...skillLocations,
+        }),
       )
       trace(
         `request_context: materialized conversationId=${conversationId} ` +

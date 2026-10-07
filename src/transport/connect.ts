@@ -376,6 +376,17 @@ function dropSession(origin: string, session: http2.ClientHttp2Session): void {
   if (_http2Sessions.get(origin) === session) _http2Sessions.delete(origin)
 }
 
+/**
+ * Stop offering `session` for new Runs and close it so in-flight streams can
+ * drain. Used by age rotation and a failed reuse ping — never
+ * `destroy()`, which would abort every sibling Run multiplexed on the session
+ * mid-output (those Runs cannot be replayed after visible activity).
+ */
+function retireCachedSession(origin: string, session: http2.ClientHttp2Session): void {
+  dropSession(origin, session)
+  try { session.close() } catch { /* already closed */ }
+}
+
 /** Test cleanup for local HTTP/2 fixtures; production sessions stay process-cached. */
 export function closeCachedHttp2SessionsForTests(): void {
   for (const session of _http2Sessions.values()) {
@@ -650,8 +661,7 @@ export function getSession(
       const createdAt = _http2SessionCreatedAt.get(existing) ?? 0
       if (!shouldReuseHttp2Session(existing, createdAt)) {
         trace(`h2 session rotate: origin=${origin} ageMs=${Math.max(0, Date.now() - createdAt)}`)
-        dropSession(origin, existing)
-        try { existing.close() } catch { /* already closed */ }
+        retireCachedSession(origin, existing)
       } else {
         try {
           await validateCachedSession(existing, pingTimeoutMs)
@@ -660,11 +670,10 @@ export function getSession(
             return existing
           }
         } catch (error) {
-          trace(`h2 cached session ping failed: origin=${origin} err=${(error as Error).message}`)
           // Sibling Runs may still be streaming on this session; destroy() would
           // abort them mid-output, where they cannot be replayed.
-          dropSession(origin, existing)
-          try { existing.close() } catch { /* already closed */ }
+          trace(`h2 cached session ping failed: origin=${origin} err=${(error as Error).message}`)
+          retireCachedSession(origin, existing)
         }
       }
     }

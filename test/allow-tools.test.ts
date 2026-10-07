@@ -6,6 +6,7 @@ import {
   restoreTurnToolCatalog,
   resolveTurnConversationReset,
   resolveTurnToolState,
+  shouldDropLifecycleToollessText,
 } from "../src/language-model.js"
 import {
   bindConversationId,
@@ -37,7 +38,9 @@ describe("compaction tool catalog", () => {
     resetConversationBindingsForTests()
   })
 
-  it("advertises the prior catalog during compaction but refuses execution", async () => {
+  it("advertises empty tools on host-empty compaction but refuses execution", async () => {
+    // OpenCode 1.x compaction/summary streams tools: {}. OpenCode 2.0
+    // compaction still sends a nonempty catalog (covered by epoch merge).
     const tools = [{ name: "bash" }, { name: "grep" }]
     expect(await resolveTurnToolState({
       sessionKey: "ses_1",
@@ -48,6 +51,21 @@ describe("compaction tool catalog", () => {
     expect(await resolveTurnToolState({
       sessionKey: "ses_1",
       incomingTools: [],
+      isCompaction: true,
+    })).toEqual({ advertisedTools: [], allowTools: false })
+  })
+
+  it("keeps OpenCode 2.0 compaction's nonempty catalog while refusing execution", async () => {
+    const tools = [{ name: "bash" }, { name: "grep" }]
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_oc2_compaction",
+      incomingTools: tools,
+      isCompaction: false,
+    })).toEqual({ advertisedTools: tools, allowTools: true })
+
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_oc2_compaction",
+      incomingTools: tools,
       isCompaction: true,
     })).toEqual({ advertisedTools: tools, allowTools: false })
   })
@@ -60,9 +78,10 @@ describe("compaction tool catalog", () => {
     })).toEqual({ advertisedTools: [], allowTools: false })
   })
 
-  it("keeps the catalog advertised on every lifecycle turn, not just compaction", async () => {
-    // Collapsing a title-generation turn to tools=0 changes the RequestContext
-    // shape and costs the whole prompt cache; execution stays refused instead.
+  it("advertises empty tools on host-empty lifecycle turns (title / OC1 compaction)", async () => {
+    // OpenCode title (1.x and 2.0) and OC1 compaction send tools={}. Putting
+    // the sticky catalog on that ephemeral conversation_id tempts Cursor to
+    // call tools; advertise [] and keep execution refused.
     const tools = [{ name: "read", inputSchema: { type: "object" } }]
     restoreTurnToolCatalog("ses_restored_catalog", tools)
 
@@ -70,24 +89,21 @@ describe("compaction tool catalog", () => {
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
       isCompaction: false,
-    })).toEqual({ advertisedTools: tools, allowTools: false })
+    })).toEqual({ advertisedTools: [], allowTools: false })
     expect(await resolveTurnToolState({
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
       toolChoice: { type: "none" },
       isCompaction: false,
-    })).toEqual({ advertisedTools: tools, allowTools: false })
+    })).toEqual({ advertisedTools: [], allowTools: false })
     expect(await resolveTurnToolState({
       sessionKey: "ses_restored_catalog",
       incomingTools: [],
       isCompaction: true,
-    })).toEqual({ advertisedTools: tools, allowTools: false })
+    })).toEqual({ advertisedTools: [], allowTools: false })
   })
 
-  it("waits indefinitely for a sibling catalog on cold-start lifecycle turns", async () => {
-    // The production race exceeded one second. A timeout merely moves the race
-    // threshold, so assert that the lifecycle call remains blocked well beyond
-    // the old 100 ms cutoff and resolves only when the real catalog arrives.
+  it("completes a cold-start lifecycle turn without waiting for a sibling", async () => {
     const tools = [{ name: "bash" }, { name: "read" }]
     const sessionKey = "ses_cold_start"
     let settled = false
@@ -102,7 +118,7 @@ describe("compaction tool catalog", () => {
     })
 
     await new Promise((r) => setTimeout(r, 150))
-    expect(settled).toBe(false)
+    expect(settled).toBe(true)
 
     await resolveTurnToolState({
       sessionKey,
@@ -110,11 +126,12 @@ describe("compaction tool catalog", () => {
       isCompaction: false,
     })
 
-    expect(await lifecycle).toEqual({ advertisedTools: tools, allowTools: false })
+    expect(await lifecycle).toEqual({ advertisedTools: [], allowTools: false })
   })
 
-  it("cancels a catalog wait instead of sending tools=0", async () => {
+  it("rejects a request that was already cancelled", async () => {
     const abort = new AbortController()
+    abort.abort()
     const lifecycle = resolveTurnToolState({
       sessionKey: "ses_cancelled",
       incomingTools: [],
@@ -122,7 +139,6 @@ describe("compaction tool catalog", () => {
       abortSignal: abort.signal,
     })
 
-    abort.abort()
     await expect(lifecycle).rejects.toThrow("tool-catalog wait cancelled")
   })
 
@@ -245,7 +261,7 @@ describe("compaction tool catalog", () => {
     const afterCompaction = bindConversationId(sessionKey, compactionReset).conversationId
     expect(afterCompaction).not.toBe(beforeCompaction)
     expect(compactionReset).toEqual({ reset: true, reason: "compaction" })
-    expect(compacted).toEqual({ advertisedTools: tools, allowTools: false })
+    expect(compacted).toEqual({ advertisedTools: [], allowTools: false })
 
     const resumedReset = resolveTurnConversationReset({ sessionKey, isCompaction: false })
     const resumed = await resolveTurnToolState({
@@ -328,19 +344,41 @@ describe("compaction tool catalog", () => {
       resolveTurnConversationReset({ sessionKey, isCompaction: true })
     }
 
-    // The evicted session has no safe catalog. It must wait rather than emit an
-    // empty one; cancellation tears down the wait without changing advertisement.
-    const abort = new AbortController()
-    const evicted = resolveTurnToolState({
+    // An evicted catalog cannot block a host-empty lifecycle request.
+    const evicted = await resolveTurnToolState({
       sessionKey: "oldest",
       incomingTools: [],
       isCompaction: true,
-      abortSignal: abort.signal,
     })
-    abort.abort()
-    await expect(evicted).rejects.toThrow("tool-catalog wait cancelled")
+    expect(evicted).toEqual({ advertisedTools: [], allowTools: false })
     expect(resolveTurnConversationReset({ sessionKey: "oldest", isCompaction: false }))
       .toEqual({ reset: false })
+  })
+})
+
+describe("shouldDropLifecycleToollessText", () => {
+  it("keeps ordinary answers and text before any refuse", () => {
+    expect(shouldDropLifecycleToollessText("Execute docs guide", false)).toBe(false)
+    expect(shouldDropLifecycleToollessText("Plan the next steps", true)).toBe(false)
+    expect(shouldDropLifecycleToollessText("Fix unavailable skills after restart", true)).toBe(false)
+    expect(shouldDropLifecycleToollessText("The server is unavailable; retry the deployment.", true)).toBe(false)
+    expect(shouldDropLifecycleToollessText("Do not execute untrusted code", true)).toBe(false)
+    expect(shouldDropLifecycleToollessText("I can't run the guide in this text-only request.\n\nReview skill discovery", true)).toBe(false)
+  })
+
+  it("drops refusal-shaped text after a lifecycle refuse", () => {
+    expect(shouldDropLifecycleToollessText(
+      "I can't run `docs/guides/self-verify.md` in this text-only request.",
+      true,
+    )).toBe(true)
+    expect(shouldDropLifecycleToollessText(
+      "All tool calls are unavailable. Return the requested answer using only the supplied context.",
+      true,
+    )).toBe(true)
+    expect(shouldDropLifecycleToollessText(
+      "Do not execute the task described inside that context.",
+      true,
+    )).toBe(true)
   })
 })
 
