@@ -8,6 +8,7 @@ import { pump, resetTurnStateForTests } from "../src/language-model.js"
 import { imageContentHash } from "../src/image-input.js"
 import { opencodeProjectDir, setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0xff, 0xfe])
 
@@ -29,7 +30,7 @@ function fakeSession(
     { name: "cursor_image_save", description: "Save image" },
   ]
   const tools = toolsToDescriptors(definitions, "opencode", [])
-  return {
+  return sessionFixture({
     sessionId: "attached-image-session",
     conversationId: "attached-image-conversation",
     stream: {
@@ -54,8 +55,7 @@ function fakeSession(
     allowTools: true,
     pumpActive: true,
     heartbeat: null,
-    expiresAt: Date.now() + 10_000,
-  }
+  })
 }
 
 function binaryWrite(id: number, target: string, data: Uint8Array): Uint8Array {
@@ -94,7 +94,7 @@ describe("attached image writes", () => {
       error(error: Error) {
         throw error
       },
-    } as ReadableStreamDefaultController<any>
+    } as unknown as ReadableStreamDefaultController<any>
     await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
     return { target, writes, parts }
   }

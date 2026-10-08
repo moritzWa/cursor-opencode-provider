@@ -27,7 +27,7 @@ const kv = { id: 7, get_blob_args: { blob_id: new TextEncoder().encode("blob") }
 
 describe("replay frame analysis", () => {
   it("treats a KV request with its span context as a control frame", () => {
-    expect(analyzeReplayFrame(kvFrame(id, getBlob, span), { kv })).toEqual({ semanticProgress: true, barrier: undefined })
+    expect(analyzeReplayFrame(kvFrame(id, getBlob, span), { kv })).toEqual({ semanticProgress: true, modelOutput: false, barrier: undefined })
     expect(analyzeReplayFrame(kvFrame(id, getBlob), { kv }).barrier).toBeUndefined()
   })
 
@@ -52,7 +52,7 @@ describe("interaction update analysis", () => {
     // thinking_delta{text, thinking_style} #4.
     const styled = updateFrame(4, [...text, ...varint(2 << 3), 1])
     expect(analyzeReplayFrame(styled, { interactionUpdate: { thinking_delta: { text: "hm" } } }))
-      .toEqual({ semanticProgress: true, barrier: undefined })
+      .toEqual({ semanticProgress: true, modelOutput: true, barrier: undefined })
   })
 
   it("keeps the barrier for undeclared updates and unknown delta fields", () => {
