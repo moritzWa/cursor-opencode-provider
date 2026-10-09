@@ -19,6 +19,7 @@
 - OpenCode 2 with several projects open renews a Cursor login and looks up its agent host once per process, not once per project
 - Concurrent project requests retain their own Cursor connection errors and retry decisions; renewed logins stay scoped to the API endpoint that issued them ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
 - A rejected login stays rejected between renewal attempts, invalid renewal responses back off, and forced renewal uses the replacement token even when its expiry matches the old one ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
+- OpenCode 2 no longer bills every tool step as a full new prompt; on both OpenCode 1.x and 2, the session cost shows an estimate during a turn and Cursor's real cost at the model's published rates once the turn ends (OpenCode 1.x previously showed $0)
 
 ## [0.8.1] - 2026-10-08
 

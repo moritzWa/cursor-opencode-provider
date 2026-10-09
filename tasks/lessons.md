@@ -693,3 +693,11 @@
   renewal even though tests starting with an empty SDK pass. Keep the current
   integration resolver after captured host options, and preserve other
   providers' SDKs (`test/plugin-opencode2.test.ts`).
+
+## 2026-10-09 — Check each host's cost formula, not one host's override
+
+- OpenCode 1.x honours `providerMetadata.copilot.totalNanoAiu`; OpenCode 2 has
+  no override and prices every step's tokens. A $0 override therefore hid the
+  cost on one host and billed every occupancy snapshot as a full prompt on the
+  other. Verify billing against both hosts' recorded session cost, not against
+  the provider's own metadata (`test/billing.test.ts` replicates both formulas).
