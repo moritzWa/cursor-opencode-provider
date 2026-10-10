@@ -2696,6 +2696,17 @@ function isTruthyEnv(value: string | undefined): boolean {
 
 const streamWriteChains = new WeakMap<BidiStream, Promise<void>>()
 
+const MIN_WRITE_DRAIN_TIMEOUT_MS = 5_000
+const MIN_UPLOAD_BYTES_PER_MS = 64
+
+/**
+ * Requests that replay many images can be tens of MB, which a slow uplink
+ * cannot flush in a fixed few seconds, so the drain budget scales with size.
+ */
+export function writeDrainTimeoutMs(bytes: number): number {
+  return Math.max(MIN_WRITE_DRAIN_TIMEOUT_MS, Math.ceil(bytes / MIN_UPLOAD_BYTES_PER_MS))
+}
+
 async function waitForStreamWrites(stream: BidiStream): Promise<void> {
   const pending = streamWriteChains.get(stream)
   if (pending) await pending.catch(() => undefined)
@@ -2747,7 +2758,7 @@ async function writeWithBackpressureNow(
     })
   }
   try {
-    await stream.waitForDrain(5_000)
+    await stream.waitForDrain(writeDrainTimeoutMs(message.length))
     trace(`stream write drained: operation=${operation} bytes=${message.length}`)
   } catch (cause) {
     throw toCursorProviderError(cause, {
