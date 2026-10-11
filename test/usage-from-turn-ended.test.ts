@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test"
+import { shapeStepUsage } from "../src/billing.js"
 import {
   buildLanguageModelV3UsageFromCounters,
   buildLanguageModelV3UsageFromTurnEnded,
@@ -9,9 +10,7 @@ import {
   formatTurnUsageValidation,
   flatUsageFromV3,
   missingRulesWarning,
-  occupancyUsageFromTokenDetails,
   occupancyValidationCounters,
-  OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "../src/usage.js"
 import { evaluateStickyCacheTurns, parseCacheDiagnosisLine, readRatio } from "./cache-diagnosis.js"
@@ -195,17 +194,38 @@ describe("buildLanguageModelV3UsageFromTurnEnded", () => {
   })
 })
 
-describe("occupancyUsageFromTokenDetails", () => {
-  it("keeps OpenCode's Copilot cost override at zero so occupancy snapshots are not billed", () => {
-    expect(OPENCODE_DISPLAY_ONLY_COST_METADATA).toEqual({
-      copilot: { totalNanoAiu: 0 },
-    })
+/** The occupancy snapshot a step finish sends, with `prior` read from cache. */
+function occupancyUsage(
+  details: { usedTokens: number; maxTokens: number },
+  prior?: { usedTokens: number },
+) {
+  return shapeStepUsage({ usedTokens: details.usedTokens, prefixTokens: prior?.usedTokens ?? 0, prices: undefined }).usage
+}
+
+describe("occupancy snapshot usage", () => {
+  it("reports the same diagnostic occupancy total for zero, one and populated snapshots", () => {
+    for (const usedTokens of [0, 1, 8_236, 22_767]) {
+      const details = { usedTokens, maxTokens: 256_000 }
+      const prior = { usedTokens: usedTokens + 10, maxTokens: 256_000 }
+      const counters = occupancyValidationCounters(details, prior)
+      expect(counters.inputTokens + counters.outputTokens).toBe(usedTokens)
+      expect(counters.cacheRead).toBeLessThanOrEqual(counters.inputTokens)
+      const validation = formatTurnUsageValidation(counters, occupancyUsage(details, prior), details, undefined, "occupancy")
+      expect(validation).toContain(`occupancyTotal=${usedTokens} sentTotal=${usedTokens}`)
+      expect(validation).toContain("status=ok")
+    }
+  })
+
+  it("does not report ok when diagnostic occupancy disagrees with the sent snapshot", () => {
+    const details = { usedTokens: 8_236, maxTokens: 256_000 }
+    const counters = { ...occupancyValidationCounters(details), inputTokens: 8_236 }
+    expect(formatTurnUsageValidation(counters, occupancyUsage(details), details, undefined, "occupancy")).toContain("status=mismatch")
   })
 
   it("places occupancy on a snapshot whose TUI sum equals usedTokens and output > 0", () => {
     const details = { usedTokens: 153_744, maxTokens: 256_000 }
     const prior = { usedTokens: 123_651, maxTokens: 256_000 }
-    const usage = occupancyUsageFromTokenDetails(details, prior)
+    const usage = occupancyUsage(details, prior)
     expect(usage.outputTokens?.total).toBe(1)
     expect(usage.outputTokens?.text).toBe(1)
     expect(usage.outputTokens?.reasoning).toBe(0)
@@ -229,7 +249,7 @@ describe("occupancyUsageFromTokenDetails", () => {
     // Live: prior checkpoint 26,823 tokens, current 26,766.
     const details = { usedTokens: 26_766, maxTokens: 256_000 }
     const prior = { usedTokens: 26_823, maxTokens: 256_000 }
-    const usage = occupancyUsageFromTokenDetails(details, prior)
+    const usage = occupancyUsage(details, prior)
     expect(usage.inputTokens?.total).toBe(26_765)
     expect(usage.inputTokens?.cacheRead).toBe(26_765)
     const validation = formatTurnUsageValidation(occupancyValidationCounters(details, prior), usage, details, "checkpoint-current-run", "occupancy")
@@ -238,7 +258,7 @@ describe("occupancyUsageFromTokenDetails", () => {
   })
 
   it("still totals usedTokens when no prior occupancy is known", () => {
-    const usage = occupancyUsageFromTokenDetails({ usedTokens: 40, maxTokens: 256_000 })
+    const usage = occupancyUsage({ usedTokens: 40, maxTokens: 256_000 })
     expect(usage.outputTokens?.total).toBe(1)
     expect(usage.inputTokens?.total).toBe(39)
     expect(usage.inputTokens?.cacheRead).toBe(0)
@@ -255,7 +275,7 @@ describe("occupancyUsageFromTokenDetails", () => {
       }
       const prior = { usedTokens: 36_122, maxTokens: 256_000 }
       const validation = formatTurnUsageValidation(
-        occupancyValidationCounters(details, prior), occupancyUsageFromTokenDetails(details, prior), details, undefined, "occupancy",
+        occupancyValidationCounters(details, prior), occupancyUsage(details, prior), details, undefined, "occupancy",
       )
       expect(validation).toContain("status=ok")
       expect(validation).toContain(`sentTotal=${usedTokens} totalMatch=true`)
@@ -263,13 +283,13 @@ describe("occupancyUsageFromTokenDetails", () => {
       expect(formatCursorTokenCategories(details)).toBe("unavailable")
       const malformed = { ...details, breakdown: { ...details.breakdown, totalUsedTokens: 36_123 } }
       expect(formatTurnUsageValidation(
-        occupancyValidationCounters(malformed, prior), occupancyUsageFromTokenDetails(malformed, prior), malformed, undefined, "occupancy",
+        occupancyValidationCounters(malformed, prior), occupancyUsage(malformed, prior), malformed, undefined, "occupancy",
       )).toContain("status=mismatch")
     }
   })
 
   it("emits empty usage when occupancy is not yet known", () => {
-    expect(occupancyUsageFromTokenDetails({ usedTokens: 0, maxTokens: 256_000 })).toEqual({
+    expect(occupancyUsage({ usedTokens: 0, maxTokens: 256_000 })).toEqual({
       inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: 0, text: 0, reasoning: 0 },
     })
@@ -297,7 +317,7 @@ describe("occupancyUsageFromTokenDetails", () => {
       },
     }
     const prior = { usedTokens: 87_353, maxTokens: 256_000 }
-    const usage = occupancyUsageFromTokenDetails(details, prior)
+    const usage = occupancyUsage(details, prior)
     const turnEndedCounters = {
       inputTokens: 176_981,
       outputTokens: 322,
@@ -325,11 +345,11 @@ describe("occupancyUsageFromTokenDetails", () => {
     expect(validation).toContain("totalMatch=true")
     expect(validation).toContain("breakdownMatch=true")
     expect(validation).toContain("cacheRatioMatch=true")
-    expect(validation).toContain("occupancyTotal=89576")
+    expect(validation).toContain("occupancyTotal=89575")
     expect(validation).toContain("occupancyCachedRatio=97.5% sentCachedRatio=97.5%")
     expect(validation).not.toContain("rawTotal=")
     expect(occupancyValidationCounters(details, prior)).toEqual({
-      inputTokens: 89_575,
+      inputTokens: 89_574,
       outputTokens: 1,
       cacheRead: 87_353,
       cacheWrite: 0,
@@ -664,7 +684,7 @@ describe("formatFinishTrace", () => {
   const zero = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 }
 
   it("labels TurnEnded counters raw and keeps the prior-turn prefix beside them", () => {
-    const usage = occupancyUsageFromTokenDetails({ usedTokens: 55_219, maxTokens: 256_000 })
+    const usage = occupancyUsage({ usedTokens: 55_219, maxTokens: 256_000 })
     expect(formatFinishTrace({
       reason: "stop",
       usage,
@@ -684,13 +704,13 @@ describe("formatFinishTrace", () => {
     const prior = { usedTokens: 56_522, maxTokens: 256_000 }
     expect(formatFinishTrace({
       reason: "tool-calls",
-      usage: occupancyUsageFromTokenDetails(details, prior),
+      usage: occupancyUsage(details, prior),
       occupancy: { usedTokens: 56_794, priorUsedTokens: 56_522 },
       estimate: zero,
       source: "occupancy-checkpoint-current-run",
     })).toBe(
       "finish: reason=tool-calls v3In=56793 v3Out=1 v3CacheRead=56522 v3CacheWrite=0 v3Reasoning=0 " +
-      "occupancyIn=56794 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
+      "occupancyIn=56793 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
       "source=occupancy-checkpoint-current-run",
     )
   })
