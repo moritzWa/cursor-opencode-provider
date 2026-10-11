@@ -322,6 +322,7 @@ export function formatTurnUsageValidation(
     input === inputParts &&
     output === outputParts &&
     projectedOpenCodeTotal === sentTotal &&
+    (counterKind !== "occupancy" || rawTotal === sentTotal) &&
     (cacheRatioMatch ?? true) &&
     (!tokenDetails || sentTotal === tokenDetails.usedTokens) &&
     breakdownMatch !== false
@@ -375,7 +376,7 @@ export function formatFinishTrace(input: {
       `rawCacheRead=${turnEnded.cacheRead} rawCacheWrite=${turnEnded.cacheWrite} ` +
       (occupancy ? `occupancyPrefixCache=${occupancy.priorUsedTokens} ` : "")
     : occupancy
-      ? `occupancyIn=${occupancy.usedTokens} occupancyOut=1 ` +
+      ? `occupancyIn=${Math.max(0, occupancy.usedTokens - 1)} occupancyOut=${occupancy.usedTokens > 0 ? 1 : 0} ` +
         `occupancyCacheRead=${usage.inputTokens?.cacheRead ?? 0} ` +
         `occupancyCacheWrite=${usage.inputTokens?.cacheWrite ?? 0} `
       : `estIn=${estimate.inputTokens} estOut=${estimate.outputTokens} ` +
@@ -429,12 +430,13 @@ export function occupancyValidationCounters(
   prior?: CursorConversationTokenDetails,
 ): CursorUsageCounters {
   const used = Math.max(0, Math.trunc(details.usedTokens))
+  const input = Math.max(0, used - 1)
   return {
-    inputTokens: used,
+    inputTokens: input,
     outputTokens: used > 0 ? 1 : 0,
     // Cursor can shrink the context between checkpoints; the prior prefix
     // cannot be larger than what is in context now.
-    cacheRead: Math.min(used, Math.max(0, Math.trunc(prior?.usedTokens ?? 0))),
+    cacheRead: Math.min(input, Math.max(0, Math.trunc(prior?.usedTokens ?? 0))),
     cacheWrite: 0,
     reasoningTokens: 0,
   }

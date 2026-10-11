@@ -3500,8 +3500,8 @@ export async function pump(
         : "checkpoint-previous-turn"
       : undefined
     // Bill the step (see `src/billing.ts`): a tool step is an estimate shaped
-    // like one model call; the turn's last step settles what Cursor really
-    // billed. Either way its token total stays the occupancy snapshot.
+    // like one model call; the turn's last step reconciles the catalog-priced
+    // aggregate counters. Either way its token total stays the occupancy snapshot.
     const billing = session.billing
     const shaped = occupancyDetails && !settledUsage
       ? shapeStepUsage({
@@ -3511,24 +3511,20 @@ export async function pump(
           ...(te && billing.cost ? { targetUsd: billingLedger.outstanding(billing.key) } : {}),
         })
       : undefined
-    if (shaped && occupancyDetails) {
-      billingLedger.recordBilled(billing.key, shaped.costUsd)
-      billing.prefixTokens = occupancyDetails.usedTokens
-    }
     const stepCostUsd = shaped?.costUsd ?? 0
     const usage = settledUsage ?? shaped?.usage ?? emptyLanguageModelV3Usage()
     const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
     const ledger = billingLedger.totals(billing.key)
-    trace(
-      `billing: step=${te ? "turn-end" : "estimate"} pricing=${billing.cost ? "priced" : "unpriced"} ` +
-        `stepUsd=${stepCostUsd.toFixed(6)} sessionRealUsd=${ledger.realUsd.toFixed(6)} ` +
-        `sessionBilledUsd=${ledger.billedUsd.toFixed(6)} key=${billing.key}`,
-    )
+    // Metadata describes the total *if delivered*. Commit it only after the
+    // consumer accepts the finish, otherwise later turns must still settle it.
+    ledger.billedUsd += stepCostUsd
+    const estimatedUsd = billingLedger.estimated(billing.key) + (te ? 0 : stepCostUsd)
     const billingMetadata = {
       stepUsd: stepCostUsd,
       estimate: !te,
       sessionRealUsd: ledger.realUsd,
       sessionBilledUsd: ledger.billedUsd,
+      ...(estimatedUsd > 0 ? { sessionEstimatedUsd: estimatedUsd } : {}),
     }
     // OpenCode 1.x bills `totalNanoAiu`; OpenCode 2 bills the same amount from
     // the shaped tokens. TurnEnded stays a real (non-occupancyOnly) finish so
@@ -3596,12 +3592,23 @@ export async function pump(
         cacheDiagnostics,
       ))
     }
-    safeEnqueue({
+    const delivered = safeEnqueue({
       type: "finish",
       usage,
       finishReason: reason,
       ...(providerMetadata ? { providerMetadata } : {}),
     } as V3Part)
+    if (delivered && shaped && occupancyDetails) {
+      billingLedger.recordBilled(billing.key, shaped.costUsd, te ? undefined : billing)
+      billing.prefixTokens = occupancyDetails.usedTokens
+    }
+    const booked = billingLedger.totals(billing.key)
+    trace(
+      `billing: step=${te ? "turn-end" : "estimate"} pricing=${billing.cost ? "priced" : "unpriced"} ` +
+        `delivered=${delivered} stepUsd=${(delivered ? stepCostUsd : 0).toFixed(6)} ` +
+        `sessionRealUsd=${booked.realUsd.toFixed(6)} sessionBilledUsd=${booked.billedUsd.toFixed(6)} ` +
+        `sessionEstimatedUsd=${billingLedger.estimated(billing.key).toFixed(6)} key=${billing.key}`,
+    )
   }
 
   const persistTerminalCheckpoint = async () => {
@@ -5396,11 +5403,10 @@ export function estimateTokens(chars: number): number {
   return Math.ceil(chars / 4)
 }
 
-/** Preserve exact request-local Cursor counters as diagnostics. */
 /**
- * Add what Cursor billed for a finished Run to its session's ledger. Called
+ * Add the catalog-priced cost for a finished Run to its session's ledger. Called
  * once per `TurnEnded`, including Runs no OpenCode step reports (a drained
- * prior Run, a progress-only continuation); the next billed step settles it.
+ * prior Run, a progress-only continuation); a later priced turn-end attempts to settle it.
  */
 function recordTurnEndedCost(session: CursorSession, turnEnded: Record<string, unknown>): void {
   const realUsd = turnEndedCostUsd(
@@ -5409,10 +5415,11 @@ function recordTurnEndedCost(session: CursorSession, turnEnded: Record<string, u
     session.tokenDetails?.usedTokens ?? 0,
   )
   if (realUsd === undefined) return
-  billingLedger.recordReal(session.billing.key, realUsd)
+  billingLedger.recordReal(session.billing.key, realUsd, session.billing)
   trace(`billing: turn real=${realUsd.toFixed(6)} key=${session.billing.key}`)
 }
 
+/** Preserve exact request-local Cursor counters as diagnostics. */
 export function cursorTurnEndedProviderMetadata(
   te: Record<string, unknown>,
   tokenDetails?: CursorConversationTokenDetails,

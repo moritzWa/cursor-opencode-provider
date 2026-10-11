@@ -10,6 +10,9 @@
 ### Fixed
 
 - OpenCode 2's generic SDK fallback no longer bypasses the plugin's current-credential resolver; new Runs resolve the active login even when the host already supplied an SDK
+- Occupancy diagnostics no longer count the footer's output token twice or report success when the diagnostic total disagrees with the sent snapshot
+- Estimated charges from interrupted Runs no longer reduce the charge for a later completed Run; only the matching Run's counters replace its estimates
+- Cancelled finishes no longer discard unsettled cost, package copies in one process share session balances, output alone cannot select a higher input tier, and inconsistent cache counts cannot overstate input cost
 - Reads the provider answers itself (a missing file, or the complete-file read inside an edit) wait for a slow connection to drain and stop on a broken one, instead of overrunning it or answering the same read twice
 - Instruction and skill updates that OpenCode adds after a tool result (including a nested `AGENTS.md` picked up by a read) now reach the model in the same turn, the way Cursor's own clients steer a running turn, instead of leaking into OpenCode 2 read content or being dropped; an update Cursor does not deliver is sent with the next message. On OpenCode 2, a nested `AGENTS.md` loaded mid-step no longer restarts the Cursor turn, and updates OpenCode adds between messages (such as MCP server instructions) are no longer dropped ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
 - Tool-result continuations wait for the Run stream to drain before treating a result as delivered, so a slow connection cannot drop or replay a partial write ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
@@ -19,7 +22,7 @@
 - OpenCode 2 with several projects open renews a Cursor login and looks up its agent host once per process, not once per project
 - Concurrent project requests retain their own Cursor connection errors and retry decisions; renewed logins stay scoped to the API endpoint that issued them ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
 - A rejected login stays rejected between renewal attempts, invalid renewal responses back off, and forced renewal uses the replacement token even when its expiry matches the old one ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
-- OpenCode 2 no longer bills every tool step as a full new prompt; on both OpenCode 1.x and 2, the session cost shows an estimate during a turn and Cursor's real cost at the model's published rates once the turn ends (OpenCode 1.x previously showed $0)
+- OpenCode 2 no longer bills every tool step as a full new prompt; on both OpenCode 1.x and 2, the session cost shows estimates during a turn and reconciles toward its aggregate counters at published rates once the turn ends, within the snapshot's pricing limits (OpenCode 1.x previously showed $0)
 
 ## [0.8.1] - 2026-10-08
 

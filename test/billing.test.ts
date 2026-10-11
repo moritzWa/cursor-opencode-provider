@@ -47,6 +47,18 @@ const total = (usage: LanguageModelV3Usage) => (usage.inputTokens.total ?? 0) + 
 afterEach(() => billingLedger.clear())
 
 describe("pricing a Run", () => {
+  it("does not select a long-context tier just because output pushes occupancy over 200k", () => {
+    expect(turnEndedCostUsd(GROK, {
+      inputTokens: 200_000, outputTokens: 1_000, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0,
+    }, 201_000)).toBeCloseTo(0.406, 12)
+  })
+
+  it("bounds cache counters to the input partition before pricing them", () => {
+    expect(turnEndedCostUsd(CLAUDE, {
+      inputTokens: 100, outputTokens: 0, cacheRead: 150, cacheWrite: 50, reasoningTokens: 0,
+    }, 100)).toBeCloseTo(100 * 0.3e-6, 12)
+  })
+
   it("uses the catalog's Fast entry only for a Fast variant with its own rate", () => {
     expect(cursorPricingId("grok-4.7", [{ id: "fast", value: "true" }])).toBe("grok-4.7-fast")
     expect(cursorPricingId("grok-4.7", [{ id: "fast", value: "false" }])).toBe("grok-4.7")
@@ -134,6 +146,57 @@ describe("shapeStepUsage", () => {
 })
 
 describe("BillingLedger", () => {
+  it("does not spend an abandoned Run's estimates as credit against another Run", () => {
+    const ledger = new BillingLedger()
+    const abandoned = {}
+    const completed = {}
+    ledger.recordBilled("s", 0.08, abandoned)
+    ledger.recordBilled("s", 0.01, completed)
+    ledger.recordReal("s", 0.03, completed)
+    expect(ledger.outstanding("s")).toBeCloseTo(0.02, 12)
+    expect(ledger.totals("s")).toEqual({ realUsd: 0.03, billedUsd: 0.09 })
+  })
+
+  it("replaces only the matching Run's estimates, including a zero-cost completion", () => {
+    const ledger = new BillingLedger()
+    const pending = {}
+    const free = {}
+    ledger.recordBilled("s", 0.08, pending)
+    ledger.recordBilled("s", 0.01, free)
+    ledger.recordReal("s", 0, free)
+    expect(ledger.outstanding("s")).toBeCloseTo(-0.01, 12)
+    ledger.recordReal("s", 0.1, pending)
+    expect(ledger.outstanding("s")).toBeCloseTo(0.01, 12)
+  })
+
+  it("keeps session balances across separately evaluated module instances", async () => {
+    const copy = await import(new URL("../src/billing.ts?ledger-copy", import.meta.url).href)
+    const run = {}
+    billingLedger.recordBilled("shared-session", 0.08, run)
+    copy.billingLedger.recordReal("shared-session", 0.1, run)
+    expect(billingLedger.estimated("shared-session")).toBe(0)
+    expect(billingLedger.outstanding("shared-session")).toBeCloseTo(0.02, 12)
+    billingLedger.clear()
+    billingLedger.recordReal("shared-session", 0.2)
+    copy.billingLedger.recordBilled("shared-session", 0.05)
+    expect(copy.billingLedger.totals("shared-session")).toEqual({ realUsd: 0.2, billedUsd: 0.05 })
+    expect(billingLedger.outstanding("shared-session")).toBeCloseTo(0.15, 12)
+  })
+
+  it("does not subtract an evicted Run's estimates from a replacement session ledger", () => {
+    const ledger = new BillingLedger()
+    const oldRun = {}
+    const newRun = {}
+    ledger.recordBilled("s", 0.08, oldRun)
+    for (let i = 0; i < 1_024; i++) ledger.recordReal(`other-${i}`, 0.01)
+    ledger.recordBilled("s", 0.02, newRun)
+    ledger.recordReal("s", 0.1, oldRun)
+    expect(ledger.estimated("s")).toBeCloseTo(0.02, 12)
+    expect(ledger.outstanding("s")).toBeCloseTo(0.1, 12)
+    ledger.recordReal("s", 0.03, newRun)
+    expect(ledger.outstanding("s")).toBeCloseTo(0.11, 12)
+  })
+
   it("tracks real against billed per session", () => {
     const ledger = new BillingLedger()
     ledger.recordReal("s", 0.3)
@@ -211,7 +274,71 @@ const turn = (input: number, cacheRead: number, output: number) => serverFrame({
 })
 
 describe("turn-end settlement through a Run", () => {
-  it("bills Cursor's real turn cost on both hosts while reporting the occupancy snapshot", async () => {
+  it("starts a replacement stream with independent estimates", async () => {
+    const session = pricedRun("replacement", "ses_replacement", [
+      serverFrame({ conversation_checkpoint_update: checkpoint(40_000) }),
+      turn(60_000, 50_000, 500),
+    ], 30_000)
+    billingLedger.recordBilled(session.billing.key, 0.08, session.billing)
+    sessionManager.replaceStream(session, session.stream, "new-run")
+    expect(session.billing.estimatedUsd).toBe(0)
+    const finish = await finishOf(session)
+    expect(Math.abs(finish.providerMetadata.cursor.billing.stepUsd - 0.048)).toBeLessThan(2e-6)
+    expect(finish.providerMetadata.cursor.billing.sessionEstimatedUsd).toBeCloseTo(0.08, 12)
+  })
+
+  it("retains cost with no occupancy until a later priced snapshot can settle it", async () => {
+    const first = await finishOf(pricedRun("no-snapshot", "ses_snapshot", [turn(10_000, 0, 0)], 0))
+    expect(total(first.usage)).toBe(0)
+    expect(first.providerMetadata.copilot.totalNanoAiu).toBe(0)
+    expect(billingLedger.outstanding("ses_snapshot")).toBeCloseTo(0.02, 12)
+    const next = await finishOf(pricedRun("has-snapshot", "ses_snapshot", [
+      serverFrame({ conversation_checkpoint_update: checkpoint(20_000) }),
+      turn(10_000, 10_000, 0),
+    ], 0))
+    expect(Math.abs(openCode2Cost(GROK, next.usage) - 0.025)).toBeLessThan(2e-6)
+    expect(Math.abs(billingLedger.outstanding("ses_snapshot"))).toBeLessThan(2e-6)
+  })
+
+  it("retains a negative balance when the host's minimum price prevents settlement", async () => {
+    const session = pricedRun("minimum", "ses_minimum", [
+      serverFrame({ conversation_checkpoint_update: checkpoint(10_000) }),
+      turn(100, 100, 0),
+    ], 0)
+    session.billing.cost = CLAUDE
+    const finish = await finishOf(session)
+    const billed = openCode2Cost(CLAUDE, finish.usage)
+    expect(billed).toBeCloseTo(9_999 * 0.3e-6 + 15e-6, 12)
+    expect(billingLedger.outstanding("ses_minimum")).toBeCloseTo(100 * 0.3e-6 - billed, 12)
+    expect(finish.providerMetadata.cursor.billing.sessionBilledUsd).toBeCloseTo(billed, 12)
+  })
+
+  it("does not book a finish rejected by a cancelled consumer", async () => {
+    const session = pricedRun("cancelled", "ses_cancelled", [
+      serverFrame({ conversation_checkpoint_update: checkpoint(40_000) }),
+      turn(60_000, 50_000, 500),
+    ], 30_000)
+    const controller = {
+      enqueue() { throw new TypeError("Controller is closed") },
+      close() {},
+      error(error: unknown) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(session, controller, { textId: "t", reasoningId: "r" })
+    } finally {
+      sessionManager.dispose()
+    }
+    expect(billingLedger.totals("ses_cancelled").realUsd).toBeCloseTo(0.048, 12)
+    expect(billingLedger.totals("ses_cancelled").billedUsd).toBe(0)
+    expect(session.billing.prefixTokens).toBe(30_000)
+    const next = await finishOf(pricedRun("after-cancel", "ses_cancelled", [
+      serverFrame({ conversation_checkpoint_update: checkpoint(40_000) }),
+      turn(10_000, 10_000, 0),
+    ], 30_000))
+    expect(Math.abs(next.providerMetadata.cursor.billing.stepUsd - 0.053)).toBeLessThan(2e-6)
+  })
+
+  it("bills the catalog-priced turn cost on both hosts while reporting the occupancy snapshot", async () => {
     const finish = await finishOf(pricedRun("settle", "ses_settle", [
       serverFrame({ conversation_checkpoint_update: checkpoint(40_000) }),
       turn(60_000, 50_000, 500),

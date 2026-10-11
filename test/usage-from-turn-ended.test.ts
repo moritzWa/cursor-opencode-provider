@@ -203,6 +203,25 @@ function occupancyUsage(
 }
 
 describe("occupancy snapshot usage", () => {
+  it("reports the same diagnostic occupancy total for zero, one and populated snapshots", () => {
+    for (const usedTokens of [0, 1, 8_236, 22_767]) {
+      const details = { usedTokens, maxTokens: 256_000 }
+      const prior = { usedTokens: usedTokens + 10, maxTokens: 256_000 }
+      const counters = occupancyValidationCounters(details, prior)
+      expect(counters.inputTokens + counters.outputTokens).toBe(usedTokens)
+      expect(counters.cacheRead).toBeLessThanOrEqual(counters.inputTokens)
+      const validation = formatTurnUsageValidation(counters, occupancyUsage(details, prior), details, undefined, "occupancy")
+      expect(validation).toContain(`occupancyTotal=${usedTokens} sentTotal=${usedTokens}`)
+      expect(validation).toContain("status=ok")
+    }
+  })
+
+  it("does not report ok when diagnostic occupancy disagrees with the sent snapshot", () => {
+    const details = { usedTokens: 8_236, maxTokens: 256_000 }
+    const counters = { ...occupancyValidationCounters(details), inputTokens: 8_236 }
+    expect(formatTurnUsageValidation(counters, occupancyUsage(details), details, undefined, "occupancy")).toContain("status=mismatch")
+  })
+
   it("places occupancy on a snapshot whose TUI sum equals usedTokens and output > 0", () => {
     const details = { usedTokens: 153_744, maxTokens: 256_000 }
     const prior = { usedTokens: 123_651, maxTokens: 256_000 }
@@ -326,11 +345,11 @@ describe("occupancy snapshot usage", () => {
     expect(validation).toContain("totalMatch=true")
     expect(validation).toContain("breakdownMatch=true")
     expect(validation).toContain("cacheRatioMatch=true")
-    expect(validation).toContain("occupancyTotal=89576")
+    expect(validation).toContain("occupancyTotal=89575")
     expect(validation).toContain("occupancyCachedRatio=97.5% sentCachedRatio=97.5%")
     expect(validation).not.toContain("rawTotal=")
     expect(occupancyValidationCounters(details, prior)).toEqual({
-      inputTokens: 89_575,
+      inputTokens: 89_574,
       outputTokens: 1,
       cacheRead: 87_353,
       cacheWrite: 0,
@@ -691,7 +710,7 @@ describe("formatFinishTrace", () => {
       source: "occupancy-checkpoint-current-run",
     })).toBe(
       "finish: reason=tool-calls v3In=56793 v3Out=1 v3CacheRead=56522 v3CacheWrite=0 v3Reasoning=0 " +
-      "occupancyIn=56794 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
+      "occupancyIn=56793 occupancyOut=1 occupancyCacheRead=56522 occupancyCacheWrite=0 " +
       "source=occupancy-checkpoint-current-run",
     )
   })

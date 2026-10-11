@@ -13,6 +13,7 @@ import type { CursorConversationTokenDetails } from "./protocol/token-details.js
 import type { HostNoteBatch } from "./protocol/host-notes.js"
 import type { ParallelStepState } from "./parallel-step.js"
 import type { OpenCodeModelCost } from "./pricing.js"
+import type { RunCostEstimate } from "./billing.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -198,14 +199,8 @@ export type CursorSession = {
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
   tokenDetailsFresh?: boolean
-  /**
-   * Run-lifetime cache evidence. Cursor exposes only aggregate cache counters at
-   * TurnEnded, so retain the inputs and protocol activity needed to explain
-   * whether a low ratio came from a cold/rebased prefix, context growth, or a
-   * multi-step agent Run.
-   */
   /** Cost reporting for this Run's steps (`src/billing.ts`). */
-  billing: {
+  billing: RunCostEstimate & {
     /** Ledger key: the OpenCode session, or this Run for an ephemeral one. */
     key: string
     /** Catalog cost entry; absent for a model Cursor publishes no rate for. */
@@ -213,6 +208,12 @@ export type CursorSession = {
     /** Context the previous billed step already sent: read from cache on the next one. */
     prefixTokens: number
   }
+  /**
+   * Run-lifetime cache evidence. Cursor exposes only aggregate cache counters at
+   * TurnEnded, so retain the inputs and protocol activity needed to explain
+   * whether a low ratio came from a cold/rebased prefix, context growth, or a
+   * multi-step agent Run.
+   */
   cacheDiagnostics?: {
     sessionKey?: string
     conversationId: string
@@ -764,6 +765,9 @@ export class SessionManager {
     session.deferredTerminalReason = null
     const old = session.stream
     session.stream = next
+    // Preserve session totals but give the replacement Run its own estimates.
+    session.billing.estimatedUsd = 0
+    delete session.billing.ledgerEpoch
     if (runId !== undefined) session.runId = runId
     session.frames = next.frames()[Symbol.asyncIterator]()
     session.pendingFrameRead = undefined

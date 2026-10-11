@@ -1409,7 +1409,7 @@ describe("display-only ToolCall pump bridge", () => {
       const usd = (6_522 * 2 + 22_944 * 0.5 + 6) / 1e6
       expect(finish.providerMetadata.copilot.totalNanoAiu / 1e11).toBeCloseTo(usd, 9)
       expect(finish.providerMetadata.cursor.billing).toEqual({
-        stepUsd: usd, estimate: true, sessionRealUsd: 0, sessionBilledUsd: usd,
+        stepUsd: usd, estimate: true, sessionRealUsd: 0, sessionBilledUsd: usd, sessionEstimatedUsd: usd,
       })
       // The next step reads this step's context from cache.
       expect(session.billing.prefixTokens).toBe(29_467)
@@ -1418,6 +1418,69 @@ describe("display-only ToolCall pump bridge", () => {
       billingLedger.clear()
     }
   })
+  it("replaces a completing Run's delivered tool estimates with its actual counters", async () => {
+    const parts: any[] = []
+    const session = fakeSession([
+      rawExecPayload(34, 28, rawSubagentArgs()),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: { turn_ended: { input_tokens: 60_000, cache_read: 50_000, output_tokens: 500 } },
+      }),
+    ], [])
+    session.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    session.billing = { key: "ses_completed_step", cost: { input: 2, output: 6, cache_read: 0.5 }, prefixTokens: 30_000 }
+    const controller = {
+      enqueue(part: unknown) { parts.push(part) },
+      close() {},
+      error(error: Error) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(session, controller, { textId: "t", reasoningId: "r" })
+      sessionManager.resolve(session.sessionId, 34)
+      await pump(session, controller, { textId: "t", reasoningId: "r" })
+      const finishes = parts.filter((part) => part.type === "finish")
+      expect(finishes).toHaveLength(2)
+      const billed = finishes.reduce((sum, part) => sum + part.providerMetadata.copilot.totalNanoAiu / 1e11, 0)
+      expect(Math.abs(billed - 0.048)).toBeLessThan(2e-6)
+      expect(billingLedger.estimated(session.billing.key)).toBe(0)
+      expect(Math.abs(billingLedger.outstanding(session.billing.key))).toBeLessThan(2e-6)
+    } finally {
+      billingLedger.clear()
+    }
+  })
+
+  it("keeps abandoned tool-step estimates out of a later Run's settlement", async () => {
+    const key = "ses_abandoned_step"
+    const cost = { input: 2, output: 6, cache_read: 0.5 }
+    const first = fakeSession([rawExecPayload(34, 28, rawSubagentArgs())], [])
+    first.runId = "abandoned-run"
+    first.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+    first.billing = { key, cost, prefixTokens: 0 }
+    const firstParts: any[] = []
+    const controller = (parts: any[]) => ({
+      enqueue(part: unknown) { parts.push(part) },
+      close() {},
+      error(error: Error) { throw error },
+    }) as unknown as ReadableStreamDefaultController<any>
+    try {
+      await pump(first, controller(firstParts), { textId: "t", reasoningId: "r" })
+      expect(firstParts.find((part) => part.type === "finish").providerMetadata.cursor.billing.stepUsd).toBeGreaterThan(0.08)
+      sessionManager.close(first, "superseded-by-new-run")
+      const next = fakeSession([encodeMessage("AgentServerMessage", {
+        interaction_update: { turn_ended: { input_tokens: 60_000, cache_read: 50_000, output_tokens: 500 } },
+      })], [])
+      next.runId = "completed-run"
+      next.tokenDetails = { usedTokens: 40_000, maxTokens: 256_000 }
+      next.billing = { key, cost, prefixTokens: 40_000 }
+      const nextParts: any[] = []
+      await pump(next, controller(nextParts), { textId: "t", reasoningId: "r" })
+      const finish = nextParts.find((part) => part.type === "finish")
+      expect(Math.abs(finish.providerMetadata.cursor.billing.stepUsd - 0.048)).toBeLessThan(2e-6)
+      expect(Math.abs(billingLedger.outstanding(key))).toBeLessThan(2e-6)
+    } finally {
+      billingLedger.clear()
+    }
+  })
+
   it("routes Cursor guide through an enabled custom scout without changing local explore", async () => {
     const writes: Uint8Array[] = []
     const parts: any[] = []
