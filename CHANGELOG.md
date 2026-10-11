@@ -9,12 +9,16 @@
 
 ### Fixed
 
+- OpenCode 2's generic SDK fallback no longer bypasses the plugin's current-credential resolver; new Runs resolve the active login even when the host already supplied an SDK
 - Reads the provider answers itself (a missing file, or the complete-file read inside an edit) wait for a slow connection to drain and stop on a broken one, instead of overrunning it or answering the same read twice
 - Instruction and skill updates that OpenCode adds after a tool result (including a nested `AGENTS.md` picked up by a read) now reach the model in the same turn, the way Cursor's own clients steer a running turn, instead of leaking into OpenCode 2 read content or being dropped; an update Cursor does not deliver is sent with the next message. On OpenCode 2, a nested `AGENTS.md` loaded mid-step no longer restarts the Cursor turn, and updates OpenCode adds between messages (such as MCP server instructions) are no longer dropped ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
 - Tool-result continuations wait for the Run stream to drain before treating a result as delivered, so a slow connection cannot drop or replay a partial write ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
 - A rebuilt Cursor conversation (after compaction, an interrupted turn, a restart without its saved state, or returning from another model) keeps your `AGENTS.md`, skills and subagents; Cursor previously dropped them for the rest of the session ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
 - A tool waiting on a permission or question prompt keeps its Cursor turn however long you take to answer, instead of losing it after 10 minutes ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
 - A `git status` that fails or times out is reported to Cursor as incomplete instead of as a clean working tree ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
+- OpenCode 2 with several projects open renews a Cursor login and looks up its agent host once per process, not once per project
+- Concurrent project requests retain their own Cursor connection errors and retry decisions; renewed logins stay scoped to the API endpoint that issued them ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
+- A rejected login stays rejected between renewal attempts, invalid renewal responses back off, and forced renewal uses the replacement token even when its expiry matches the old one ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
 
 ## [0.8.1] - 2026-10-08
 
