@@ -54,6 +54,8 @@ Inside `opencode2`, run `/connect`, choose **Cursor**, then browser login or an 
 
 After auth, Cursor models appear in the picker from the in-memory inventory. The `<host-cache>/cursor-models.json` cache is still used as the discovery source; it is not copied into config.
 
+The plugin supplies its own Cursor SDK even when the host's generic package loader already created one. Each new Run resolves the active integration credential and applies on-demand renewal; a token captured by the generic loader or its options cannot bypass that resolver.
+
 ## From a local clone (`CURSOR_OPENCODE2_DEV_ENTRY`)
 
 ```bash

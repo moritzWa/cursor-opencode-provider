@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- OpenCode 2's generic SDK fallback no longer bypasses the plugin's current-credential resolver; new Runs resolve the active login even when the host already supplied an SDK
 - Reads the provider answers itself (a missing file, or the complete-file read inside an edit) wait for a slow connection to drain and stop on a broken one, instead of overrunning it or answering the same read twice
 - Instruction and skill updates that OpenCode adds after a tool result (including a nested `AGENTS.md` picked up by a read) now reach the model in the same turn, the way Cursor's own clients steer a running turn, instead of leaking into OpenCode 2 read content or being dropped; an update Cursor does not deliver is sent with the next message. On OpenCode 2, a nested `AGENTS.md` loaded mid-step no longer restarts the Cursor turn, and updates OpenCode adds between messages (such as MCP server instructions) are no longer dropped ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))
 - Tool-result continuations wait for the Run stream to drain before treating a result as delivered, so a slow connection cannot drop or replay a partial write ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49) by [@nkoynov](https://github.com/nkoynov))

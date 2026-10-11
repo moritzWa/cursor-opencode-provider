@@ -685,3 +685,11 @@
 ## 2026-10-09 — Test independent dependency graphs
 
 - Reloading an entry module with a query string does not reload its dependencies. Reproductions involving class identity must load a separate dependency graph and assert different constructors; success-path deduplication alone does not validate a shared promise's rejection path (`test/process-shared.test.ts`).
+
+## 2026-10-11 — Reproduce the host's hook order
+
+- Test provider hooks with a pre-populated SDK when the host's generic loader
+  runs first. Preserving that fallback can bypass per-request credential
+  renewal even though tests starting with an empty SDK pass. Keep the current
+  integration resolver after captured host options, and preserve other
+  providers' SDKs (`test/plugin-opencode2.test.ts`).
