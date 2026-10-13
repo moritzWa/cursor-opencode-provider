@@ -296,6 +296,17 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).not.toContain("OpenCode `task`")
   })
 
+  it("names OpenCode 2's `patch` as the file tool on a GPT catalog", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      { name: "patch" },
+      { name: "read" },
+      { name: "shell" },
+    ], false, "/workspace/project")!
+    expect(guidance).toContain("Use OpenCode `patch` for file-content changes")
+    expect(guidance).toContain("converted to `patch` automatically")
+    expect(guidance).toContain("make a targeted edit/patch from complete context")
+  })
+
   it("routes advertised skill and MCP tools through the dynamic catalog (issue #29)", () => {
     const withBoth = buildOpenCodeInteractionGuidance([
       { name: "skill" },

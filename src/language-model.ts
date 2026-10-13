@@ -73,6 +73,7 @@ import {
   type OpencodeToolDef,
   type ParsedExecRequest,
 } from "./protocol/tools.js"
+import { hostPatchTool, isHostPatchTool } from "./protocol/apply-patch.js"
 import { buildGitDiffExecMessages } from "./protocol/git-diff.js"
 import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
 import { createManagedTerminal } from "./terminal-runner.js"
@@ -3397,6 +3398,11 @@ export async function pump(
   const advertisedToolNameSet = new Set(
     advertisedToolNames.map((name) => resolveCustomWebToolAlias(name, session.toolAliases)),
   )
+  // The epoch catalog still lists `edit`/`write` after a switch to a GPT model; this turn's host list picks the file tool.
+  const fileToolNames = (): ReadonlySet<string> =>
+    session.permittedToolNames && session.permittedToolNames.size > 0
+      ? session.permittedToolNames
+      : advertisedToolNameSet
   let textStarted = false
   let reasoningStarted = false
   let assistantText = ""
@@ -3613,9 +3619,9 @@ export async function pump(
       !displayCallId ||
       parsed.resultField !== "read_result" ||
       parsed.toolName !== "read" ||
-      // `apply_patch` is the substitute this host offers when it withholds
+      // The patch tool is the substitute this host offers when it withholds
       // `write` — the follow-up write_args is remapped onto it either way.
-      !(advertisedToolNameSet.has("write") || advertisedToolNameSet.has("apply_patch"))
+      !(advertisedToolNameSet.has("write") || hostPatchTool(advertisedToolNameSet))
     ) return false
 
     const stored = session.displayToolCalls.get(displayCallId)
@@ -4610,7 +4616,7 @@ export async function pump(
           if (editCall) {
             const remapped = remapCorrelatedEditWriteForCatalog(
               parsed,
-              advertisedToolNameSet,
+              fileToolNames(),
               editCall.path,
               workspaceRootFromRequestContext(session.requestContext),
             )
@@ -4624,12 +4630,12 @@ export async function pump(
               )
             }
           }
-          // Hosts that advertise `apply_patch` in place of `edit`/`write` (see
+          // Hosts that advertise a patch tool in place of `edit`/`write` (see
           // protocol/apply-patch.ts) still receive Cursor's native write/edit
           // exec requests. Translate before the unavailable-tool check below.
           remapEditToolsForCatalog(
             parsed,
-            advertisedToolNameSet,
+            fileToolNames(),
             workspaceRootFromRequestContext(session.requestContext),
           )
         }
@@ -5439,7 +5445,7 @@ function attributeTrailingMedia(results: ToolResultContent[], media: unknown[]):
     if (result.output === TOOL_MEDIA_PLACEHOLDER) return { min: 1, max: media.length }
     // These canonical tools have text output only. Opaque MCP tools remain
     // unconstrained, even if another tool also returned descriptive text.
-    if (["glob", "grep", "ls", "edit", "write", "apply_patch", "todowrite", "todoread"].includes(result.toolName)) {
+    if (["glob", "grep", "ls", "edit", "write", "todowrite", "todoread"].includes(result.toolName) || isHostPatchTool(result.toolName)) {
       return { min: 0, max: 0 }
     }
     return { min: 0, max: media.length }
@@ -5635,6 +5641,7 @@ export function buildOpenCodeInteractionGuidance(
   if (isCompaction) return undefined
   const names = new Set(tools.map((tool) => tool.name))
   if (names.size === 0) return undefined
+  const patchTool = hostPatchTool(names)
   const instructions: string[] = []
   const subagents = extractHostSubagentCatalog(tools)
   const planEntryHandoff = !names.has("plan_enter") && hostAgentModeSwitchKind() === "resumes"
@@ -5779,12 +5786,12 @@ export function buildOpenCodeInteractionGuidance(
         ? "- For file changes, use OpenCode `edit` for targeted changes to existing files and `write` to create files or intentionally replace complete contents; do not use shell, Python, or heredocs to change file content while these tools are available."
         : "- Use OpenCode `write` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available.",
     )
-  } else if (names.has("apply_patch")) {
-    // This host withheld `edit`/`write` and offers `apply_patch` instead. Native
+  } else if (patchTool) {
+    // This host withheld `edit`/`write` and offers a patch tool instead. Native
     // Cursor write/edit requests are translated into it, so say so rather than
     // leaving the turn with no file-editing guidance at all.
     instructions.push(
-      "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Cursor-native write and edit requests are accepted and converted to `apply_patch` automatically.",
+      `- Use OpenCode \`${patchTool}\` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Cursor-native write and edit requests are accepted and converted to \`${patchTool}\` automatically.`,
     )
   }
   if (hostToolDialectFromTools(tools).filePathKey === "path") {
@@ -5792,7 +5799,7 @@ export function buildOpenCodeInteractionGuidance(
       "- OpenCode file tools take `path` as an absolute path under the workspace root above. Do not pass a project-relative path, and do not invent a different absolute prefix.",
     )
   }
-  if (names.has("edit") || names.has("write") || names.has("apply_patch")) {
+  if (names.has("edit") || names.has("write") || patchTool) {
     instructions.push(
       "- Never use a read result as complete file content when it says the output is capped, partial, or requires another offset. Read the remaining ranges first, or make a targeted edit/patch from complete context; do not pass a partial read back as a whole-file replacement.",
     )

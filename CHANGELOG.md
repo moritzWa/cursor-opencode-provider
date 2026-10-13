@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- On OpenCode 2, file writes and edits from GPT models go to OpenCode's `patch` tool instead of first failing with "OpenCode tool 'write' is unavailable for the current agent", also after a session switches to a GPT model ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov), [#80](https://github.com/oakimov/cursor-opencode-provider/issues/80))
 - On OpenCode 2, Stop stops the Cursor Run instead of leaving it generating, or waiting for a tool result, until your next message ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov))
 - A Run whose stream is cancelled mid-generation, as OpenCode 1.x does on Stop, is cancelled at Cursor so the next message resumes from where it stopped, and a tool result Cursor has withdrawn is no longer sent back ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov))
 - A turn stopped mid-step keeps its Cursor conversation and prompt cache at the next message, also after a restart ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov), [#74](https://github.com/oakimov/cursor-opencode-provider/issues/74))
