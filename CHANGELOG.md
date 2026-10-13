@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Pull request reviews follow the repository review rubric (`docs/review-rules.md`), including blocker checks for secrets, entrypoints, provider boundary, and protocol evidence
 - The first message of a new session no longer runs workspace discovery (`git status`) twice, once for the title and once for the turn ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
 - Debug log: `finish:` and usage-validation counters are labelled by source (`raw*`, `occupancy*`, `est*`), `rawReadVsPriorContext` is a multiple (`3.00x`), and cache diagnoses name why a Run started cold (`coldReason`) ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
 
