@@ -159,6 +159,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   host cache: checkpoint, reachable blobs, baseline, catalogs, provenance, notes,
   lost requests and steer receipts. Keep all blobs if reachability is uncertain.
   A >100 MiB or incomplete transfer graph warns and warm-reuses; it never remints.
+- Skip a history image only when the checkpoint being sent is known to hold it
+  (`sent-history-images.ts`; hashes per conversation id + checkpoint SHA-256,
+  snapshot fields 16/17). A Run's own images count once its turn ends with
+  `turn_ended` on a checkpoint that arrived after them; a failed or stopped
+  turn, or a snapshot without the set, sends them again.
 - Retention uses persisted application metadata, not filesystem timestamps.
   Hydrate on demand, expire after 24 h, avoid blocking startup/full-cache decode,
   preserve concurrent replacement files, and keep soft-evicted state reusable.

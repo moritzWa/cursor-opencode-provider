@@ -213,6 +213,15 @@ import {
   hydrateTurnProvenance,
   persistConversationState,
 } from "./protocol/conversation-state.js"
+import {
+  confirmHistoryImagesAtTurnEnd,
+  forgetHeldHistoryImages,
+  heldHistoryImageHashes,
+  noteHistoryImageCheckpoint,
+  noteHistoryImagesSent,
+  resetHeldHistoryImagesForTests,
+  runHistoryImages,
+} from "./protocol/sent-history-images.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
 import {
   resolveContinuationPolicy,
@@ -323,7 +332,6 @@ let _availableModelsMtimeMs = -1
 // session so the new Cursor conversation is still born with tool definitions;
 // execution remains disabled for the summary turn itself.
 const toolCatalogBySession = new Map<string, OpencodeToolDef[]>()
-const sentHistoryImageHashesBySession = new Map<string, Set<string>>()
 /** Host note bodies a turn ended without delivering, for the session's next user turn. */
 let nextHostNoteOrder = 0
 const undeliveredHostNotesBySession = new Map<string, HostNoteBatch[]>()
@@ -343,7 +351,6 @@ const postCompactionRebaseBySession = new Set<string>()
 type PromptIdentity = { hostAgent?: string; systemPromptHash?: string }
 const promptIdentityBySession = new Map<string, PromptIdentity>()
 export const MAX_TURN_STATE_SESSIONS = 256
-const MAX_SENT_HISTORY_IMAGES_PER_SESSION = 256
 const DEFAULT_RETRY_POLICY = {
   maxAttempts: 3,
   baseDelayMs: 500,
@@ -748,34 +755,20 @@ export function promptIdentityWouldRemint(
   return false
 }
 
-function sentHistoryImageHashes(sessionKey: string | undefined): ReadonlySet<string> | undefined {
-  if (!sessionKey) return undefined
-  const hashes = sentHistoryImageHashesBySession.get(sessionKey)
-  if (!hashes) return undefined
-  sentHistoryImageHashesBySession.delete(sessionKey)
-  sentHistoryImageHashesBySession.set(sessionKey, hashes)
-  return hashes
+function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array): void {
+  if (!session.historyImages || !session.openCodeSessionId) return
+  noteHistoryImageCheckpoint(session.historyImages, session.openCodeSessionId, session.conversationId, checkpoint)
 }
 
-function rememberSentHistoryImageHashes(sessionKey: string | undefined, hashes: readonly string[]): void {
-  if (!sessionKey || hashes.length === 0) return
-  const remembered = sentHistoryImageHashesBySession.get(sessionKey) ?? new Set<string>()
-  for (const hash of hashes) {
-    remembered.delete(hash)
-    remembered.add(hash)
-    while (remembered.size > MAX_SENT_HISTORY_IMAGES_PER_SESSION) {
-      const oldest = remembered.values().next().value as string | undefined
-      if (!oldest) break
-      remembered.delete(oldest)
-    }
-  }
-  sentHistoryImageHashesBySession.delete(sessionKey)
-  sentHistoryImageHashesBySession.set(sessionKey, remembered)
-  while (sentHistoryImageHashesBySession.size > MAX_TURN_STATE_SESSIONS) {
-    const oldest = sentHistoryImageHashesBySession.keys().next().value as string | undefined
-    if (!oldest) break
-    sentHistoryImageHashesBySession.delete(oldest)
-  }
+/** `resumeCheckpoint` is set only by a checkpoint this Run received. */
+function confirmRunImagesAtTurnEnd(session: CursorSession): void {
+  if (!session.historyImages || !session.openCodeSessionId) return
+  confirmHistoryImagesAtTurnEnd(
+    session.historyImages,
+    session.openCodeSessionId,
+    session.conversationId,
+    session.resumeCheckpoint,
+  )
 }
 
 /** Test helper: the release `startSession` performs, then the host-note stores. */
@@ -788,11 +781,6 @@ export function releaseHostNoteInjectionsForTests(sessionKey: string): {
     inFlight: [...(hostNoteInjectionsBySession.get(sessionKey)?.values() ?? [])].map((entry) => entry.notes),
     undelivered: undeliveredHostNotes(sessionKey),
   }
-}
-
-/** Test helper: content hashes recorded after a successful held-Run image write. */
-export function snapshotSentHistoryImageHashesForTests(sessionKey: string): string[] {
-  return [...(sentHistoryImageHashesBySession.get(sessionKey) ?? [])]
 }
 
 type V3Part = LanguageModelV3StreamPart
@@ -1623,6 +1611,7 @@ async function startSession(
     ?? (recovery?.kind === "rebase" ? "interrupted-run" : (resetState.reason ?? "unknown"))
   if (bound.reset) {
     if (sessionKey) {
+      forgetHeldHistoryImages(sessionKey)
       await clearPersistedConversationState(cacheDir, sessionKey, bound.previousId).catch((error) => {
         trace(`conversation persistence: reset cleanup failed sessionKey=${sessionKey}: ${String(error)}`)
       })
@@ -1800,6 +1789,10 @@ async function startSession(
       assertCursorUserImageSupport(message as unknown as Record<string, unknown> | undefined, supportsImages, cursorModelId)
     }
   }
+  // A Run without a checkpoint (new, reset, rebased or compacted conversation) sends every image.
+  const heldImages = sessionKey && !ephemeralRun && conversationState
+    ? heldHistoryImageHashes(sessionKey, conversationId, conversationState)
+    : undefined
   const imageExtraction = resuming
     ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0, omittedCount: 0 }
     : await extractCursorPromptImages(
@@ -1807,13 +1800,7 @@ async function startSession(
         lastUser as unknown as Record<string, unknown> | undefined,
         {
           supportsImages,
-          // Content hashes are retained for the OpenCode session so growing
-          // history does not re-upload old screenshots. A recovery or
-          // foreign-history rebase opens a new Cursor conversation, so it must
-          // resend the same payload.
-          seenHistoryHashes: recovery?.kind === "rebase" || foreignHistory
-            ? undefined
-            : sentHistoryImageHashes(sessionKey),
+          seenHistoryHashes: heldImages,
           signal: callOptions.abortSignal,
         },
       )
@@ -1972,8 +1959,9 @@ async function startSession(
     stoppedWithSessionId: lifecycle ? undefined : sessionKey,
     requestedAt: startOptions?.requestedAt ?? Date.now(),
   })
-  rememberSentHistoryImageHashes(sessionKey, imageExtraction.hashes)
   userTurnHostNotes.sent()
+  const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
+  if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes)
 
   const hostToolDialect = hostToolDialectFromTools(tools, options.defaultDialect)
   trace(
@@ -1994,6 +1982,7 @@ async function startSession(
     conversationId,
     cacheDir,
     resumeCheckpoint: undefined,
+    ...(historyImages ? { historyImages } : {}),
     tokenDetails: priorTokenDetails,
     tokenDetailsFresh: false,
     cacheDiagnostics: {
@@ -2821,6 +2810,7 @@ export async function drainSessionUntilTurnEnded(
           noteCheckpoint(session.openCodeSessionId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
+          noteRunImageCheckpoint(session, bytes)
           const tokenDetails = decodeConversationTokenDetails(bytes)
           if (tokenDetails) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -2840,6 +2830,7 @@ export async function drainSessionUntilTurnEnded(
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
         keepUndeliveredHostNotes(session)
         settleEarlySteers(session.openCodeSessionId, session.sessionId)
+        confirmRunImagesAtTurnEnd(session)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),
@@ -3328,9 +3319,7 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
-    // Cursor now holds these in the exec result; the next fresh Run must not
-    // attach them again as history images.
-    rememberSentHistoryImageHashes(session.openCodeSessionId, deliveredImageHashes)
+    if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes)
     if (deliveredSwitchMode) {
       const normalized = deliveredSwitchMode.target.toLowerCase()
       setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
@@ -4840,6 +4829,7 @@ export async function pump(
         noteCheckpoint(session.openCodeSessionId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
+        noteRunImageCheckpoint(session, bytes)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
@@ -4891,6 +4881,7 @@ export async function pump(
       const turnEnded = iu.turn_ended as Record<string, unknown>
       recordTurnEndedCost(session, turnEnded)
       if (session.openCodeSessionId) finishEmittedStep(session.openCodeSessionId, session.conversationId)
+      confirmRunImagesAtTurnEnd(session)
       await persistTerminalCheckpoint(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
       if (steers.undelivered.length > 0 && typeof session.reopenWithUserMessage === "function") {
@@ -7111,7 +7102,7 @@ export function resetTurnStateForTests(): void {
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
-  sentHistoryImageHashesBySession.clear()
+  resetHeldHistoryImagesForTests()
   undeliveredHostNotesBySession.clear()
   steerAnsweringRuns.clear()
   resetHostSteersForTests()
