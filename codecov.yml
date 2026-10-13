@@ -260,4 +260,13 @@ coverage:
           - unit
         paths:
           - src/
-    changes: true
+    changes:
+      default:
+        if_ci_failed: error
+        if_not_found: success
+        only_pulls: false
+        informational: false
+        flags:
+          - unit
+        paths:
+          - src/
