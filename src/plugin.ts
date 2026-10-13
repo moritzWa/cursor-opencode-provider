@@ -8,6 +8,7 @@ import {
   CURSOR_WEBSITE_HOST,
 } from "./shared.js"
 import { cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled } from "./plugin-core.js"
+import { noteHostCompaction } from "./language-model.js"
 import { pollForTokens, exchangeApiKey, isExpiringSoon, generatePkceParams, generatePkceChallenge, buildLoginUrl, decodeJwtExpiryMs, isExchangeableApiKey } from "./auth.js"
 import {
   renewSessionIfDue,
@@ -392,7 +393,14 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
     },
 
     async "chat.params"(hookInput, output) {
-      if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) return
+      if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) {
+        if (hookInput.agent === "compaction") {
+          await noteHostCompaction(hookInput.sessionID).catch((error) => {
+            trace(`host compaction: checkpoint cleanup failed sessionKey=${hookInput.sessionID}: ${errorMessage(error)}`)
+          })
+        }
+        return
+      }
       // Agent changes can replace the host system prompt and mode contract.
       // Carry the canonical OpenCode id so an incompatible Cursor checkpoint
       // is rotated instead of resuming the prior agent's prompt.

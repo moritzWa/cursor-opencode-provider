@@ -19,6 +19,7 @@ import {
   resetCursorShellCalls,
 } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
+import { resetTurnStateForTests, resolveTurnConversationReset } from "../src/language-model.js"
 import * as rootExports from "../src/index.js"
 import { hostPlanFileFor, resetHostPlanFilesForTests } from "../src/host-plan-file.js"
 import { HOST_PATH_BRIDGE } from "../src/context/paths.js"
@@ -134,6 +135,29 @@ describe("package root exports", () => {
       resetHostPlanFilesForTests()
       resetHostAgentModeSwitchForTests()
       }
+  })
+
+  it("rebases the next Cursor turn after another provider compacted the session", async () => {
+    resetTurnStateForTests()
+    const hooks = await CursorPlugin({} as any)
+    const params = { options: {} as Record<string, unknown> }
+    await hooks["chat.params"]!(
+      { sessionID: "ses_other_build", model: { providerID: "openai" }, agent: "build" } as any,
+      params as any,
+    )
+    expect(resolveTurnConversationReset({ sessionKey: "ses_other_build", isCompaction: false }))
+      .toEqual({ reset: false })
+
+    await hooks["chat.params"]!(
+      { sessionID: "ses_other_compaction", model: { providerID: "openai" }, agent: "compaction" } as any,
+      params as any,
+    )
+    expect(params.options[CURSOR_COMPACTION_OPTION]).toBeUndefined()
+    expect(resolveTurnConversationReset({ sessionKey: "ses_other_compaction", isCompaction: false }))
+      .toEqual({ reset: true, reason: "post-compaction-rebase" })
+    expect(resolveTurnConversationReset({ sessionKey: "ses_other_compaction", isCompaction: false }))
+      .toEqual({ reset: false })
+    resetTurnStateForTests()
   })
 
   it("looks a session's plan file up once when it has none, but retries a failed lookup", async () => {

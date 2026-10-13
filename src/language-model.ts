@@ -624,6 +624,19 @@ function rememberPostCompactionRebase(sessionKey: string): void {
   }
 }
 
+/**
+ * OpenCode compacted this session with a model this provider never saw (the
+ * compaction agent can run on another provider). The host keeps a recent tail
+ * after the summary, so the next prompt still ends with this provider's own
+ * step and foreign-history detection cannot notice the rewrite. Rebase the next
+ * turn onto the compacted host history, and drop the persisted checkpoint so a
+ * server restart in between cannot resume the pre-compaction conversation.
+ */
+export async function noteHostCompaction(sessionKey: string): Promise<void> {
+  rememberPostCompactionRebase(sessionKey)
+  await clearPersistedConversationState(opencodeGlobalCacheDir(), sessionKey)
+}
+
 function normalizePromptIdentity(value: PromptIdentity): PromptIdentity {
   const hostAgent = value.hostAgent?.trim()
   const systemPromptHash = value.systemPromptHash?.trim()
