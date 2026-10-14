@@ -27,6 +27,7 @@
 - Concurrent project requests retain their own Cursor connection errors and retry decisions; renewed logins stay scoped to the API endpoint that issued them ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
 - A rejected login stays rejected between renewal attempts, invalid renewal responses back off, and forced renewal uses the replacement token even when its expiry matches the old one ([#70](https://github.com/oakimov/cursor-opencode-provider/pull/70))
 - OpenCode 2 no longer bills every tool step as a full new prompt; on both OpenCode 1.x and 2, the session cost shows estimates during a turn and reconciles toward its aggregate counters at published rates once the turn ends, within the snapshot's pricing limits (OpenCode 1.x previously showed $0)
+- Grok 4.7, 4.6 and 4.5 now run Cursor's declared default level (High) when no reasoning effort is configured; before, they ran at the lowest level because Cursor's default is a Fast variant that the resolver skips ([#86](https://github.com/oakimov/cursor-opencode-provider/pull/86) by [@willowite](https://github.com/willowite))
 
 ## [0.8.1] - 2026-10-08
 
