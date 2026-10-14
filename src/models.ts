@@ -506,8 +506,20 @@ export function resolveVariantParameters(
     if (max) return buildRequestedModelParams(max.parameterValues, { maxMode: true })
   }
 
-  // 4. Default non-max variant.
-  const byDefault = scoped.find((v) => v.isDefaultNonMax) ?? scoped[0]
+  // 4. Default non-max variant. Cursor can declare a Fast variant as the default (Grok);
+  // `scoped` has no Fast variants, so take the declared default's non-Fast twin (same
+  // parameters except `fast`) before falling back to the first variant, the lowest level.
+  const declaredDefault = model.variants.find((v) => v.isDefaultNonMax)
+  const isNonFastTwinOfDefault = (v: ModelVariant): boolean =>
+    declaredDefault !== undefined &&
+    v.parameterValues.length === declaredDefault.parameterValues.length &&
+    v.parameterValues.every(
+      (p) =>
+        p.id === "fast" ||
+        declaredDefault.parameterValues.some((d) => d.id === p.id && d.value === p.value),
+    )
+  const byDefault =
+    scoped.find((v) => v.isDefaultNonMax) ?? scoped.find(isNonFastTwinOfDefault) ?? scoped[0]
   return buildRequestedModelParams(byDefault.parameterValues, {
     reasoningEffort: opts.reasoningEffort,
     maxMode: false,

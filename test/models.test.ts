@@ -1322,3 +1322,56 @@ describe("model cache integrity", () => {
     }
   })
 })
+
+describe("resolveVariantParameters (declared default is a Fast variant)", () => {
+  const variant = (effort: string, fast: boolean, isDefaultNonMax = false) => ({
+    key: "grok",
+    displayName: `${effort} ${fast ? "fast" : "standard"}`,
+    isDefaultNonMax,
+    isDefaultMax: false,
+    parameterValues: [
+      { id: "effort", value: effort },
+      { id: "fast", value: String(fast) },
+    ],
+  })
+  // Mirrors Grok 4.6: lowest effort listed first, "High Fast" declared as the default.
+  const grok: Parameters<typeof resolveVariantParameters>[0] = {
+    id: "grok-4.6",
+    maxContext: 256_000,
+    maxContextForMaxMode: 256_000,
+    variants: [
+      variant("low", false),
+      variant("low", true),
+      variant("medium", false),
+      variant("medium", true),
+      variant("high", false),
+      variant("high", true, true),
+    ],
+  }
+
+  it("sends the non-Fast twin of the declared default when no hint is given", () => {
+    expect(resolveVariantParameters(grok)).toEqual([
+      { id: "effort", value: "high" },
+      { id: "fast", value: "false" },
+    ])
+  })
+
+  it("still sends a picked Fast variant verbatim", () => {
+    const picked = [
+      { id: "effort", value: "low" },
+      { id: "fast", value: "true" },
+    ]
+    expect(resolveVariantParameters(grok, { picked })).toEqual(picked)
+  })
+
+  it("keeps a non-Fast declared default as is", () => {
+    const plain = {
+      ...grok,
+      variants: [variant("low", false), variant("medium", false, true), variant("high", false)],
+    }
+    expect(resolveVariantParameters(plain)).toEqual([
+      { id: "effort", value: "medium" },
+      { id: "fast", value: "false" },
+    ])
+  })
+})
