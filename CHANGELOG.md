@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- A configured reasoning effort now reaches models whose Cursor parameter is `reasoning_effort` (Grok 4.7, Gemini 3.8 Flash, Gemini 4 Argon); before, only models with an `effort` or `reasoning` parameter honored it and the others always ran Cursor's default variant
+- A configured reasoning effort now reaches models whose Cursor parameter is `reasoning_effort` (Grok 4.7, Gemini 3.8 Flash, Gemini 4 Argon); before, only models with an `effort` or `reasoning` parameter honored it and the others always ran Cursor's default variant ([#84](https://github.com/oakimov/cursor-opencode-provider/pull/84) by [@willowite](https://github.com/willowite))
 - The first Cursor request after a restart no longer waits for every saved conversation to be decompressed; sessions restore on demand while bounded cache cleanup runs independently ([#68](https://github.com/oakimov/cursor-opencode-provider/issues/68))
 - Saved conversations now expire on a long-running server without a restart, including snapshots from the previous cache schema and temp files left by a save that was killed mid-write; concurrent cleanups no longer abort each other or, on Bun, fail a restore that races them, and one unreadable file no longer stops the rest of a cleanup pass
 - Restored or saved conversations no longer keep a second full copy of their checkpoint and blobs in memory for the life of the process; only the conversation id, timestamp and turn provenance stay resident, and a later restore reads the snapshot from disk
