@@ -23,7 +23,24 @@ import {
   normalizeAgentRunOrigin,
   type BidiStream,
 } from "./transport/connect.js"
-import { waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
+import { StreamWriteDrainError, waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
+import {
+  clearEarlySteers,
+  forgetEarlySteerRecords,
+  forgetUndeliveredEarlySteer,
+  handOverEarlySteers,
+  isEarlySteerTracked,
+  needsHostHistory,
+  listenForHostSteers,
+  markEarlySteerDelivered,
+  markEarlySteersCheckpointed,
+  matchEarlySteers,
+  recordEarlySteer,
+  resetHostSteersForTests,
+  settleEarlySteers,
+  type EarlySteer,
+  type HostSteer,
+} from "./host-steer.js"
 import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
 import { toolResultFailure, type ToolRefusal } from "./opencode2/tool-results.js"
 import { isExchangeableApiKey } from "./auth.js"
@@ -771,6 +788,9 @@ async function doStreamImpl(
   options: CreateCursorOptions,
   callOptions: LanguageModelV3CallOptions,
 ): Promise<LanguageModelV3StreamResult> {
+  const withoutAnswered = await leaveOutAnsweredEarlySteers(callOptions.prompt, opencodeSessionKey(callOptions))
+  if (withoutAnswered === "all") return { stream: answeredSteerStream() }
+  if (withoutAnswered) callOptions = { ...callOptions, prompt: withoutAnswered }
   const prompt = callOptions.prompt
   const retryPolicy = resolveRetryPolicy(options.retry)
   // The Bearer token is resolved for every Run this call opens, including
@@ -806,8 +826,12 @@ async function doStreamImpl(
   // live continuation. Treating mid-prompt history as continuation caused
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
-  const trailingToolResults = extractTrailingToolResults(prompt)
+  let trailingToolResults = extractTrailingToolResults(prompt)
   let session = findContinuationSession(trailingToolResults)
+  if (trailingToolResults.length === 0) {
+    const steered = continuationAfterEarlySteers(prompt, opencodeSessionKey(callOptions))
+    if (steered) ({ results: trailingToolResults, session } = steered)
+  }
   // A call that must open a Run gets its credential before it changes any
   // session state (plan mode, finishing the prior held Run), so a login that
   // cannot be renewed fails the turn without side effects.
@@ -831,10 +855,13 @@ async function doStreamImpl(
     const results = session.supportsImages
       ? await decodeTrailingToolImages(session, trailingToolResults, callOptions.abortSignal)
       : trailingToolResults
+    const held = session
     session = await deliverContinuationResults(session, results, {
       hostAgent: hostAgentFromCallOptions(callOptions),
     })
     if (session) await refreshHeldSessionToolCatalog(session, callOptions)
+    // The rebase below seeds from host history, which holds OpenCode's copy of any promoted steer.
+    else handOverEarlySteers(held.openCodeSessionId, held.sessionId, undefined)
   }
 
   if (!session) {
@@ -899,11 +926,20 @@ async function doStreamImpl(
               `any still-pending prior held — ${(error as Error).message}`,
           )
         }
+        if (!unfinishedPrior && needsHostHistory(sessionKey, sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.sessionId)) {
+          unfinishedPrior = true
+          trace("fresh turn: an early steer of an unfinished Run is not where the checkpoint has it — rebasing from host history")
+        }
         // Without TurnEnded, the checkpoint may predate completed side effects.
         // Include their host results instead of resuming that model step.
         session = await openSession(unfinishedPrior
           ? { recovery: { kind: "rebase", reason: "unfinished-prior-run" } }
           : undefined)
+        // A helper Run (title, lifecycle) or a compaction Run is not the user's next turn.
+        if (session.openCodeSessionId && !session.postCompactionRebase) {
+          clearEarlySteers(sessionKey)
+          steerAnsweringRuns.delete(session.openCodeSessionId)
+        }
       }
     }
   }
@@ -1050,6 +1086,11 @@ export async function pumpWithRecovery(input: {
       }
       throw error
     }
+    handOverEarlySteers(
+      pumpedSession.openCodeSessionId,
+      pumpedSession.sessionId,
+      recovery.kind === "resume" ? next.sessionId : undefined,
+    )
     if (recovery.kind === "resume") {
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -1083,6 +1124,10 @@ export async function pumpWithRecovery(input: {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
     sessionManager.beginPump(pumpedSession, pumpOwner)
+    // A compaction Run keeps the session id, but a steer is for the agent, not the summarizer.
+    const stopSteers = pumpedSession.openCodeSessionId && !pumpedSession.postCompactionRebase
+      ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
+      : undefined
     try {
       await pump(
         pumpedSession,
@@ -1144,6 +1189,7 @@ export async function pumpWithRecovery(input: {
       await sleepForRetry(delayMs, input.abortSignal)
       session = await reopen(pumpedSession, failure)
     } finally {
+      stopSteers?.()
       // Cancellation cleanup inside pump() must keep an active owner alive.
       // Retry after releasing this owner so a stopped consumer with no pending
       // tools cannot leave its Run and heartbeat open. Pending tool turns and
@@ -1940,7 +1986,9 @@ export const FRESH_TURN_PENDING_CANCEL_REASON =
   "Host started a new user turn before this tool result was delivered"
 
 /** Persist an acknowledged terminal checkpoint without inventing usage counters. */
-async function persistTerminalCheckpoint(session: CursorSession): Promise<void> {
+async function persistTerminalCheckpoint(session: Pick<CursorSession,
+  "openCodeSessionId" | "cacheDir" | "conversationId" | "requestContext" | "toolCatalog"
+  | "postCompactionRebase" | "hostAgent" | "stableSystemPromptHash">): Promise<void> {
   if (!session.openCodeSessionId) return
   await persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
     sessionKey: session.openCodeSessionId,
@@ -3052,8 +3100,9 @@ function trackHostNoteInjection(
  * provider sent. Same outcomes as Cursor SDK `Run.steer`: `delivered` hands
  * the notes to the turn; `queued` waits; `queued_for_next_turn`, `cancelled`
  * and `rejected` keep them for the session's next user turn.
+ * Returns true when Cursor delivered an early steer: the model answers it next.
  */
-function applyContextInjectionState(session: CursorSession, value: unknown): void {
+function applyContextInjectionState(session: CursorSession, value: unknown): boolean {
   const update = value as { injection_id?: string; state?: Record<string, unknown> | null }
   const [kind, detail] = Object.entries(update.state ?? {}).find(([, v]) => v != null) ?? ["unknown", undefined]
   const reason = (detail as { reason?: string } | undefined)?.reason
@@ -3062,14 +3111,16 @@ function applyContextInjectionState(session: CursorSession, value: unknown): voi
       (reason ? ` reason=${JSON.stringify(reason)}` : ""),
   )
   const sessionKey = session.openCodeSessionId
+  if (kind === "delivered" && markEarlySteerDelivered(sessionKey, update.injection_id)) return true
   const entries = sessionKey ? hostNoteInjectionsBySession.get(sessionKey) : undefined
   const entry = update.injection_id ? entries?.get(update.injection_id) : undefined
-  if (!sessionKey || !entries || !entry || kind === "queued" || kind === "unknown") return
+  if (!sessionKey || !entries || !entry || kind === "queued" || kind === "unknown") return false
   entries.delete(update.injection_id!)
   if (entries.size === 0) hostNoteInjectionsBySession.delete(sessionKey)
-  if (kind === "delivered") return
+  if (kind === "delivered") return false
   appendUndeliveredHostNotes(sessionKey, [{ notes: entry.notes, order: entry.order }])
   trace(`continuation: host note injection ${kind}; kept for the next user turn sessionKey=${sessionKey}`)
+  return false
 }
 
 /**
@@ -3204,6 +3255,169 @@ function forgetUndeliveredHostNotes(sessionKey: string, notes: readonly HostNote
   if (remaining.length) undeliveredHostNotesBySession.set(sessionKey, remaining)
   else undeliveredHostNotesBySession.delete(sessionKey)
   trace(`continuation: undelivered host notes sent in the ${carrier} sessionKey=${sessionKey} count=${notes.length}`)
+}
+
+/** Runs whose `turn_ended` is being handled; a message injected now would never be delivered. */
+const endingTurns = new WeakSet<CursorSession>()
+
+/** Inject a message OpenCode holds until this step ends, while Cursor still works on the step. */
+function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
+  const { runId, stream } = session
+  const takesSteers = () =>
+    !session.closed && !session.hostInterrupted && !!session.runId && !endingTurns.has(session)
+    && sessionManager.isActivelyPumping(session) && session.stream === stream && session.runId === runId
+  if (!takesSteers()) return false
+  const injectionId = crypto.randomUUID()
+  if (!recordEarlySteer({
+    ...steer, injectionId, run: session.sessionId, delivered: false, checkpointed: false, answered: false,
+  })) {
+    trace(`steer: too many early steers tracked for sessionID=${steer.sessionID}; left for the next step`)
+    return false
+  }
+  // While it waits behind another write, the host may withdraw it, or its Run may end or be replaced.
+  writeWithBackpressure(stream, encodeMessage("AgentClientMessage", {
+    conversation_action: {
+      inject_context_action: {
+        injection_id: injectionId,
+        expected_run_id: runId,
+        user_context: { user_message: { text: steer.text, message_id: crypto.randomUUID() } },
+      },
+    },
+  }), "steer injection", () => isEarlySteerTracked(steer.sessionID, injectionId) && takesSteers()).then((written) => {
+    if (written) trace(`steer: injected a mid-step message runId=${runId} id=${injectionId} inboxID=${steer.inboxID}`)
+    else forgetUndeliveredEarlySteer(steer.sessionID, injectionId)
+  }, (error) => {
+    // Bytes buffered before a failed drain may still reach Cursor; only a rejected write is certainly lost.
+    if (!(error instanceof StreamWriteDrainError)) forgetUndeliveredEarlySteer(steer.sessionID, injectionId)
+    trace(`steer: injection write failed id=${injectionId}: ${(error as Error).message}`)
+  })
+  return true
+}
+
+/** Trailing user messages as plain text, after `notes` (host notes among them) are set aside. */
+function trailingUserTexts(prompt: LanguageModelV3CallOptions["prompt"]): {
+  start: number
+  texts: Array<{ index: number; text: string }>
+  notes: LanguageModelV3CallOptions["prompt"]
+} | undefined {
+  let start = prompt.length
+  while (start > 0 && (prompt[start - 1].role === "user" || prompt[start - 1].role === "system")) start--
+  if (start === prompt.length) return undefined
+  const texts: Array<{ index: number; text: string }> = []
+  const notes: LanguageModelV3CallOptions["prompt"] = []
+  for (let index = start; index < prompt.length; index++) {
+    const message = prompt[index]
+    if (hostTailNote(message)) {
+      notes.push(message)
+      continue
+    }
+    if (message.role !== "user" || message.content.some((part) => part.type !== "text")) return undefined
+    texts.push({ index, text: message.content.map((part) => (part as { text: string }).text).join("\n") })
+  }
+  return { start, texts, notes }
+}
+
+type SnapshotSource = Parameters<typeof persistTerminalCheckpoint>[0]
+
+/** What the Run that answered a session's early steers needs to save the session's snapshot. */
+const steerAnsweringRuns = new Map<string, SnapshotSource>()
+
+function rememberSteerAnsweringRun(sessionKey: string, session: CursorSession): void {
+  const { openCodeSessionId, cacheDir, conversationId, requestContext, toolCatalog, postCompactionRebase, hostAgent, stableSystemPromptHash } = session
+  steerAnsweringRuns.delete(sessionKey)
+  steerAnsweringRuns.set(sessionKey, {
+    openCodeSessionId, cacheDir, conversationId, requestContext, toolCatalog, postCompactionRebase, hostAgent, stableSystemPromptHash,
+  })
+  while (steerAnsweringRuns.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = steerAnsweringRuns.keys().next().value as string | undefined
+    if (!oldest) break
+    steerAnsweringRuns.delete(oldest)
+  }
+}
+
+/**
+ * OpenCode adds its own copy of an early steer once the model has answered it. A step made only of
+ * such copies needs no Run (`"all"`); otherwise the copies are left out of the prompt.
+ */
+async function leaveOutAnsweredEarlySteers(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  sessionKey: string | undefined,
+): Promise<"all" | LanguageModelV3CallOptions["prompt"] | undefined> {
+  if (!sessionKey || sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.pending.size) return undefined
+  const tail = trailingUserTexts(prompt)
+  if (!tail || prompt[tail.start - 1]?.role !== "assistant") return undefined
+  const notes = tail.notes.map(hostTailNote)
+  if (notes.some((note) => note?.media)) return undefined
+  const answered = new Map<number, EarlySteer>()
+  for (const { index, text } of tail.texts) {
+    const taken = [...answered.values()]
+    const [record] = matchEarlySteers(sessionKey, [text], (candidate) => candidate.answered && !taken.includes(candidate))
+    if (record) answered.set(index, record)
+  }
+  if (answered.size === 0) return undefined
+  trace(
+    `fresh turn: the model already answered ${answered.size} early steer(s) ` +
+      `inboxIDs=${[...answered.values()].map((record) => record.inboxID).join(",")} — left out of this step`,
+  )
+  // The fresh turn clears the records once its Run is open, so a retried step still matches them.
+  // It sends the last user message and the host notes just before it.
+  if (answered.size < tail.texts.length) {
+    const kept = tail.texts.filter(({ index }) => !answered.has(index)).map(({ index }) => prompt[index])
+    return [...prompt.slice(0, tail.start), ...kept.slice(0, -1), ...tail.notes, kept.at(-1)!]
+  }
+  forgetEarlySteerRecords(sessionKey, [...answered.values()])
+  const run = steerAnsweringRuns.get(sessionKey)
+  steerAnsweringRuns.delete(sessionKey)
+  // Host notes in this step reach Cursor with the next user turn instead.
+  const noteTexts = collectHostNoteBodies(notes.map((note) => note?.text))
+  if (noteTexts.length > 0) {
+    appendUndeliveredHostNotes(sessionKey, [{ notes: noteTexts, order: nextHostNoteOrder++ }])
+    if (run) await persistTerminalCheckpoint(run)
+  }
+  return "all"
+}
+
+function answeredSteerStream(): ReadableStream<V3Part> {
+  return new ReadableStream<V3Part>({
+    start(controller) {
+      controller.enqueue({ type: "stream-start", warnings: [] } as V3Part)
+      controller.enqueue({
+        type: "finish",
+        finishReason: { unified: "stop", raw: undefined },
+        usage: emptyLanguageModelV3Usage(),
+        providerMetadata: { copilot: { totalNanoAiu: 0 }, cursor: { usageVersion: 3, occupancyOnly: true } },
+      } as V3Part)
+      controller.close()
+    },
+  })
+}
+
+/**
+ * OpenCode adds its own copy of an early steer after the step's tool results. The held Run already
+ * has it, so the step continues there without it instead of starting a new user turn.
+ */
+function continuationAfterEarlySteers(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  sessionKey: string | undefined,
+): { results: ExtractedToolResult[]; session: CursorSession } | undefined {
+  const held = sessionKey ? sessionManager.findOpenByOpenCodeSessionId(sessionKey) : undefined
+  if (!held || held.pending.size === 0) return undefined
+  const tail = trailingUserTexts(prompt)
+  if (!tail || prompt[tail.start - 1]?.role !== "tool") return undefined
+  const steers = matchEarlySteers(
+    sessionKey,
+    tail.texts.map(({ text }) => text),
+    (record) => record.run === held.sessionId && !record.answered && !record.promoted,
+  )
+  if (steers.length === 0) return undefined
+  const results = extractTrailingToolResults([...prompt.slice(0, tail.start), ...tail.notes])
+  if (results.length === 0 || findContinuationSession(results) !== held) return undefined
+  for (const steer of steers) steer.promoted = true
+  trace(
+    `continuation: ${results.length} trailing tool result(s) before ${steers.length} early steer(s) ` +
+      `the held Run already has inboxIDs=${steers.map((steer) => steer.inboxID).join(",")}`,
+  )
+  return { results, session: held }
 }
 
 async function loadAvailableModels(): Promise<void> {
@@ -4197,6 +4411,7 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
+        markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
@@ -4238,15 +4453,42 @@ export async function pump(
         return
       }
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+      endingTurns.add(session)
       keepUndeliveredHostNotes(session)
+      const steers = settleEarlySteers(session.openCodeSessionId, session.sessionId)
+      if (steers.answered && session.openCodeSessionId) {
+        trace(`steer: the model answered ${steers.answered} early steer(s) in this turn`)
+        rememberSteerAnsweringRun(session.openCodeSessionId, session)
+      }
       const turnEnded = iu.turn_ended as Record<string, unknown>
       recordTurnEndedCost(session, turnEnded)
       if (session.openCodeSessionId) finishEmittedStep(session.openCodeSessionId, session.conversationId)
       await persistTerminalCheckpoint(session)
       const checkpoint = session.resumeCheckpoint ?? getCheckpoint(session.conversationId)
+      if (steers.undelivered.length > 0 && typeof session.reopenWithUserMessage === "function") {
+        // OpenCode will not send these again: they were left out of this turn's continuation.
+        trace(`steer: Cursor did not take ${steers.undelivered.length} early steer(s); sending them as a follow-up Run`)
+        if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
+        try {
+          await session.reopenWithUserMessage(steers.undelivered.map((steer) => steer.text).join("\n\n"))
+          // Resuming the checkpoint from before the follow-up would send the steer again.
+          session.resumeCheckpoint = undefined
+          endingTurns.delete(session)
+          textBreakPending = true
+          continue
+        } catch (error) {
+          // Not transient: recovery would resume a checkpoint without the message.
+          throw new CursorTransportError(
+            `Cursor did not take a message sent during this turn, and sending it again failed: ${(error as Error).message}`,
+            { transient: false, replaySafe: false, cause: error },
+          )
+        }
+      }
       if (
         typeof session.reopenWithUserMessage === "function"
         && !isHostPlanEntryPending(session.openCodeSessionId)
+        // A steer Cursor did not take runs as OpenCode's next step; a nudge would delay it.
+        && steers.leftToHost === 0
         && checkpoint
         && checkpoint.length > 0
         && shouldContinueProgressOnlyTurn({
@@ -4267,6 +4509,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             ),
           )
+          endingTurns.delete(session)
           assistantText = ""
           continue
         } catch (error) {
@@ -4444,7 +4687,7 @@ export async function pump(
     } else if (iu?.step_completed) {
       cacheDiagnostics.stepCompletes++
     } else if (iu?.context_injection_state) {
-      applyContextInjectionState(session, iu.context_injection_state)
+      if (applyContextInjectionState(session, iu.context_injection_state)) textBreakPending = true
     } else if (esm) {
       cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
@@ -6355,6 +6598,8 @@ export function resetTurnStateForTests(): void {
   mirroredTodosBySession.clear()
   sentHistoryImageHashesBySession.clear()
   undeliveredHostNotesBySession.clear()
+  steerAnsweringRuns.clear()
+  resetHostSteersForTests()
   hostNoteInjectionsBySession.clear()
   hostInterrupts.clear()
   resetContextEpochsForTests()
