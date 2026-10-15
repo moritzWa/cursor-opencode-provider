@@ -712,7 +712,10 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
 - **Capture per-test state before awaiting in a shared `afterEach`.** A hook
   timeout otherwise deletes the next test's files. Clear installed host-agent
   switches after each fixture, because Bun's file order differs across
-  filesystems (`test/switch-mode.test.ts`).
+  filesystems (`test/switch-mode.test.ts`). Restore the cache override after a
+  fixture calls `createCursor({ cacheDir })`; the interrupt test left it pinned
+  and made 15 later plugin tests read the wrong model cache
+  (`test/host-interrupt.test.ts`, `test/plugin.test.ts`).
 - **Choose fixtures that fail the same way for every user.** A permission-mode
   fixture does not fail under root; a malformed Git index does
   (`test/workspace-facts.test.ts`).
