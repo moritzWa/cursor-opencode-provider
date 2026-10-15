@@ -22,6 +22,7 @@ import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import { resetConversationPersistenceForTests, setConversationPersistenceHookForTests } from "../src/protocol/conversation-persistence.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
+import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 type ClientMessage = Record<string, any>
@@ -108,6 +109,7 @@ function restartProcess(): void {
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
   resetConversationBlobsForTests()
+  resetToolRequestsListedSeenForTests()
 }
 
 afterEach(() => {
