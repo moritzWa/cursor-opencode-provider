@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-15
+
+### Added
+
+- Gemini 4 Argon pricing, context, and capability metadata from Cursor's model docs
+
 ### Changed
 
 - A new session runs workspace discovery (`git status`) once instead of separately for its title and its first turn ([#49](https://github.com/oakimov/cursor-opencode-provider/pull/49))
