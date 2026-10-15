@@ -296,14 +296,17 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).not.toContain("OpenCode `task`")
   })
 
-  it("names OpenCode 2's `patch` as the file tool on a GPT catalog", () => {
+  it.each([
+    ["OpenCode 1.x", "apply_patch", "bash"],
+    ["OpenCode 2", "patch", "shell"],
+  ] as const)("names %s's `%s` as the file tool on a GPT catalog", (_host, patchTool, shell) => {
     const guidance = buildOpenCodeInteractionGuidance([
-      { name: "patch" },
+      { name: patchTool },
       { name: "read" },
-      { name: "shell" },
+      { name: shell },
     ], false, "/workspace/project")!
-    expect(guidance).toContain("Use OpenCode `patch` for file-content changes")
-    expect(guidance).toContain("converted to `patch` automatically")
+    expect(guidance).toContain(`Use OpenCode \`${patchTool}\` for file-content changes`)
+    expect(guidance).toContain(`converted to \`${patchTool}\` automatically`)
     expect(guidance).toContain("make a targeted edit/patch from complete context")
   })
 
