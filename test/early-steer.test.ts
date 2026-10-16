@@ -16,6 +16,8 @@ import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
+import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
+import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
@@ -32,6 +34,8 @@ import {
   markEarlySteersCheckpointed,
   matchEarlySteers,
   recordEarlySteer,
+  restoreEarlySteers,
+  serializeEarlySteers,
   settleEarlySteers,
   type EarlySteer,
   type HostSteer,
@@ -809,4 +813,205 @@ describe("a steer sent while Cursor waits inside a step", () => {
       expect(runs.flatMap(injectionsOf)).toEqual([])
     })
   }, 30_000)
+})
+
+function coldMemory(): void {
+  sessionManager.dispose()
+  resetTurnStateForTests()
+  resetTurnProvenanceForTests()
+  resetConversationPersistenceForTests()
+  resetConversationBindingsForTests()
+  resetCheckpointsForTests()
+  resetConversationBlobsForTests()
+}
+
+describe("steer restart and mixed-message regressions", () => {
+  for (const identical of [false, true]) {
+    it(`keeps a consumed receipt across restart without swallowing the next message (${identical ? "same text" : "new text"})`, async () => {
+      await withModel(`receipt-scope-${identical}`, async (model, cacheDir) => {
+        const sessionKey = `ses_receipt_scope_${identical}`
+        const { first, announce } = await waitingRun(model, sessionKey, { inject: answerSteer })
+        const message = announce("REPEATABLE_STEER")
+        const answer = textOf(await first)
+        const promoted = [ask, assistant(answer), user(message.text)]
+        expect(textOf(await collect(model, promoted, sessionKey))).toBe("")
+        coldMemory()
+        cacheHttp2SessionForTests(ORIGIN, client)
+        const restarted = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+        onRun = (run, next) => { if (next.run_request) endTurn(run, "NEW_ANSWER") }
+        const nextText = identical ? message.text : "DISTINCT_NEW_REQUEST"
+        expect(textOf(await collect(restarted, [...promoted, user(nextText)], sessionKey))).toBe("NEW_ANSWER")
+        const sent = userText(runs.at(-1)!)
+        expect(sent).toContain(nextText)
+        expect(sent.split(message.text).length - 1).toBe(identical ? 1 : 0)
+      })
+    }, 30_000)
+  }
+
+  it("does not suppress the same words after another model answered", async () => {
+    await withModel("foreign-reply", async (model) => {
+      const sessionKey = "ses_receipt_foreign"
+      const { first, announce } = await waitingRun(model, sessionKey, { inject: answerSteer })
+      const message = announce("SAME_WORDS_AFTER_MODEL_CHANGE")
+      await first
+      onRun = (run, next) => { if (next.run_request) endTurn(run, "A new answer.") }
+      expect(textOf(await collect(model, [ask, assistant("A different model answered."), user(message.text)], sessionKey))).toBe("A new answer.")
+      expect(runs).toHaveLength(2)
+    })
+  }, 30_000)
+
+  for (const hasCheckpoint of [false, true]) {
+    it(`sends all pending user messages exactly once (${hasCheckpoint ? "warm" : "seeded"})`, async () => {
+      await withModel(`live-user-turn-${hasCheckpoint}`, async (model) => {
+        const sessionKey = `ses_live_turn_${hasCheckpoint}`
+        onRun = (run, next) => { if (next.run_request) endTurn(run, "Done.") }
+        if (hasCheckpoint) await collect(model, [ask], sessionKey)
+        const prompt = hasCheckpoint ? [ask, assistant("Done.")] : []
+        await collect(model, [...prompt, user("FIRST_PENDING_MESSAGE"), user("SECOND_PENDING_MESSAGE")], sessionKey)
+        const sent = userText(runs.at(-1)!)
+        expect(sent.split("FIRST_PENDING_MESSAGE")).toHaveLength(2)
+        expect(sent.split("SECOND_PENDING_MESSAGE")).toHaveLength(2)
+        expect(sent.indexOf("FIRST_PENDING_MESSAGE")).toBeLessThan(sent.indexOf("SECOND_PENDING_MESSAGE"))
+      })
+    }, 30_000)
+  }
+
+  it("validates restart receipts and round-trips their scope", () => {
+    const record: EarlySteer = {
+      ...steer("ses_receipt_validation", "RECEIPT"), injectionId: "injection", run: "run",
+      delivered: true, checkpointed: true, answered: true, hostTurn: "a".repeat(64),
+    }
+    expect(recordEarlySteer(record)).toBe(true)
+    const encoded = serializeEarlySteers(record.sessionID)
+    coldMemory()
+    for (const invalid of ["{", "null", JSON.stringify({ version: 2, records: [record] }), JSON.stringify({ version: 1, records: [record, {}] })]) {
+      restoreEarlySteers(record.sessionID, invalid)
+      expect(matchEarlySteers(record.sessionID, [record.text], () => true)).toEqual([])
+    }
+    restoreEarlySteers("ses_another", encoded)
+    expect(matchEarlySteers("ses_another", [record.text], () => true)).toEqual([])
+    restoreEarlySteers(record.sessionID, encoded)
+    expect(matchEarlySteers(record.sessionID, [record.text], () => true)).toEqual([record])
+  })
+
+  it("does not resend an answered steer after a simulated process restart before its host copy", async () => {
+    await withModel("restart-before-copy", async (model, cacheDir) => {
+      const sessionKey = "ses_edge_restart"
+      const { first, announce } = await waitingRun(model, sessionKey, { inject: answerSteer })
+      const message = announce("ONCE_ONLY_RESTART_STEER")
+      const answer = textOf(await first)
+      const persisted = await getPersistedConversation(cacheDir, sessionKey)
+      expect(persisted?.conversationId).toBeTruthy()
+      expect(JSON.parse(persisted!.earlySteers!).records[0].answered).toBe(true)
+      coldMemory()
+      cacheHttp2SessionForTests(ORIGIN, client)
+      const restarted = createCursor({
+        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir,
+        retry: { maxAttempts: 1 },
+      }).languageModel("composer-2.5")
+      onRun = (run, next) => { if (next.run_request) endTurn(run, "REPEATED") }
+      const promoted = await collect(restarted, [ask, assistant(answer), user(message.text)], sessionKey)
+      expect(textOf(promoted)).toBe("")
+      expect(runs).toHaveLength(1)
+    })
+  }, 30_000)
+
+  for (const order of ["early-first", "early-last"] as const) {
+    it(`keeps both user messages after tool results in a mixed promotion (${order})`, async () => {
+      await withModel(`mixed-${order}`, async (model, cacheDir) => {
+        const file = probeFile(cacheDir)
+        const sessionKey = `ses_edge_mixed_${order}`
+        const { first, announce } = await waitingRun(model, sessionKey, {
+          inject: (run, id) => { injectionState(run, id, "delivered"); readOnSteer(file)(run, id) },
+          next: (run, next) => {
+            if (next.exec_client_message?.read_result) endTurn(run, "STEERED")
+            else if (next.run_request) endTurn(run, "FRESH_REPLY")
+          },
+        })
+        const early = announce("EARLY_MIXED_STEER")
+        const step = readStep(readCall(await first), file, early.text)
+        const late = "NEVER_INJECTED_MIXED_STEER"
+        if (order === "early-first") step.push(user(late))
+        else step.splice(step.length - 1, 0, user(late))
+        await collect(model, step, sessionKey)
+        const freshText = userText(runs.at(-1)!)
+        // Cursor already received the early steer in the held Run; the new one must not be lost.
+        expect(freshText).toContain(late)
+        expect(freshText).not.toContain(early.text)
+      })
+    }, 30_000)
+  }
+
+  for (const restart of [false, true]) {
+    it(`does not repeat a mixed promoted steer on host retry (${restart ? "after restart" : "same process"})`, async () => {
+      let rejectRenewal = false
+      let failedOnce = false
+      await withModel("mixed-retry", async (model, cacheDir) => {
+        const file = probeFile(cacheDir)
+        const sessionKey = "ses_edge_mixed_retry"
+        const { first, announce } = await waitingRun(model, sessionKey, {
+          inject: (run, id) => { injectionState(run, id, "delivered"); readOnSteer(file)(run, id) },
+          next: (run, next) => {
+            if (next.exec_client_message?.read_result) endTurn(run, "STEERED")
+            else if (next.run_request && !failedOnce) {
+              failedOnce = true
+              rejectRenewal = true
+              run.send({ interaction_update: { text_delta: { text: "PARTIAL" } } })
+              run.end()
+            } else if (next.run_request) endTurn(run, "RETRIED")
+          },
+        })
+        const early = announce("ONCE_ONLY_MIXED_RETRY_STEER")
+        const step = readStep(readCall(await first), file, early.text)
+        step.splice(step.length - 1, 0, user("NEW_MIXED_RETRY_REQUEST"))
+        const error = await failure(collect(model, step, sessionKey))
+        expect(error).toBeInstanceOf(Error)
+        rejectRenewal = false
+        if (restart) {
+          coldMemory()
+          cacheHttp2SessionForTests(ORIGIN, client)
+          model = createCursor({
+            name: "cursor", agentBaseURL: ORIGIN, cacheDir,
+            getAccessToken: async () => "test-token",
+          }).languageModel("composer-2.5")
+        }
+        await collect(model, step, sessionKey)
+        const retryText = userText(runs.at(-1)!)
+
+        expect(retryText).toContain("NEW_MIXED_RETRY_REQUEST")
+        expect(retryText).not.toContain(early.text)
+      }, async () => {
+        if (rejectRenewal) throw new Error("fixture credential renewal failed")
+        return "test-token"
+      })
+    }, 30_000)
+  }
+
+  for (const withLaterMessage of [false, true]) {
+    it(`keeps an undelivered steer's host copy after Stop (${withLaterMessage ? "with another message" : "alone"})`, async () => {
+      await withModel(`stop-before-copy-${withLaterMessage}`, async (model) => {
+        const sessionKey = `ses_edge_stop_${withLaterMessage}`
+        const { first, announce } = await waitingRun(model, sessionKey, {
+          inject: (run, id) => injectionState(run, id, "queued"),
+          next: (run, next) => {
+            if (next.conversation_action?.cancel_action) {
+              run.send({ conversation_checkpoint_update: CHECKPOINT })
+              run.end("canceled")
+            } else if (next.run_request) endTurn(run, "AFTER_STOP")
+          },
+        })
+        const message = announce("UNDISPATCHED_STOP_STEER")
+        const stopped = failure(first)
+        await waitFor(() => injectionsOf(runs[0]!).length === 1, "the queued injection")
+        await notifyHostInterrupt(sessionKey, "user", Date.now())
+        await stopped
+        const step = [ask, assistant("Waiting for the job."), user(message.text)]
+        if (withLaterMessage) step.push(user("NEW_REQUEST_AFTER_STOP"))
+        await collect(model, step, sessionKey)
+        const nextText = userText(runs.at(-1)!)
+        expect(nextText).toContain(message.text)
+        if (withLaterMessage) expect(nextText).toContain("NEW_REQUEST_AFTER_STOP")
+      })
+    }, 30_000)
+  }
 })

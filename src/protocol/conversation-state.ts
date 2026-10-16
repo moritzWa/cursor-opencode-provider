@@ -1,4 +1,5 @@
 import { trace } from "../debug.js"
+import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -51,6 +52,7 @@ export async function hydrateConversationState(
   }
 
   restoreConversationBinding(sessionKey, persisted.conversationId)
+  restoreEarlySteers(sessionKey, persisted.earlySteers)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
@@ -126,6 +128,7 @@ export async function persistConversationState(
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
+    earlySteers: serializeEarlySteers(input.sessionKey),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),

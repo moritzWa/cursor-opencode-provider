@@ -25,7 +25,7 @@ import {
 } from "./transport/connect.js"
 import { StreamWriteDrainError, waitForStreamWrites, writeStreamMessage as writeWithBackpressure } from "./stream-write.js"
 import {
-  clearEarlySteers,
+  clearUnansweredEarlySteers,
   forgetEarlySteerRecords,
   forgetUndeliveredEarlySteer,
   handOverEarlySteers,
@@ -38,6 +38,7 @@ import {
   recordEarlySteer,
   resetHostSteersForTests,
   settleEarlySteers,
+  serializeEarlySteers,
   type EarlySteer,
   type HostSteer,
 } from "./host-steer.js"
@@ -788,6 +789,7 @@ async function doStreamImpl(
   options: CreateCursorOptions,
   callOptions: LanguageModelV3CallOptions,
 ): Promise<LanguageModelV3StreamResult> {
+  await restoreSessionState(opencodeSessionKey(callOptions), opencodeGlobalCacheDir())
   const withoutAnswered = await leaveOutAnsweredEarlySteers(callOptions.prompt, opencodeSessionKey(callOptions))
   if (withoutAnswered === "all") return { stream: answeredSteerStream() }
   if (withoutAnswered) callOptions = { ...callOptions, prompt: withoutAnswered }
@@ -937,7 +939,7 @@ async function doStreamImpl(
           : undefined)
         // A helper Run (title, lifecycle) or a compaction Run is not the user's next turn.
         if (session.openCodeSessionId && !session.postCompactionRebase) {
-          clearEarlySteers(sessionKey)
+          clearUnansweredEarlySteers(sessionKey)
           steerAnsweringRuns.delete(session.openCodeSessionId)
         }
       }
@@ -1269,24 +1271,21 @@ export function attachSessionHeartbeat(session: CursorSession): void {
   }
 }
 
-async function startSession(
-  modelId: string,
-  token: string,
-  callOptions: LanguageModelV3CallOptions,
-  options: CreateCursorOptions,
-  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number },
-): Promise<CursorSession> {
-  const continuationPolicy = resolveContinuationPolicy(options.continuation)
-  const prompt = callOptions.prompt
-  const incomingTools = extractTools(callOptions)
-  const sessionKey = opencodeSessionKey(callOptions)
-  const isolateHelper = startOptions?.isolate === true
-  const cacheDir = opencodeGlobalCacheDir()
+/** Restore receipts before matching a promoted copy, which may need no Run at all. */
+async function restoreSessionState(sessionKey: string | undefined, cacheDir: string): Promise<void> {
   if (sessionKey) {
     const restored = await hydrateConversationState(cacheDir, sessionKey).catch((error) => {
       trace(`conversation persistence: restore failed sessionKey=${sessionKey}: ${String(error)}`)
       return undefined
     })
+    if (restored && serializeEarlySteers(sessionKey)) {
+      const requestContext = getFrozenRequestContext(restored.conversationId)
+      if (requestContext) rememberSteerAnsweringRun(sessionKey, {
+        openCodeSessionId: sessionKey, conversationId: restored.conversationId, cacheDir, requestContext,
+        toolCatalog: restored.toolCatalog, postCompactionRebase: restored.postCompactionRebase,
+        hostAgent: restored.hostAgent, stableSystemPromptHash: restored.systemPromptHash,
+      })
+    }
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
     restorePersistedHostNotes(sessionKey, restored?.hostNote)
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
@@ -1301,6 +1300,21 @@ async function startSession(
       trace(`turn provenance: restore failed sessionKey=${sessionKey}: ${String(error)}`)
     })
   }
+}
+
+async function startSession(
+  modelId: string,
+  token: string,
+  callOptions: LanguageModelV3CallOptions,
+  options: CreateCursorOptions,
+  startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean; requestedAt?: number },
+): Promise<CursorSession> {
+  const continuationPolicy = resolveContinuationPolicy(options.continuation)
+  const prompt = callOptions.prompt
+  const incomingTools = extractTools(callOptions)
+  const sessionKey = opencodeSessionKey(callOptions)
+  const isolateHelper = startOptions?.isolate === true
+  const cacheDir = opencodeGlobalCacheDir()
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const hostAgent = hostAgentFromCallOptions(callOptions)
   // The classic plugin marks OpenCode's agent="compaction" through chat.params.
@@ -1436,9 +1450,12 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
+  const liveTurn = !isCompaction && !ephemeralRun && !resuming
+    && (!recovery || checkpointUnusable || unfinishedPriorRun)
+    ? liveUserTurn(prompt) : undefined
   let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
-    : (extractUserText(lastUser) || ".")
+    : (liveTurn?.text || extractUserText(lastUser) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -1473,6 +1490,7 @@ async function startSession(
         server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
       })
   const history = extractPromptHistory(prompt, {
+    liveTurnStart: liveTurn?.start,
     preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun,
     // A foreign-history rebase replays the other model's tool results too.
     toolResults: isCompaction || foreignHistory || checkpointUnusable || unfinishedPriorRun ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
@@ -1485,6 +1503,7 @@ async function startSession(
     ephemeralRun,
     resuming,
     seedHistory: history,
+    liveTurnStart: liveTurn?.start,
   })
   const oneShotReminders = [
     modeReminder,
@@ -1567,11 +1586,10 @@ async function startSession(
   const modelInfo = _availableModels?.find((m) => m.id === cursorModelId)
   const supportsImages = resolveCursorModelSupportsImages(cursorModelId, modelInfo?.supportsImages)
   if (!resuming) {
-    assertCursorUserImageSupport(
-      lastUser as unknown as Record<string, unknown> | undefined,
-      supportsImages,
-      cursorModelId,
-    )
+    const liveMessages = liveTurn ? prompt.slice(liveTurn.start).filter((message) => message.role === "user") : [lastUser]
+    for (const message of liveMessages) {
+      assertCursorUserImageSupport(message as unknown as Record<string, unknown> | undefined, supportsImages, cursorModelId)
+    }
   }
   const imageExtraction = resuming
     ? { images: [], hashes: [], candidateCount: 0, duplicateCount: 0, userImageCount: 0, omittedCount: 0 }
@@ -2453,6 +2471,7 @@ export async function drainSessionUntilTurnEnded(
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
+          markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
           const tokenDetails = decodeConversationTokenDetails(bytes)
           if (tokenDetails) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -3175,6 +3194,8 @@ export function prepareUserTurnHostNotes(input: {
   resuming: boolean
   /** The history actually seeded by a Run without a checkpoint. */
   seedHistory?: readonly SeedHistoryMessage[]
+  /** Messages carried as the live action, rather than replayed in seed history. */
+  liveTurnStart?: number
 }): { reminders: string[]; carriedNotes: HostNoteBatch[]; sent: () => void } {
   const { sessionKey, startedWithCheckpoint, isCompaction, ephemeralRun, resuming } = input
   // Notes injected into a Run that closed without acknowledging them can no
@@ -3193,10 +3214,13 @@ export function prepareUserTurnHostNotes(input: {
     .filter((message) => message.role === "user")
     .map((message) => message.content)
     .join("\n\n")
-  const deferred = undelivered?.flatMap((batch) => batch.notes).filter((note) => !seededText.includes(note.trim())) ?? []
-  const turnBoundary = startedWithCheckpoint && !isCompaction && !ephemeralRun && !resuming
-    ? hostNotesBeforeUserTurn(input.prompt)
+  const turnBoundary = !isCompaction && !ephemeralRun && !resuming
+    ? input.liveTurnStart !== undefined
+      ? collectHostNoteBodies(input.prompt.slice(input.liveTurnStart).map((message) => hostTailNote(message)?.text))
+      : startedWithCheckpoint ? hostNotesBeforeUserTurn(input.prompt) : []
     : []
+  const deferred = undelivered?.flatMap((batch) => batch.notes)
+    .filter((note) => !seededText.includes(note.trim()) && !turnBoundary.some((text) => text.includes(note.trim()))) ?? []
   if (turnBoundary.length > 0) {
     trace(`fresh turn: ${turnBoundary.length} host note(s) before the user message ride with it`)
   }
@@ -3322,7 +3346,7 @@ type SnapshotSource = Parameters<typeof persistTerminalCheckpoint>[0]
 /** What the Run that answered a session's early steers needs to save the session's snapshot. */
 const steerAnsweringRuns = new Map<string, SnapshotSource>()
 
-function rememberSteerAnsweringRun(sessionKey: string, session: CursorSession): void {
+function rememberSteerAnsweringRun(sessionKey: string, session: SnapshotSource): void {
   const { openCodeSessionId, cacheDir, conversationId, requestContext, toolCatalog, postCompactionRebase, hostAgent, stableSystemPromptHash } = session
   steerAnsweringRuns.delete(sessionKey)
   steerAnsweringRuns.set(sessionKey, {
@@ -3345,16 +3369,23 @@ async function leaveOutAnsweredEarlySteers(
 ): Promise<"all" | LanguageModelV3CallOptions["prompt"] | undefined> {
   if (!sessionKey || sessionManager.findOpenByOpenCodeSessionId(sessionKey)?.pending.size) return undefined
   const tail = trailingUserTexts(prompt)
-  if (!tail || prompt[tail.start - 1]?.role !== "assistant") return undefined
+  if (!tail || !["assistant", "tool"].includes(prompt[tail.start - 1]?.role)) return undefined
+  if (prompt[tail.start - 1]?.role === "assistant" && detectForeignHistory({
+    sessionKey, conversationId: peekConversationId(sessionKey), prompt,
+  })) return undefined
+  const hostTurn = createHash("sha256").update(JSON.stringify(prompt[tail.start - 1])).digest("hex")
   const notes = tail.notes.map(hostTailNote)
   if (notes.some((note) => note?.media)) return undefined
   const answered = new Map<number, EarlySteer>()
   for (const { index, text } of tail.texts) {
     const taken = [...answered.values()]
-    const [record] = matchEarlySteers(sessionKey, [text], (candidate) => candidate.answered && !taken.includes(candidate))
+    const [record] = matchEarlySteers(sessionKey, [text], (candidate) =>
+      candidate.answered && (!candidate.hostTurn || candidate.hostTurn === hostTurn) && !taken.includes(candidate))
     if (record) answered.set(index, record)
   }
   if (answered.size === 0) return undefined
+  const firstCopy = [...answered.values()].some((record) => !record.hostTurn)
+  for (const record of answered.values()) record.hostTurn = hostTurn
   trace(
     `fresh turn: the model already answered ${answered.size} early steer(s) ` +
       `inboxIDs=${[...answered.values()].map((record) => record.inboxID).join(",")} — left out of this step`,
@@ -3365,15 +3396,13 @@ async function leaveOutAnsweredEarlySteers(
     const kept = tail.texts.filter(({ index }) => !answered.has(index)).map(({ index }) => prompt[index])
     return [...prompt.slice(0, tail.start), ...kept.slice(0, -1), ...tail.notes, kept.at(-1)!]
   }
-  forgetEarlySteerRecords(sessionKey, [...answered.values()])
   const run = steerAnsweringRuns.get(sessionKey)
-  steerAnsweringRuns.delete(sessionKey)
   // Host notes in this step reach Cursor with the next user turn instead.
   const noteTexts = collectHostNoteBodies(notes.map((note) => note?.text))
-  if (noteTexts.length > 0) {
+  if (firstCopy && noteTexts.length > 0) {
     appendUndeliveredHostNotes(sessionKey, [{ notes: noteTexts, order: nextHostNoteOrder++ }])
-    if (run) await persistTerminalCheckpoint(run)
   }
+  if (run) await persistTerminalCheckpoint(run)
   return "all"
 }
 
@@ -3404,14 +3433,31 @@ function continuationAfterEarlySteers(
   if (!held || held.pending.size === 0) return undefined
   const tail = trailingUserTexts(prompt)
   if (!tail || prompt[tail.start - 1]?.role !== "tool") return undefined
-  const steers = matchEarlySteers(
-    sessionKey,
-    tail.texts.map(({ text }) => text),
-    (record) => record.run === held.sessionId && !record.answered && !record.promoted,
-  )
+  const steers: EarlySteer[] = []
+  const newTexts: string[] = []
+  for (const { text } of tail.texts) {
+    const [record] = matchEarlySteers(sessionKey, [text], (candidate) =>
+      candidate.run === held.sessionId && !candidate.answered && !steers.includes(candidate))
+    if (record) steers.push(record)
+    else newTexts.push(text)
+  }
   if (steers.length === 0) return undefined
   const results = extractTrailingToolResults([...prompt.slice(0, tail.start), ...tail.notes])
   if (results.length === 0 || findContinuationSession(results) !== held) return undefined
+  // The host has already promoted these messages. Keep them for a follow-up after the held
+  // turn, rather than superseding its tool results or dropping all but the last user message.
+  const added: EarlySteer[] = []
+  for (const text of newTexts) {
+    const record: EarlySteer = {
+      sessionID: sessionKey!, inboxID: crypto.randomUUID(), injectionId: crypto.randomUUID(),
+      run: held.sessionId, text, delivered: false, checkpointed: false, answered: false, promoted: true,
+    }
+    if (!recordEarlySteer(record)) {
+      forgetEarlySteerRecords(sessionKey!, added)
+      return undefined
+    }
+    added.push(record)
+  }
   for (const steer of steers) steer.promoted = true
   trace(
     `continuation: ${results.length} trailing tool result(s) before ${steers.length} early steer(s) ` +
@@ -6121,6 +6167,17 @@ export function cursorTurnEndedProviderMetadata(
   }
 }
 
+/** All user messages after the last assistant/tool boundary form one live user turn. */
+export function liveUserTurn(prompt: LanguageModelV3CallOptions["prompt"]): { start: number; text: string } | undefined {
+  let start = prompt.length
+  while (start > 0 && (prompt[start - 1].role === "user" || prompt[start - 1].role === "system")) start--
+  if (start === 0) while (start < prompt.length && prompt[start].role === "system") start++
+  if (start === prompt.length) return undefined
+  const texts = prompt.slice(start).flatMap((message) =>
+    message.role === "user" && !hostTailNote(message) ? [extractUserText(message as unknown as Record<string, unknown>)] : [])
+  return { start, text: texts.join("\n\n") || "." }
+}
+
 /**
  * Prior prompt turns for a seed ConversationStateStructure. Tool results must
  * never be replayed as assistant-authored prose: that teaches the model to
@@ -6134,6 +6191,7 @@ export function extractPromptHistory(
   options?: {
     preserveTrailingUser?: boolean
     toolResults?: "omit" | "all" | "trailing"
+    liveTurnStart?: number
   },
 ): SeedHistoryMessage[] {
   const out: SeedHistoryMessage[] = []
@@ -6150,6 +6208,7 @@ export function extractPromptHistory(
     if (trailingToolStart === notesStart) trailingToolStart = prompt.length
   }
   for (let messageIndex = 0; messageIndex < prompt.length; messageIndex++) {
+    if (!options?.preserveTrailingUser && options?.liveTurnStart !== undefined && messageIndex >= options.liveTurnStart) break
     const m = prompt[messageIndex]!
     if (m.role === "system") {
       if (typeof m.content === "string" && m.content.length > 0) {
@@ -6191,7 +6250,7 @@ export function extractPromptHistory(
     }
   }
   // Live user message is the Run action, not seed history.
-  if (!options?.preserveTrailingUser && out.length > 0 && out[out.length - 1]!.role === "user") {
+  if (options?.liveTurnStart === undefined && !options?.preserveTrailingUser && out.length > 0 && out[out.length - 1]!.role === "user") {
     out.pop()
   }
   return out

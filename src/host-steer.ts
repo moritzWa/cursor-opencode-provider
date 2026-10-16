@@ -14,6 +14,8 @@ export type EarlySteer = HostSteer & {
   answered: boolean
   /** OpenCode's own copy came after the step's tool results and was left out of the continuation. */
   promoted?: boolean
+  /** Prompt boundary at which the host supplied its copy; distinct later replies do not match it. */
+  hostTurn?: string
 }
 
 type HostSteerState = {
@@ -119,6 +121,7 @@ export function markEarlySteersCheckpointed(sessionID: string | undefined, run: 
  * At `turn_ended`: a delivered steer is answered and waits for OpenCode's copy; one Cursor never took is
  * forgotten, so OpenCode's copy runs as an ordinary message. A promoted one has no copy left to come:
  * one Cursor never took is returned for a follow-up Run and stays, as sent, until a checkpoint holds it.
+ * Answered receipts survive retries and are retired when a later Run finishes.
  */
 export function settleEarlySteers(
   sessionID: string | undefined,
@@ -130,9 +133,12 @@ export function settleEarlySteers(
   let leftToHost = 0
   const undelivered: EarlySteer[] = []
   const kept = records.filter((record) => {
-    if (record.run !== run) return true
+    if (record.run !== run) return !record.answered
     if (record.promoted) {
-      if (record.delivered) return false
+      if (record.delivered) {
+        if (!record.answered) { record.answered = true; answered++ }
+        return true
+      }
       undelivered.push(record)
       record.delivered = true
       return true
@@ -208,9 +214,38 @@ export function needsHostHistory(sessionID: string | undefined, openRun: string 
     !record.answered && record.run !== openRun && (record.promoted ? !record.checkpointed : record.checkpointed))
 }
 
-/** A new user turn began, so no message injected before it can still come back. */
-export function clearEarlySteers(sessionID: string | undefined): void {
-  if (sessionID) state.injected.delete(sessionID)
+/** Keep answered receipts until the new turn succeeds, so a host retry still omits its copies. */
+export function clearUnansweredEarlySteers(sessionID: string | undefined): void {
+  if (sessionID) keep(sessionID, (state.injected.get(sessionID) ?? []).filter((record) => record.answered))
+}
+
+/** Private restart metadata, saved atomically with the checkpoint it describes. */
+export function serializeEarlySteers(sessionID: string): string | undefined {
+  const records = state.injected.get(sessionID)
+  return records?.length ? JSON.stringify({ version: 1, records }) : undefined
+}
+
+export function restoreEarlySteers(sessionID: string, encoded: string | undefined): void {
+  if (!encoded || state.injected.has(sessionID) || state.injected.size >= MAX_REMEMBERED) return
+  let value: { version?: unknown; records?: unknown }
+  try { value = JSON.parse(encoded) } catch { return }
+  if (!value || value.version !== 1 || !Array.isArray(value.records) || value.records.length > MAX_RECORDS_PER_SESSION) return
+  const records: EarlySteer[] = []
+  for (const record of value.records) {
+    if (!record || record.sessionID !== sessionID
+      || ![record.inboxID, record.injectionId, record.run, record.text].every((part) => typeof part === "string" && part.length > 0)
+      || ![record.delivered, record.checkpointed, record.answered].every((part) => typeof part === "boolean")
+      || ((record.checkpointed || record.answered) && !record.delivered)
+      || (record.promoted !== undefined && typeof record.promoted !== "boolean")
+      || (record.hostTurn !== undefined && (typeof record.hostTurn !== "string" || !/^[a-f0-9]{64}$/.test(record.hostTurn)))) return
+    records.push({
+      sessionID, inboxID: record.inboxID, injectionId: record.injectionId, run: record.run, text: record.text,
+      delivered: record.delivered, checkpointed: record.checkpointed, answered: record.answered,
+      ...(record.promoted !== undefined ? { promoted: record.promoted } : {}),
+      ...(record.hostTurn !== undefined ? { hostTurn: record.hostTurn } : {}),
+    })
+  }
+  if (records.length) state.injected.set(sessionID, records)
 }
 
 export function forgetEarlySteers(sessionID: string): void {
