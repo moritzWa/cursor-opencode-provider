@@ -941,30 +941,32 @@ function planWholeFileEdit(source: string, target: string): WholeFileEditReplace
 
 /**
  * Host tool a Cursor edit announcement will become, using the same file facts
- * as `remapEditToolsForCatalog`. `edit` wins when the catalog has it. A patch
- * tool is used for a missing file (Add File). A name is withheld when that
- * remap would refuse the file: not a regular file, too large, unreadable, or
- * `patch` with carriage returns. Never predicts `write`.
+ * as `remapCorrelatedEditWriteForCatalog` and `remapEditToolsForCatalog`. An
+ * existing file becomes `edit`, else the patch tool. A missing file is a
+ * creation, which stays `write`, else becomes the patch tool's Add File. A name
+ * is withheld when those remaps would refuse the file or not produce that
+ * tool: no workspace for a relative path, not a regular file, too large,
+ * unreadable, or `patch` with carriage returns.
  */
 export function hostToolForCursorEdit(
   filePath: string,
   catalog: ReadonlySet<string>,
   workspaceRoot?: string,
 ): string | undefined {
-  if (catalog.has("edit")) return "edit"
   const patchTool = hostPatchTool(catalog)
-  if (!patchTool) return undefined
   if (!path.isAbsolute(filePath) && !workspaceRoot) return undefined
   const absolute = path.resolve(workspaceRoot ?? process.cwd(), filePath)
   try {
     const stat = fs.statSync(absolute)
     if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
+    if (catalog.has("edit")) return "edit"
+    if (!patchTool) return undefined
     if (patchTool === "patch" && /\r(?:\n|$)/.test(fs.readFileSync(absolute, "utf8"))) return undefined
+    return patchTool
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return patchTool
-    return undefined
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined
+    return catalog.has("write") ? "write" : patchTool
   }
-  return patchTool
 }
 
 /**

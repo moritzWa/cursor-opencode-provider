@@ -177,6 +177,7 @@ import {
 import {
   carryLostRequest,
   dropLostRequest,
+  hasLostRequest,
   noteCheckpoint,
   rememberLostRequest,
 } from "./lost-request.js"
@@ -957,11 +958,22 @@ async function doStreamImpl(
       // supersede the held parent Run — that remints (`interrupted-run`) when
       // the trailing tool result returns. Isolate onto an ephemeral conversation.
       const busyPrior = sessionManager.findOpenByOpenCodeSessionId(sessionKey)
+      const incomingTools = extractTools(callOptions)
+      // A tool-less call that is not compaction (title, summary) is a lifecycle
+      // Run: ephemeral and refused execution. Without a result for the parent's
+      // pending call, the host is still running that tool (OpenCode 2 sends one
+      // mid-tool), so the call must not cancel it. With that result, the host
+      // has moved past the tool and the parent Run is finished as usual.
+      const lifecycleCall = !computeAllowTools(incomingTools.length, callOptions.toolChoice)
+        && !isCompactionCall(callOptions, sessionKey)
+        && !historicalResults.some((result) =>
+          result.sessionId === busyPrior?.sessionId && busyPrior.pending.has(result.execId))
       if (
-        busyPrior && shouldIsolateInSessionHelper(sessionKey, extractTools(callOptions), historicalResults)
+        busyPrior
+        && (lifecycleCall || shouldIsolateInSessionHelper(sessionKey, incomingTools, historicalResults))
       ) {
         trace(
-          `fresh turn: isolating in-session helper — incomingTools subset of ` +
+          `fresh turn: isolating in-session ${lifecycleCall ? "tool-less lifecycle call" : "helper — incomingTools subset of"} ` +
             `parentTools=${busyPrior.toolCatalog?.length ?? 0} ` +
             `priorSession=${busyPrior.sessionId} pending=${busyPrior.pending.size}`,
         )
@@ -1060,7 +1072,14 @@ async function doStreamImpl(
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
-          if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
+          if (!activeSession.hostInterrupted) {
+            // Only the snapshot carries a request Cursor never checkpointed
+            // past a restart; a failed Run reaches no other save.
+            if (hasLostRequest(activeSession.openCodeSessionId)) {
+              await persistRunInProgress(activeSession, "failed Run")
+            }
+            sessionManager.close(activeSession)
+          }
           try {
             controller.error(hostFacingError(e))
           } catch {
@@ -1427,16 +1446,7 @@ async function startSession(
   const cacheDir = opencodeGlobalCacheDir()
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const hostAgent = hostAgentFromCallOptions(callOptions)
-  // The classic plugin marks OpenCode's agent="compaction" through chat.params.
-  // OpenCode 2.0 removed that hook, so its plugin writes the same request-local
-  // option from session hooks. The session marker is a fallback only when a
-  // host does not preserve mutable options; explicit false prevents concurrent
-  // title/generate calls from inheriting a compaction marker.
-  // Do not infer this from tools/toolChoice: standalone no-tool calls are valid.
-  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
-  const isCompaction = compactionOption === true || (
-    compactionOption === undefined && isCompactionSession(sessionKey)
-  )
+  const isCompaction = isCompactionCall(callOptions, sessionKey)
   const toolState = await resolveTurnToolState({
     sessionKey,
     incomingTools,
@@ -6606,11 +6616,7 @@ export async function refreshHeldSessionToolCatalog(
   const sessionKey = session.openCodeSessionId
   const previousAdvertised = session.toolCatalog?.length ?? 0
   const incomingTools = extractTools(callOptions)
-  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
-  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
-  const isCompaction = compactionOption === true || (
-    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
-  )
+  const isCompaction = isCompactionCall(callOptions, sessionKey)
   const toolState = await resolveTurnToolState({
     sessionKey,
     incomingTools,
@@ -6739,6 +6745,22 @@ function toolsInFixedOrder<T extends { name?: string }>(tools: readonly T[]): T[
 }
 
 /** Exported for tests — false for compaction/summary (no tools) and toolChoice none. */
+/**
+ * The classic plugin marks OpenCode's agent="compaction" through chat.params.
+ * OpenCode 2.0 removed that hook, so its plugin writes the same request-local
+ * option from session hooks. The session marker is a fallback only when a
+ * host does not preserve mutable options; explicit false prevents concurrent
+ * title/generate calls from inheriting a compaction marker.
+ * Do not infer this from tools/toolChoice: standalone no-tool calls are valid.
+ */
+function isCompactionCall(callOptions: LanguageModelV3CallOptions, sessionKey: string | undefined): boolean {
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
+  return compactionOption === true || (
+    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
+  )
+}
+
 export function computeAllowTools(
   toolCount: number,
   toolChoice: LanguageModelV3CallOptions["toolChoice"] | undefined,

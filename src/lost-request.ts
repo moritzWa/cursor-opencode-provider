@@ -80,6 +80,10 @@ export function noteCheckpoint(sessionKey: string | undefined, bytes: Uint8Array
   if (checkpointKey(bytes) !== record.checkpointKey) map.delete(sessionKey)
 }
 
+export function hasLostRequest(sessionKey: string | undefined): boolean {
+  return !!sessionKey && records().has(sessionKey)
+}
+
 export function dropLostRequest(sessionKey: string | undefined): void {
   if (sessionKey) records().delete(sessionKey)
 }

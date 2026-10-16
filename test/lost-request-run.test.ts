@@ -15,6 +15,8 @@ import { resetConversationBindingsForTests, restoreConversationBinding } from ".
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { resetLostRequestsForTests } from "../src/lost-request.js"
+import { resetFrozenRequestContextsForTests } from "../src/context/frozen.js"
+import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 
 const ORIGIN = "https://agentn.lost-request-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -134,6 +136,32 @@ describe("lost request through startSession", () => {
       await failedTurn(root, "ses_lost_checkpoint", [user("first request"), partial, user("second request")])
 
       expect(sentTexts).toHaveLength(2)
+      expect(sentTexts[1]).toContain("first request\n\nsecond request")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it("keeps a request Cursor never checkpointed across a restart after the failed turn", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-run-"))
+    try {
+      restoreConversationBinding("ses_lost_restart", "conv-lost-restart")
+      setCheckpoint("conv-lost-restart", Uint8Array.from([0x0a, 0x01, 0x78]))
+      await failedTurn(root, "ses_lost_restart", [user("first request")])
+
+      // Everything in memory is gone; only the conversation snapshot remains.
+      sessionManager.dispose()
+      resetTurnStateForTests()
+      resetLostRequestsForTests()
+      resetConversationBindingsForTests()
+      resetCheckpointsForTests()
+      resetConversationBlobsForTests()
+      resetConversationPersistenceForTests()
+      resetFrozenRequestContextsForTests()
+      await failedTurn(root, "ses_lost_restart", [user("first request"), partial, user("second request")])
+
+      expect(sentTexts).toHaveLength(2)
+      expect(sentTexts[1]).not.toContain("<conversation_history>")
       expect(sentTexts[1]).toContain("first request\n\nsecond request")
     } finally {
       fs.rmSync(root, { recursive: true, force: true })

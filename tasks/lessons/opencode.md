@@ -92,7 +92,9 @@ These are failure lessons shared by both hosts, not a replacement for
   (`pumpWithRecovery`, `test/parallel-pump.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
-  first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`).
+  first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty
+  catalog is a helper too: OpenCode 2's tool-less call during a running shell
+  cancelled the parent Run (`test/lifecycle-isolation-run.test.ts`).
 - **Drain before replacing a held Run.** Cancellation preserves warmth only with
   a valid terminal acknowledgement and fresh checkpoint. An incomplete drain
   must rebuild without losing the new request (`test/host-interrupt.test.ts`).
@@ -111,8 +113,12 @@ These are failure lessons shared by both hosts, not a replacement for
   completed edit never reached Cursor. Keep routes like tombstones and parse the
   id after a restart (`parseEarlyRowToolCallId`, `test/early-tool-rows.test.ts`).
 - **Carry a lost request only where history cannot.** A Run without a checkpoint
-  seeds host history, which already holds it; prepending as well sent it twice
+  seeds host history, which already holds it; prepending as well sent it twice.
+  A failed Run reached no save, so a restart lost the record
   (`carryLostRequest`, `test/lost-request-run.test.ts`).
+- **Predict the tool the remap will produce.** An announced edit on a new file
+  becomes `write`; predicting `edit` showed a failed row beside every created
+  file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).
 - **A renewal source may extend a lease, never shorten it.** A running tool near
   its 4 h ceiling cut an activity-renewed lease (`refreshHardDeadline`,
   `test/session.test.ts`).

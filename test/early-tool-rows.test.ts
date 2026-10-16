@@ -28,6 +28,12 @@ function tempDir(): string {
   return dir
 }
 
+function existingFile(): string {
+  const file = path.join(tempDir(), "existing.txt")
+  fs.writeFileSync(file, "one\n")
+  return file
+}
+
 function partial(callId: string, filePath: string): Uint8Array {
   return encodeMessage("AgentServerMessage", {
     interaction_update: {
@@ -98,13 +104,18 @@ async function run(session: CursorSession, parts: any[]): Promise<void> {
 }
 
 describe("hostToolForCursorEdit", () => {
-  it("predicts edit, patch for a missing file, and withholds a patch that would change CRLF", () => {
+  it("predicts edit for an existing file, write for a new one, and withholds a patch that would change CRLF", () => {
     const dir = tempDir()
     const crlf = path.join(dir, "crlf.txt")
     const lf = path.join(dir, "lf.txt")
     fs.writeFileSync(crlf, "a\r\nb\r\n")
     fs.writeFileSync(lf, "a\nb\n")
-    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit"]))).toBe("edit")
+    // A missing file is a creation: it stays a write, else becomes the patch tool's Add File.
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit", "write"]))).toBe("write")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["write", "patch"]))).toBe("write")
+    expect(hostToolForCursorEdit(lf, new Set(["edit", "write"]))).toBe("edit")
+    expect(hostToolForCursorEdit(crlf, new Set(["edit", "patch"]))).toBe("edit")
     expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["patch"]))).toBe("patch")
     expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["apply_patch"]))).toBe("apply_patch")
     expect(hostToolForCursorEdit(crlf, new Set(["patch"]))).toBeUndefined()
@@ -237,9 +248,37 @@ describe("early edit rows", () => {
     expect(extractTrailingToolResults(prompt)).toMatchObject([{ sessionId: session.sessionId, execId: UNBOUND_EXEC_ID }])
   })
 
+  it("binds a new file's announced row to its write instead of showing a failed edit", async () => {
+    const dir = tempDir()
+    const target = path.join(dir, "big.txt")
+    const callId = "edit-new"
+    const { session, parts } = pumpSession([
+      partial(callId, target),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: {
+          id: 5,
+          write_args: { path: target, file_text: "line 1\n", tool_call_id: callId },
+        },
+      }),
+    ], [
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const calls = parts.filter((part) => part.type === "tool-call")
+    expect(start?.toolName).toBe("write")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: "write" })
+    expect(calls[0].providerExecuted).toBeUndefined()
+    sessionManager.resolve(session.sessionId, 5)
+  })
+
   it("closes the row when the exec is a different tool", async () => {
     const { session, parts } = pumpSession([
-      partial("edit-1", "/tmp/anywhere.txt"),
+      partial("edit-1", existingFile()),
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
       }),
@@ -261,7 +300,7 @@ describe("early edit rows", () => {
 
   it("stays open across later text and closes before the step finishes", async () => {
     const { session, parts } = pumpSession([
-      partial("edit-1", "/tmp/anywhere.txt"),
+      partial("edit-1", existingFile()),
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
       turnEnded(),
     ], [{ name: "edit", description: "Edit" }])
