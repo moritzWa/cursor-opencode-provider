@@ -114,8 +114,10 @@ These are failure lessons shared by both hosts, not a replacement for
   id after a restart (`parseEarlyRowToolCallId`, `test/early-tool-rows.test.ts`).
 - **Carry a lost request only where history cannot.** A Run without a checkpoint
   seeds host history, which already holds it; prepending as well sent it twice.
-  A failed Run reached no save, so a restart lost the record
-  (`carryLostRequest`, `test/lost-request-run.test.ts`).
+  A failed Run reached no save, so a restart lost the record. Storing the
+  combined text re-prepended it on every failed host retry, stacking OpenCode
+  2's identical interruption note ten times; a part already carried is not
+  added again (`carryLostRequest`, `test/lost-request-run.test.ts`).
 - **Predict the tool the remap will produce.** An announced edit on a new file
   becomes `write`; predicting `edit` showed a failed row beside every created
   file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).

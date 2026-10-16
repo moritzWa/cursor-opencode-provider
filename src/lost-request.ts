@@ -19,7 +19,9 @@ export function checkpointKey(bytes: Uint8Array | undefined): string {
 /**
  * Prepend a user message whose Run never received a newer checkpoint.
  * A history rebuild already contains it, so that path drops the record.
- * An exact retry of the same text is left as-is.
+ * An exact retry of the same text is left as-is. Live text the record already
+ * carries as one of its parts (a host retry that sends the same note on every
+ * attempt) sends the record unchanged, so failed retries do not pile up.
  */
 export function carryLostRequest(input: {
   sessionKey: string
@@ -41,8 +43,16 @@ export function carryLostRequest(input: {
     return input.text
   }
   if (input.text === record.text || input.text.startsWith(`${record.text}\n\n`)) return input.text
+  if (carriesPart(record.text, input.text)) return record.text
   map.delete(input.sessionKey)
   return `${record.text}\n\n${input.text}`
+}
+
+/** `part` is one whole `\n\n`-separated piece of `text`, as `carryLostRequest` joins them. */
+function carriesPart(text: string, part: string): boolean {
+  return text.startsWith(`${part}\n\n`)
+    || text.endsWith(`\n\n${part}`)
+    || text.includes(`\n\n${part}\n\n`)
 }
 
 export function rememberLostRequest(input: {

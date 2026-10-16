@@ -6,8 +6,10 @@ import {
   carryLostRequest,
   dropLostRequest,
   noteCheckpoint,
+  hasLostRequest,
   rememberLostRequest,
   resetLostRequestsForTests,
+  restoreLostRequest,
 } from "../src/lost-request.js"
 import {
   hydrateConversationState,
@@ -104,6 +106,59 @@ describe("lost requests", () => {
       text: "third",
       rebuildFromHistory: false,
     })).toBe("hello\n\nnext\n\nthird")
+  })
+
+  it("does not pile up a note the host repeats on every failed retry", () => {
+    const checkpoint = Uint8Array.from([5])
+    const note = "The previous response was interrupted. Continue from where you left off."
+    const carry = (text: string) => {
+      const sent = carryLostRequest({ sessionKey: "ses", conversationId: "conv", checkpoint, text, rebuildFromHistory: false })
+      remember("ses", "conv", checkpoint, sent)
+      return sent
+    }
+    expect(carry("the request")).toBe("the request")
+    for (let attempt = 0; attempt < 10; attempt++) expect(carry(note)).toBe(`the request\n\n${note}`)
+    // A genuinely new message is still added once, and repeating any earlier part adds nothing.
+    expect(carry("next message")).toBe(`the request\n\n${note}\n\nnext message`)
+    expect(carry(note)).toBe(`the request\n\n${note}\n\nnext message`)
+    expect(carry("next message")).toBe(`the request\n\n${note}\n\nnext message`)
+    // A part only matches whole: a longer message that merely starts the same way is new.
+    expect(carry("next message, please")).toBe(`the request\n\n${note}\n\nnext message\n\nnext message, please`)
+  })
+
+  it("keeps at most 1,024 sessions, dropping the least recently written", () => {
+    const checkpoint = Uint8Array.from([6])
+    for (let index = 0; index <= 1_024; index++) remember(`ses-${index}`, "conv", checkpoint, `request ${index}`)
+    expect(hasLostRequest("ses-0")).toBe(false)
+    expect(hasLostRequest("ses-1")).toBe(true)
+    expect(hasLostRequest("ses-1024")).toBe(true)
+    // Rewriting a record makes it the newest.
+    remember("ses-1", "conv", checkpoint, "request 1 again")
+    remember("ses-extra", "conv", checkpoint, "extra")
+    expect(hasLostRequest("ses-1")).toBe(true)
+    expect(hasLostRequest("ses-2")).toBe(false)
+  })
+
+  it("ignores a corrupt or incomplete snapshot record", () => {
+    restoreLostRequest("ses-corrupt", "{not json")
+    restoreLostRequest("ses-partial", JSON.stringify({ conversationId: "conv", checkpointKey: "none" }))
+    restoreLostRequest("ses-empty", JSON.stringify({ conversationId: "conv", checkpointKey: "none", text: "" }))
+    restoreLostRequest("ses-missing", undefined)
+    expect(hasLostRequest("ses-corrupt")).toBe(false)
+    expect(hasLostRequest("ses-partial")).toBe(false)
+    expect(hasLostRequest("ses-empty")).toBe(false)
+    expect(hasLostRequest("ses-missing")).toBe(false)
+
+    // A record already in memory is newer than the snapshot and is kept.
+    remember("ses-live", "conv", Uint8Array.from([7]), "live text")
+    restoreLostRequest("ses-live", JSON.stringify({ conversationId: "conv", checkpointKey: "none", text: "stale" }))
+    expect(carryLostRequest({
+      sessionKey: "ses-live",
+      conversationId: "conv",
+      checkpoint: Uint8Array.from([7]),
+      text: "next",
+      rebuildFromHistory: false,
+    })).toBe("live text\n\nnext")
   })
 
   it("restores the record from the conversation snapshot", async () => {

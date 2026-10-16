@@ -168,6 +168,32 @@ describe("lost request through startSession", () => {
     }
   }, 30_000)
 
+  it("sends the request once after host retries that keep failing on the same checkpoint", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-run-"))
+    // OpenCode 2 adds this note as a user message before each retry of an interrupted response.
+    const note = user("The previous response was interrupted. Continue from where you left off without repeating completed content.")
+    try {
+      restoreConversationBinding("ses_lost_retries", "conv-lost-retries")
+      setCheckpoint("conv-lost-retries", Uint8Array.from([0x0a, 0x01, 0x78]))
+      const prompt: LanguageModelV3Prompt = [user("first request")]
+      await failedTurn(root, "ses_lost_retries", prompt)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        prompt.push(partial, note)
+        await failedTurn(root, "ses_lost_retries", [...prompt])
+      }
+      prompt.push(partial, user("second request"))
+      await failedTurn(root, "ses_lost_retries", prompt)
+
+      const last = sentTexts.at(-1)!
+      expect(sentTexts).toHaveLength(5)
+      expect(occurrences(last, "first request")).toBe(1)
+      expect(occurrences(last, "The previous response was interrupted.")).toBe(1)
+      expect(last).toContain("second request")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("does not prepend a request that the seeded host history already carries", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-run-"))
     try {
