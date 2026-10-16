@@ -163,6 +163,16 @@ export function buildHeartbeat(): Uint8Array {
   })
 }
 
+/**
+ * ACM #5 `exec_client_control_message.heartbeat{id}`: Cursor CLI sends it every
+ * 3 s for each exec it is still running, keyed by the exec message id.
+ */
+export function buildExecHeartbeat(execId: number): Uint8Array {
+  return encodeMessage("AgentClientMessage", {
+    exec_client_control_message: { heartbeat: { id: execId } },
+  })
+}
+
 /** Stops the live Run, as Cursor CLI does on a user Stop before it closes the stream. */
 export function buildCancelAction(reason: string): Uint8Array {
   return encodeMessage("AgentClientMessage", {

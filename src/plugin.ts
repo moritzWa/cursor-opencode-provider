@@ -35,7 +35,7 @@ import {
   setCursorShellPath,
   resolveCursorShellPath,
 } from "./shell-timeout.js"
-import { applyHostPromptEvent, sessionActivity } from "./activity.js"
+import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./activity.js"
 import { dispatchHostEventBridge } from "./host-event-bridge.js"
 import { createPromptHostAgentModeSwitch, setHostAgentModeSwitch } from "./host-agent-mode.js"
 import { isHostPlanFileResolved, resolveHostPlanFile } from "./host-plan-file.js"
@@ -334,6 +334,7 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
     async event({ event }) {
       // The SDK's event union predates these prompt events; read them untyped.
       applyHostPromptEvent(sessionActivity, (event as { type: unknown }).type, (event as { properties?: unknown }).properties)
+      applyHostToolEvent(sessionActivity, (event as { type: unknown }).type, (event as { properties?: unknown }).properties)
       switch (event.type) {
         case "session.created":
           sessionActivity.linkSession(event.properties.info.id, event.properties.info.parentID)

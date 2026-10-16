@@ -2,6 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
+import protobuf from "protobufjs"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -46,7 +47,7 @@ import { isDebugEnabled, trace, traceRequestContextPaths } from "./debug.js"
 import { toolResultFailure, type ToolRefusal } from "./opencode2/tool-results.js"
 import { isExchangeableApiKey } from "./auth.js"
 import { resolveBearerToken } from "./auth-renewal.js"
-import { buildRunRequest, buildHeartbeat, buildCancelAction } from "./protocol/request.js"
+import { buildRunRequest, buildHeartbeat, buildCancelAction, buildExecHeartbeat } from "./protocol/request.js"
 import { onHostInterrupt } from "./host-interrupt.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
@@ -79,6 +80,7 @@ import {
   preferCorrelatedTaskDescription,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
+  hostToolForCursorEdit,
   buildCompleteEditReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
@@ -164,6 +166,20 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
+  EARLY_ROW_CLOSED,
+  EarlyToolRows,
+  cursorEditAnnouncement,
+  earlyRowToolCallId,
+  shouldOpenEarlyRow,
+  type EarlyToolRow,
+} from "./early-tool-rows.js"
+import {
+  carryLostRequest,
+  dropLostRequest,
+  noteCheckpoint,
+  rememberLostRequest,
+} from "./lost-request.js"
+import {
   currentCursorTokenBreakdown,
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
@@ -213,6 +229,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  hostFacingError,
   isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
@@ -533,12 +550,46 @@ function retryInfoProtobufDelayMs(encoded: string): number | undefined {
   return Math.ceil(Number(seconds) * 1_000 + Number(nanos) / 1_000_000)
 }
 
+type CursorErrorDetails = { title?: string; detail?: string; isRetryable?: boolean }
+
+/** Decode `aiserver.v1.ErrorDetails.details` (#2): title #1, detail #2, is_retryable #4. */
+function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefined {
+  try {
+    const outer = protobuf.Reader.create(Buffer.from(encoded, "base64"))
+    while (outer.pos < outer.len) {
+      const tag = outer.uint32()
+      if (tag !== 0x12) {
+        outer.skipType(tag & 7)
+        continue
+      }
+      const inner = protobuf.Reader.create(outer.bytes())
+      const details: CursorErrorDetails = {}
+      while (inner.pos < inner.len) {
+        const innerTag = inner.uint32()
+        if (innerTag === 0x0a) details.title = inner.string().trim() || undefined
+        else if (innerTag === 0x12) details.detail = inner.string().trim() || undefined
+        else if (innerTag === 0x20) details.isRetryable = inner.bool()
+        else inner.skipType(innerTag & 7)
+      }
+      return details
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
 export function connectFrameError(payload: string): CursorProviderError {
   try {
     const envelope = JSON.parse(payload) as {
-      error?: { code?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
+      error?: { code?: unknown; message?: unknown; details?: unknown; retryAfter?: unknown; retry_after?: unknown }
     }
     const code = typeof envelope.error?.code === "string" ? envelope.error.code : "unknown"
+    // Hosts classify retries from the error text, so Cursor's own message and
+    // details (the specific reason) stay in the log.
+    if (envelope.error?.message !== undefined || envelope.error?.details !== undefined) {
+      trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
+    }
     if (code === "unauthenticated" || code === "permission_denied") {
       return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
         code,
@@ -549,6 +600,7 @@ export function connectFrameError(payload: string): CursorProviderError {
       envelope.error?.retryAfter ?? envelope.error?.retry_after,
     )
     let hasRetryInfo = false
+    let cursorDetails: CursorErrorDetails | undefined
     if (Array.isArray(envelope.error?.details)) {
       for (const detail of envelope.error.details) {
         if (!detail || typeof detail !== "object") continue
@@ -560,10 +612,16 @@ export function connectFrameError(payload: string): CursorProviderError {
             record.retryDelay ?? record.retry_delay ?? record.value,
           )
         }
+        if (type === "aiserver.v1.ErrorDetails" && typeof record.value === "string") {
+          cursorDetails ??= decodeCursorErrorDetails(record.value)
+        }
       }
     }
-    return new CursorServerError(`Cursor API error (code=${code})`, {
-      transient: isTransientGrpcStatus(code) || hasRetryInfo,
+    // Cursor CLI shows `${title} ${detail}` and obeys an explicit isRetryable.
+    const explanation = [cursorDetails?.title, cursorDetails?.detail].filter(Boolean).join(" ")
+    return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
+      transient: cursorDetails?.isRetryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
+      retryable: cursorDetails?.isRetryable,
       replaySafe: true,
       code,
       retryAfterMs: retryAfterMs === undefined
@@ -1003,7 +1061,7 @@ async function doStreamImpl(
           // A Run the host stopped is drained and closed by its cancel.
           if (!activeSession.hostInterrupted) sessionManager.close(activeSession)
           try {
-            controller.error(e instanceof Error ? e : new Error(String(e)))
+            controller.error(hostFacingError(e))
           } catch {
             /* controller already errored/closed */
           }
@@ -1264,10 +1322,61 @@ export function attachSessionHeartbeat(session: CursorSession): void {
   }, session.policy.heartbeatMs)
   interval.unref?.()
   session.heartbeat = interval
+  const execInterval = setInterval(() => {
+    if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
+    if (execHeartbeatsPendingBySession.has(session)) return
+    void writeExecHeartbeats(session, generation)
+  }, EXEC_HEARTBEAT_MS)
+  execInterval.unref?.()
   session.heartbeatCancel = () => {
     if (session.heartbeat) clearInterval(session.heartbeat)
     session.heartbeat = null
+    clearInterval(execInterval)
     if (isCurrentHeartbeatGeneration(session, generation)) bumpHeartbeatGeneration(session)
+  }
+}
+
+/** Cursor CLI's per-exec heartbeat period (`agent-exec` handler). */
+const EXEC_HEARTBEAT_MS = 3_000
+const execHeartbeatsPendingBySession = new WeakSet<CursorSession>()
+const execHeartbeatCount = new WeakMap<PendingExec, number>()
+
+/** A Cursor exec the host still runs, as opposed to an interaction answer or a display-only mirror. */
+function isOwedCursorExec(pending: PendingExec): boolean {
+  return !pending.bridged
+    && pending.resultField !== ASK_QUESTION_RESULT_FIELD
+    && pending.resultField !== SWITCH_MODE_RESULT_FIELD
+    && pending.resultField !== CREATE_PLAN_RESULT_FIELD
+}
+
+/**
+ * Tell Cursor each exec the host is still running is alive, as Cursor CLI does
+ * while its exec handler runs. A failed write is left to the session heartbeat,
+ * which owns closing a broken stream; the CLI ignores it too.
+ */
+async function writeExecHeartbeats(session: CursorSession, generation: number): Promise<void> {
+  execHeartbeatsPendingBySession.add(session)
+  const stream = session.stream
+  try {
+    for (const [execId, pending] of [...session.pending]) {
+      if (!isOwedCursorExec(pending)) continue
+      const stillRunning = () => !session.closed
+        && session.stream === stream
+        && isCurrentHeartbeatGeneration(session, generation)
+        && session.pending.get(execId) === pending
+        && pending.state === "pending"
+        && !pending.aborted
+      if (!stillRunning()) continue
+      const written = await writeWithBackpressure(stream, buildExecHeartbeat(execId), `exec heartbeat id=${execId}`, stillRunning)
+      if (!written) continue
+      const count = (execHeartbeatCount.get(pending) ?? 0) + 1
+      execHeartbeatCount.set(pending, count)
+      trace(`exec heartbeat: id=${execId} tool=${pending.toolName ?? "?"} n=${count} sessionId=${session.sessionId}`)
+    }
+  } catch (error) {
+    trace(`exec heartbeat write failed sessionId=${session.sessionId}: ${(error as Error).message}`)
+  } finally {
+    execHeartbeatsPendingBySession.delete(session)
   }
 }
 
@@ -1456,6 +1565,23 @@ async function startSession(
   let userText = recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (liveTurn?.text || extractUserText(lastUser) || ".")
+  if (sessionKey && liveTurn && recovery?.kind !== "rebase") {
+    userText = carryLostRequest({
+      sessionKey,
+      conversationId,
+      checkpoint: conversationState,
+      text: userText,
+      rebuildFromHistory: false,
+    })
+    rememberLostRequest({
+      sessionKey,
+      conversationId,
+      checkpoint: conversationState,
+      text: userText,
+    })
+  } else if (sessionKey && recovery?.kind === "rebase") {
+    dropLostRequest(sessionKey)
+  }
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -2174,11 +2300,7 @@ function applyExecControl(session: CursorSession, control: Record<string, unknow
   }
   const pending = session.pending.get(id)
   // Interaction answers share the pending map under their own ids, never an exec's.
-  const owed = pending !== undefined
-    && pending.resultField !== ASK_QUESTION_RESULT_FIELD
-    && pending.resultField !== SWITCH_MODE_RESULT_FIELD
-    && pending.resultField !== CREATE_PLAN_RESULT_FIELD
-  const marked = owed && sessionManager.markExecAborted(session, id)
+  const marked = pending !== undefined && isOwedCursorExec(pending) && sessionManager.markExecAborted(session, id)
   trace(
     `exec control: Cursor aborted execId=${id} (${where}) sessionId=${session.sessionId} ` +
       `${marked ? "— no result will be written for it" : "— not an exec the host still owes"}`,
@@ -2253,6 +2375,7 @@ export function cancelRunForHostInterrupt(
 
 async function cancelRun(session: CursorSession, reason: string, opts?: { graceMs?: number }): Promise<void> {
   session.hostInterrupted = reason
+  dropLostRequest(session.openCodeSessionId)
   // Stopped while its turn end was being saved, the host may have kept only part of the step.
   if (session.openCodeSessionId && sessionManager.isActivelyPumping(session)) {
     resumeEmittedStep(session.openCodeSessionId, session.conversationId)
@@ -2421,6 +2544,7 @@ export async function drainSessionUntilTurnEnded(
       }
 
       const frame = next.value as Frame
+      sessionManager.recordSemanticProgress(session)
       if (frame.flags & 0x02) {
         if (cancelling) {
           try {
@@ -2470,6 +2594,7 @@ export async function drainSessionUntilTurnEnded(
           cancellationCheckpoint = true
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
+          noteCheckpoint(session.openCodeSessionId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
           const tokenDetails = decodeConversationTokenDetails(bytes)
@@ -2561,7 +2686,6 @@ export async function drainSessionUntilTurnEnded(
           outcome = "interrupted"
           break
         }
-        sessionManager.recordSemanticProgress(session)
         continue
       }
 
@@ -2575,17 +2699,13 @@ export async function drainSessionUntilTurnEnded(
         outcome = "busy"
         break
       }
-      if (iu?.heartbeat || iu?.step_started || iu?.step_completed) {
-        sessionManager.recordSemanticProgress(session)
-        continue
-      }
+      if (iu?.heartbeat || iu?.step_started || iu?.step_completed) continue
       if (iu?.tool_call_completed) {
         // Display close of a call Cursor already has its answer for (the
         // result this drain just delivered, typically). Cursor does not wait
         // on it, and its checkpoint and turn_ended follow; stopping here would
         // supersede the Run and lose that turn. Its display mirror, if any,
         // has no host consumer on this path.
-        sessionManager.recordSemanticProgress(session)
         trace(`fresh turn drain: skipped display tool_call_completed sessionId=${session.sessionId}`)
         continue
       }
@@ -3526,25 +3646,17 @@ function isTruthyEnv(value: string | undefined): boolean {
 async function nextFrameWithSemanticDeadline(
   session: CursorSession,
 ): Promise<IteratorResult<Frame>> {
+  const idleTimeout = () => new CursorTransportError(
+    `Cursor Run sent no frames for ${session.policy.semanticIdleMs}ms`,
+    { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
+  )
   const remainingMs = session.semanticDeadlineAt - Date.now()
-  if (remainingMs <= 0) {
-    throw new CursorTransportError(
-      `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
-      { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
-    )
-  }
+  if (remainingMs <= 0) throw idleTimeout()
   let timer: ReturnType<typeof setTimeout> | undefined
   let rejectCancelled: ((error: CursorProviderError) => void) | undefined
   const deadline = new Promise<never>((_, reject) => {
     rejectCancelled = reject
-    timer = setTimeout(() => {
-      reject(
-        new CursorTransportError(
-          `Cursor semantic-progress timeout after ${session.policy.semanticIdleMs}ms`,
-          { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" },
-        ),
-      )
-    }, remainingMs)
+    timer = setTimeout(() => reject(idleTimeout()), remainingMs)
     timer.unref?.()
   })
   session.semanticDeadlineCancel = () => {
@@ -3686,6 +3798,7 @@ export async function pump(
   let lifecycleRefusedExec = false
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
+  const earlyRows = new EarlyToolRows()
   let planHandoffCancellationRequested = false
   const replaySafety = new AttemptReplaySafety(session.sessionId)
   const failRunProtocol = (message: string, code: string): never => {
@@ -4114,12 +4227,39 @@ export async function pump(
     session.usageEstimate.outputTokens += estimateTokens(text.length)
     safeEnqueue({ type: "reasoning-delta", id: reasoningId, delta: text } as V3Part)
   }
+  const owedPendingCount = (): number => {
+    let owed = 0
+    for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
+    return owed
+  }
+  const closeEarlyRow = (row: EarlyToolRow) => {
+    replaySafety.markBarrier("visible-tool-row")
+    safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
+    safeEnqueue({
+      type: "tool-call",
+      toolCallId: row.toolCallId,
+      toolName: row.toolName,
+      input: "{}",
+      providerExecuted: true,
+    } as V3Part)
+    safeEnqueue({
+      type: "tool-result",
+      toolCallId: row.toolCallId,
+      toolName: row.toolName,
+      result: EARLY_ROW_CLOSED,
+      isError: true,
+    } as V3Part)
+  }
+  const settleOpenEarlyRows = () => {
+    for (const row of earlyRows.drain()) closeEarlyRow(row)
+  }
   const emitFinish = (
     te: Record<string, unknown> | undefined,
     reason: LanguageModelV3FinishReason,
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
   ) => {
+    settleOpenEarlyRows()
     flushToollessText()
     closeOpenSpans()
     const est = session.usageEstimate
@@ -4260,6 +4400,7 @@ export async function pump(
   const stopForHostInterrupt = (read?: IteratorResult<Frame>): never => {
     if (read?.done) session.pendingFrameRead = Promise.resolve(read)
     else if (read) session.pushbackFrame = read.value
+    settleOpenEarlyRows()
     closeOpenSpans()
     clearParallelStep()
     trace(`pump: host interrupted the turn sessionId=${session.sessionId} — leaving the cancelled Run to its drain`)
@@ -4316,12 +4457,14 @@ export async function pump(
             `Cursor Run frame stream interrupted: ${(error as Error).message}`,
             { cause: error },
           )
+      settleOpenEarlyRows()
       if (session.hostInterrupted) stopForHostInterrupt()
       if (finishInterruptedTools("remote-error", failure)) return
       throw finalizeFailure(failure)
     }
     if (session.hostInterrupted) stopForHostInterrupt(next)
     if (next.done) {
+      settleOpenEarlyRows()
       closeOpenSpans()
       trace("pump: frames iterator ended before turn_ended")
       if (finishInterruptedTools("remote-clean-close")) return
@@ -4329,6 +4472,10 @@ export async function pump(
       throw finalizeFailure(failure)
     }
     const frame = next.value as Frame
+    // As in Cursor CLI, any inbound frame (heartbeats included) proves the Run is
+    // alive: a model composing a large tool input sends only heartbeats or token
+    // counts until the call arrives.
+    sessionManager.recordSemanticProgress(session)
 
     if (frame.flags & 0x02) {
       // A successful agent turn has an explicit turn_ended update before the
@@ -4342,6 +4489,7 @@ export async function pump(
           replaySafety.markBarrier("unknown-or-malformed-frame")
         }
       }
+      settleOpenEarlyRows()
       closeOpenSpans()
       const failure = payload
         ? connectFrameError(payload)
@@ -4394,7 +4542,6 @@ export async function pump(
     const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
     const checkpointRaw = asm.conversation_checkpoint_update
     const topField = payload.length > 0 ? payload[0] >> 3 : 0
-    const checkpointProgress = normalizeCheckpointBytes(checkpointRaw)
     const requiredChannel = responseRequiredChannel(payload)
     if (
       requiredChannel === "multiple" ||
@@ -4410,11 +4557,7 @@ export async function pump(
       kv,
       execControl,
       interactionQuery,
-      checkpointBytes: checkpointProgress,
     })
-    if (replayFrame.semanticProgress) {
-      sessionManager.recordSemanticProgress(session)
-    }
     if (replayFrame.barrier === "unknown-or-malformed-frame" && isDebugEnabled()) {
       const layout = describeFrameLayout(payload)
       if (!unknownFrameLayouts.has(layout)) {
@@ -4468,6 +4611,7 @@ export async function pump(
       if (bytes && bytes.length > 0) {
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
+        noteCheckpoint(session.openCodeSessionId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         const tokenDetails = decodeConversationTokenDetails(bytes)
@@ -4943,6 +5087,8 @@ export async function pump(
         trace(`exec: id=${parsed?.id} variant=${parsed ? Object.keys(parsed).join(",") : "none"} toolName=${parsed?.toolName} resultField=${parsed?.resultField}`)
         if (parsed) {
           if (parsed.localError) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             disposeParallelCall(displayCallId)
             if (closeIfParallelStepComplete()) return
@@ -4953,6 +5099,8 @@ export async function pump(
           // advertise no tools — refuse on the Cursor channel and keep
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -5130,7 +5278,25 @@ export async function pump(
             session.displayToolCalls.delete(displayCallId)
             trace(`exec: claimed display callId=${displayCallId}`)
           }
-          const tc = buildToolCallPart(parsed, session.sessionId)
+          const boundEarly = earlyRows.claim(displayCallId)
+          let earlyToolCallId: string | undefined
+          if (boundEarly) {
+            const predicted = hostToolForCursorEdit(
+              boundEarly.path,
+              fileToolNames(),
+              workspaceRootFromRequestContext(session.requestContext),
+            )
+            if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
+              closeEarlyRow(boundEarly)
+            } else {
+              replaySafety.markBarrier("visible-tool-row")
+              safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
+              sessionManager.bindToolCall(boundEarly.toolCallId, session.sessionId, parsed.id)
+              earlyToolCallId = boundEarly.toolCallId
+            }
+          }
+          const built = buildToolCallPart(parsed, session.sessionId)
+          const tc = earlyToolCallId ? { ...built, toolCallId: earlyToolCallId } : built
           if (
             parsed.resultField === "shell_stream"
             || parsed.resultField === "shell_result"
@@ -5160,6 +5326,7 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
+          if (!(session.parallelStep && shouldHoldParallelStep(session.parallelStep))) settleOpenEarlyRows()
           emittedHostTools++
           // Close open text/reasoning spans before tool-call (required by AI SDK V3).
           closeOpenSpans()
@@ -5513,6 +5680,7 @@ export async function pump(
     }
     } catch (e) {
       if (e instanceof CursorProviderError) {
+        settleOpenEarlyRows()
         if (finishInterruptedTools("remote-error", e)) return
         throw e
       }
@@ -5523,9 +5691,44 @@ export async function pump(
       // exec/args decode) must not abort the whole turn — log and skip.
       trace(`frame dispatch FAILED (skipping): topField=${topField}`)
     }
-    // heartbeat / step / partial_tool_call → ignore (partial args are
-    // display-only; the exec channel is authoritative. Checkpoints and
-    // interaction queries are handled above.)
+    const announced = iu?.partial_tool_call ? cursorEditAnnouncement(iu.partial_tool_call) : undefined
+    if (
+      announced
+      && !earlyRows.seen(announced.callId)
+      && shouldOpenEarlyRow({
+        allowTools: session.allowTools,
+        hostInterrupted: !!session.hostInterrupted,
+        holdingParallelStep: !!session.parallelStep && shouldHoldParallelStep(session.parallelStep),
+        emittedHostTools,
+        owedPending: owedPendingCount(),
+      })
+    ) {
+      const toolName = hostToolForCursorEdit(
+        announced.path,
+        fileToolNames(),
+        workspaceRootFromRequestContext(session.requestContext),
+      )
+      if (!toolName) earlyRows.skip(announced.callId)
+      else {
+        const row: EarlyToolRow = {
+          cursorCallId: announced.callId,
+          toolCallId: earlyRowToolCallId(session.sessionId, announced.callId),
+          toolName,
+          path: announced.path,
+        }
+        earlyRows.openRow(row)
+        replaySafety.markBarrier("visible-tool-row")
+        safeEnqueue({
+          type: "tool-input-start",
+          id: row.toolCallId,
+          toolName: row.toolName,
+        } as V3Part)
+      }
+    }
+    // heartbeat / step / tool-input deltas stay display-only. An edit
+    // partial with a path may have opened a row above; the exec channel
+    // still decides the call. Checkpoints and interaction queries are
+    // handled above.
   }
 }
 
@@ -5567,6 +5770,7 @@ type ExtractedToolResult = ToolResultContent & { sessionId: string; execId: numb
 function correlateToolResults(results: ToolResultContent[]): ExtractedToolResult[] {
   return results.flatMap(result => {
     const parsed = parseExecIdFromToolCallId(result.toolCallId)
+      ?? sessionManager.toolCallExec(result.toolCallId)
     return parsed ? [{ ...result, ...parsed }] : []
   })
 }
@@ -6707,6 +6911,7 @@ function foldStreamParts(parts: V3Part[]): LanguageModelV3GenerateResult {
     if (part.type === "text-delta") text += part.delta
     else if (part.type === "reasoning-delta") reasoning += part.delta
     else if (part.type === "tool-call") {
+      if (part.providerExecuted) continue
       content.push({
         type: "tool-call",
         toolCallId: part.toolCallId,

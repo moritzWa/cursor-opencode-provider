@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, setSystemTime } from "bun:test"
-import { applyHostPromptEvent, SessionActivityTracker } from "../src/activity.js"
+import { applyHostPromptEvent, applyHostToolEvent, RUNNING_TOOL_CAP_MS, SessionActivityTracker } from "../src/activity.js"
 
 afterEach(() => setSystemTime())
 
@@ -96,5 +96,53 @@ describe("applyHostPromptEvent", () => {
     applyHostPromptEvent(tracker, "permission.asked", undefined)
     applyHostPromptEvent(tracker, "form.created", { form: "nope" })
     expect(tracker.lastActivityAt("s")).toBeUndefined()
+  })
+})
+
+describe("running host tools", () => {
+  it("keeps the original start and the later tool's own ceiling", () => {
+    const tracker = new SessionActivityTracker()
+    tracker.linkSession("child", "parent")
+    tracker.toolStarted("parent", "early", 1_000)
+    tracker.toolStarted("parent", "early", 50_000)
+    const cap = RUNNING_TOOL_CAP_MS
+    expect(tracker.runningToolDeadline("parent", 1_000, cap)).toBe(1_000 + cap)
+    tracker.toolStarted("child", "later", 3 * 60 * 60 * 1_000)
+    const afterEarly = 1_000 + cap + 1
+    expect(tracker.runningToolDeadline("parent", afterEarly, cap)).toBe(3 * 60 * 60 * 1_000 + cap)
+    tracker.toolEnded("child", "later", afterEarly)
+    expect(tracker.runningToolDeadline("parent", afterEarly, cap)).toBeUndefined()
+    setSystemTime(new Date(afterEarly))
+    expect(tracker.lastActivityAt("parent")).toBe(afterEarly)
+  })
+
+  it("starts from a running tool part and a host call, and stops when the session is idle", () => {
+    const tracker = new SessionActivityTracker()
+    const started = Date.now()
+    applyHostToolEvent(tracker, "message.part.updated", {
+      part: {
+        type: "tool",
+        sessionID: "s",
+        callID: "call-1",
+        state: { status: "running" },
+        metadata: { providerExecuted: true },
+      },
+    })
+    expect(tracker.runningToolDeadline("s", started, RUNNING_TOOL_CAP_MS)).toBeUndefined()
+    applyHostToolEvent(tracker, "message.part.updated", {
+      part: { type: "tool", sessionID: "s", callID: "call-1", state: { status: "running" } },
+    })
+    expect(tracker.runningToolDeadline("s", started, RUNNING_TOOL_CAP_MS)).toBeGreaterThan(started)
+    applyHostToolEvent(tracker, "session.tool.called", { sessionID: "s", id: "call-2", executed: true })
+    applyHostToolEvent(tracker, "session.tool.called", { sessionID: "s", id: "call-2", executed: false })
+    applyHostToolEvent(tracker, "message.part.updated", {
+      part: { type: "tool", sessionID: "s", callID: "call-1", state: { status: "completed" } },
+    })
+    expect(tracker.runningToolDeadline("s", Date.now(), RUNNING_TOOL_CAP_MS)).toBeTypeOf("number")
+    applyHostToolEvent(tracker, "session.tool.success", { sessionID: "s", id: "call-2" })
+    expect(tracker.runningToolDeadline("s", Date.now(), RUNNING_TOOL_CAP_MS)).toBeUndefined()
+    applyHostToolEvent(tracker, "session.tool.called", { sessionID: "s", id: "call-3" })
+    applyHostToolEvent(tracker, "session.idle", { sessionID: "s" })
+    expect(tracker.runningToolDeadline("s", Date.now(), RUNNING_TOOL_CAP_MS)).toBeUndefined()
   })
 })

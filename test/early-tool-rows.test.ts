@@ -1,0 +1,281 @@
+import { afterEach, describe, expect, it } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { encodeMessage } from "../src/protocol/messages.js"
+import { hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
+import {
+  cursorEditAnnouncement,
+  earlyRowToolCallId,
+  shouldOpenEarlyRow,
+} from "../src/early-tool-rows.js"
+import { extractTrailingToolResults, pump } from "../src/language-model.js"
+import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  sessionManager.dispose()
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-early-row-"))
+  tempDirs.push(dir)
+  return dir
+}
+
+function partial(callId: string, filePath: string): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: {
+      partial_tool_call: {
+        call_id: callId,
+        tool_call: { edit_tool_call: { args: { path: filePath } } },
+      },
+    },
+  })
+}
+
+function turnEnded(): Uint8Array {
+  return encodeMessage("AgentServerMessage", {
+    interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } },
+  })
+}
+
+function pumpSession(
+  payloads: Uint8Array[],
+  tools: Array<{ name: string; description: string }>,
+): { session: CursorSession; parts: any[] } {
+  let index = 0
+  const frames: AsyncIterator<Frame> = {
+    next: async () => index < payloads.length
+      ? { done: false, value: { flags: 0, payload: payloads[index++]! } }
+      : { done: true, value: undefined },
+  }
+  const descriptors = toolsToDescriptors(tools, "opencode", [])
+  const session = sessionFixture({
+    sessionId: `early-${Math.random().toString(16).slice(2)}`,
+    conversationId: `conv-early-${Math.random().toString(16).slice(2)}`,
+    stream: {
+      write() {},
+      end() {},
+      destroy() {},
+      isClosed: () => false,
+      frames: () => ({ [Symbol.asyncIterator]: () => frames }),
+    } as never,
+    frames,
+    pending: new Map(),
+    displayToolCalls: new Map(),
+    nextBridgedExecId: 900_000,
+    blobs: new Map(),
+    toolCatalog: tools,
+    toolDescriptors: descriptors,
+    requestContext: {},
+    usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+    allowTools: true,
+    pumpActive: false,
+    heartbeat: null,
+    heartbeatCancel: null,
+    closed: false,
+  })
+  const parts: any[] = []
+  return {
+    session,
+    parts,
+  }
+}
+
+async function run(session: CursorSession, parts: any[]): Promise<void> {
+  const controller = {
+    enqueue(part: unknown) { parts.push(part) },
+    close() {},
+    error(error: unknown) { throw error },
+  } as unknown as ReadableStreamDefaultController<any>
+  await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+}
+
+describe("hostToolForCursorEdit", () => {
+  it("predicts edit, patch for a missing file, and withholds a patch that would change CRLF", () => {
+    const dir = tempDir()
+    const crlf = path.join(dir, "crlf.txt")
+    const lf = path.join(dir, "lf.txt")
+    fs.writeFileSync(crlf, "a\r\nb\r\n")
+    fs.writeFileSync(lf, "a\nb\n")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit"]))).toBe("edit")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["patch"]))).toBe("patch")
+    expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["apply_patch"]))).toBe("apply_patch")
+    expect(hostToolForCursorEdit(crlf, new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(crlf, new Set(["apply_patch"]))).toBe("apply_patch")
+    expect(hostToolForCursorEdit(lf, new Set(["patch"]))).toBe("patch")
+    expect(hostToolForCursorEdit(dir, new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit("relative.txt", new Set(["patch"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(lf, new Set(["write"]))).toBeUndefined()
+  })
+})
+
+describe("early edit rows", () => {
+  it("opens only while the step can wait for the exec", () => {
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(true)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: true,
+      emittedHostTools: 2,
+      owedPending: 1,
+    })).toBe(true)
+    expect(shouldOpenEarlyRow({
+      allowTools: false,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(false)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: true,
+      holdingParallelStep: false,
+      emittedHostTools: 0,
+      owedPending: 0,
+    })).toBe(false)
+    expect(shouldOpenEarlyRow({
+      allowTools: true,
+      hostInterrupted: false,
+      holdingParallelStep: false,
+      emittedHostTools: 1,
+      owedPending: 0,
+    })).toBe(false)
+    expect(cursorEditAnnouncement({
+      call_id: "task-1",
+      tool_call: { task_tool_call: { args: { description: "look" } } },
+    })).toBeUndefined()
+    expect(earlyRowToolCallId("sess", "call")).toBe("cursor-early_sess_call")
+  })
+
+  it("binds the announced row to the exec and routes its result", async () => {
+    const dir = tempDir()
+    const target = path.join(dir, "notes.txt")
+    fs.writeFileSync(target, "line one\nline two\n")
+    const callId = "edit-1"
+    const { session, parts } = pumpSession([
+      partial(callId, target),
+      encodeMessage("AgentServerMessage", {
+        interaction_update: {
+          tool_call_started: {
+            call_id: callId,
+            tool_call: { edit_tool_call: { args: { path: target } } },
+          },
+        },
+      }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 17, read_args: { path: target, tool_call_id: callId } },
+      }),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: {
+          id: 18,
+          write_args: {
+            path: target,
+            file_text: "edited one\nline two\n",
+            tool_call_id: callId,
+          },
+        },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+      { name: "write", description: "Write" },
+    ])
+    session.requestContext.env = { workspace_paths: [dir] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const call = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(start?.toolName).toBe("edit")
+    expect(call?.toolCallId).toBe(start?.id)
+    expect(call?.toolCallId.startsWith("cursor-early_")).toBe(true)
+    expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toHaveLength(1)
+    expect(parts.findIndex((part) => part.type === "tool-input-start"))
+      .toBeLessThan(parts.findIndex((part) => part.type === "tool-input-end"))
+    const continued = extractTrailingToolResults([
+      { role: "assistant", content: [{ type: "text", text: "editing" }] },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId: call.toolCallId,
+          toolName: "edit",
+          output: { type: "text", value: "ok" },
+        }],
+      },
+    ] as never)
+    expect(continued).toMatchObject([{ sessionId: session.sessionId, execId: 18 }])
+    sessionManager.resolve(session.sessionId, 18)
+  })
+
+  it("closes the row when the exec is a different tool", async () => {
+    const { session, parts } = pumpSession([
+      partial("edit-1", "/tmp/anywhere.txt"),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
+      }),
+    ], [
+      { name: "edit", description: "Edit" },
+      { name: "bash", description: "Shell" },
+    ])
+    await run(session, parts)
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
+    const shell = parts.find((part) => part.type === "tool-call" && part.toolName === "bash")
+    expect(start?.toolName).toBe("edit")
+    expect(closed?.toolCallId).toBe(start?.id)
+    expect(shell?.toolCallId.startsWith("cursor_")).toBe(true)
+    expect(parts.findIndex((part) => part === closed)).toBeLessThan(parts.findIndex((part) => part === shell))
+    expect(parts.at(-1)?.type).toBe("finish")
+    sessionManager.resolve(session.sessionId, 4)
+  })
+
+  it("stays open across later text and closes before the step finishes", async () => {
+    const { session, parts } = pumpSession([
+      partial("edit-1", "/tmp/anywhere.txt"),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }])
+    await run(session, parts)
+    const startAt = parts.findIndex((part) => part.type === "tool-input-start")
+    const textAt = parts.findIndex((part) => part.type === "text-delta")
+    const closedAt = parts.findIndex((part) => part.type === "tool-call" && part.providerExecuted)
+    const finishAt = parts.findIndex((part) => part.type === "finish")
+    expect(startAt).toBeGreaterThanOrEqual(0)
+    expect(textAt).toBeGreaterThan(startAt)
+    expect(closedAt).toBeGreaterThan(textAt)
+    expect(finishAt).toBeGreaterThan(closedAt)
+  })
+
+  it("does not open a row a patch conversion would refuse, or on a tool-less turn", async () => {
+    const dir = tempDir()
+    const crlf = path.join(dir, "crlf.txt")
+    fs.writeFileSync(crlf, "a\r\nb\r\n")
+    const refused = pumpSession([
+      partial("edit-1", crlf),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "no row" } } }),
+      turnEnded(),
+    ], [{ name: "patch", description: "Patch" }])
+    await run(refused.session, refused.parts)
+    expect(refused.parts.some((part) => part.type === "tool-input-start")).toBe(false)
+
+    const lifecycle = pumpSession([
+      partial("edit-1", crlf),
+      encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "title" } } }),
+      turnEnded(),
+    ], [{ name: "edit", description: "Edit" }])
+    lifecycle.session.allowTools = false
+    await run(lifecycle.session, lifecycle.parts)
+    expect(lifecycle.parts.some((part) => part.type === "tool-input-start")).toBe(false)
+  })
+})

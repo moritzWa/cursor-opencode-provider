@@ -294,6 +294,39 @@ describe("SessionManager", () => {
     })
   })
 
+  it("renews every pending while a host tool runs, up to that tool's own ceiling", () => {
+    let now = 1_000
+    const tracker = new SessionActivityTracker()
+    const mgr = new SessionManager({
+      now: () => now,
+      activitySource: tracker,
+      setTimer: () => ({ unref() {} }) as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => {},
+    })
+    const s = fakeSession()
+    s.openCodeSessionId = "parent"
+    s.policy = { heartbeatMs: 10, semanticIdleMs: 50, hardCapMs: 100 }
+    mgr.registerPending(9, s, "read_result")
+    mgr.registerPending(10, s, "shell_result")
+    tracker.toolStarted("parent", "read", 1_000)
+
+    now = 1_500
+    mgr.sweepHardDeadlines()
+    expect(s.closed).toBe(false)
+    expect(mgr.pendingFor(s.sessionId, 9)?.hardDeadlineAt).toBe(1_600)
+    expect(mgr.pendingFor(s.sessionId, 10)?.hardDeadlineAt).toBe(1_600)
+
+    tracker.toolStarted("parent", "later", 1_000 + 3 * 60 * 60 * 1_000)
+    now = 1_000 + 4 * 60 * 60 * 1_000 + 1
+    mgr.sweepHardDeadlines()
+    expect(s.closed).toBe(false)
+
+    now = 1_000 + 3 * 60 * 60 * 1_000 + 4 * 60 * 60 * 1_000 + 1
+    mgr.sweepHardDeadlines()
+    expect(s.closed).toBe(true)
+    mgr.dispose()
+  })
+
   it("holds a pending tool past the hard cap while the host waits on the user", () => {
     const start = new Date("2026-10-09T00:00:00Z").getTime()
     setSystemTime(new Date(start))

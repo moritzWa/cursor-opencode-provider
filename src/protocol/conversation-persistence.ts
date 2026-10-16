@@ -38,6 +38,8 @@ export type PersistedConversation = {
   hostNote?: string
   /** Bounded early-steer delivery receipts for the saved checkpoint. */
   earlySteers?: string
+  /** JSON lost-request record: user text sent on a checkpoint Cursor never advanced. */
+  lostRequest?: string
 }
 
 /** Small per-session facts kept for the process; full snapshots stay on disk. */
@@ -317,6 +319,7 @@ function encodeCacheFile(value: PersistedConversation): {
   if (value.turnProvenance) writer.uint32(fieldTag(12, 2)).string(value.turnProvenance)
   if (value.hostNote) writer.uint32(fieldTag(13, 2)).string(value.hostNote)
   if (value.earlySteers) writer.uint32(fieldTag(14, 2)).string(value.earlySteers)
+  if (value.lostRequest) writer.uint32(fieldTag(15, 2)).string(value.lostRequest)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -336,6 +339,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let turnProvenance: string | undefined
   let hostNote: string | undefined
   let earlySteers: string | undefined
+  let lostRequest: string | undefined
   while (reader.pos < reader.len) {
     const tag = reader.uint32()
     const wireType = tag & 7
@@ -396,6 +400,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 2) throw new Error("invalid early steers")
         earlySteers = reader.string()
         break
+      case 15:
+        if (wireType !== 2) throw new Error("invalid lost request")
+        lostRequest = reader.string()
+        break
       default:
         reader.skipType(wireType)
     }
@@ -423,6 +431,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     ...(turnProvenance ? { turnProvenance } : {}),
     ...(hostNote ? { hostNote } : {}),
     ...(earlySteers ? { earlySteers } : {}),
+    ...(lostRequest ? { lostRequest } : {}),
   }
 }
 
