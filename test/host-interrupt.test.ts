@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -6,6 +6,7 @@ import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { CursorLocalCancellationError } from "../src/errors.js"
 import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { createCursor } from "../src/index.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 import {
   cancelIfHostStoppedSince,
   cancelRunForHostInterrupt,
@@ -156,7 +157,10 @@ async function savedState(session: CursorSession) {
   }
 }
 
+let previousCacheDir: string | undefined
+beforeEach(() => { previousCacheDir = getHostCacheDirOverride() })
 afterEach(() => {
+  setHostCacheDirOverride(previousCacheDir)
   sessionManager.dispose()
   resetCursorShellCalls()
   resetTurnStateForTests()
