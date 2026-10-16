@@ -688,6 +688,101 @@ describe("a steer sent while Cursor waits inside a step", () => {
     })
   }, 30_000)
 
+  it("rebuilds the retried step from host history when a promoted steer's Run drops after its checkpoint and recovery fails", async () => {
+    let refuseToken = false
+    await withModel("promoted-recovery-fails", async (model, cacheDir) => {
+      const heldSteer = Buffer.from([0x0a, 0x01, 0x36])
+      const rebuilt = Uint8Array.from([0x0a, 0x01, 0x37])
+      const file = probeFile(cacheDir)
+      const sessionKey = "ses_early_promoted_recovery_fails"
+      let injectionId = ""
+      const { first, announce } = await waitingRun(model, sessionKey, {
+        inject: (run, id) => {
+          injectionId = id
+          readOnSteer(file)(run, id)
+        },
+        next: (run, message) => {
+          if (message.exec_client_message?.read_result) {
+            injectionState(run, injectionId, "delivered")
+            run.send({ interaction_update: { text_delta: { text: "STEER" } } })
+            run.send({ conversation_checkpoint_update: heldSteer })
+            refuseToken = true
+            run.end()
+          } else if (message.run_request) {
+            run.send({ interaction_update: { text_delta: { text: "Answered once." } } })
+            run.send({ conversation_checkpoint_update: rebuilt })
+            run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+          }
+        },
+      })
+      const message = announce("Then read probe.txt and say STEERED.")
+      const step = readStep(readCall(await first), file, message.text)
+      expect(await failure(collect(model, step, sessionKey))).toBeInstanceOf(Error)
+      refuseToken = false
+      await collect(model, step, sessionKey)
+      const original = runs[0]!.received[0]!.run_request
+      const retried = runs.at(-1)!.received[0]!.run_request
+      const resumed = Uint8Array.from(retried.conversation_state ?? [])
+      const sent = userText(runs.at(-1)!)
+      expect(resumed).toEqual(new Uint8Array())
+      // The checkpoint taken after Cursor took the steer holds it as one copy.
+      const copies = sent.split(message.text).length - 1 + (Buffer.from(resumed).equals(heldSteer) ? 1 : 0)
+      expect(copies).toBe(1)
+      expect(sent).toContain(`Read file ${file}, lines 1-1\n1: alpha`)
+      expect(retried.action.user_message_action.request_context).toEqual(original.action.user_message_action.request_context)
+
+      await collect(model, [...step, assistant("Answered once."), user("And then?")], sessionKey)
+      const next = runs.at(-1)!.received[0]!.run_request
+      expect(next.conversation_id).toBe(retried.conversation_id)
+      expect(Uint8Array.from(next.conversation_state)).toEqual(rebuilt)
+    }, async () => {
+      if (refuseToken) throw new Error("login expired")
+      return "test-token"
+    })
+  }, 30_000)
+
+  it("resumes the checkpoint when a new message finishes a Run that answered a promoted steer", async () => {
+    await withModel("promoted-drained", async (model, cacheDir) => {
+      const answeredSteer = Uint8Array.from([0x0a, 0x01, 0x38])
+      const file = probeFile(cacheDir)
+      const sessionKey = "ses_early_promoted_drained"
+      let injectionId = ""
+      const { first, announce } = await waitingRun(model, sessionKey, {
+        inject: (run, id) => {
+          injectionId = id
+          readOnSteer(file)(run, id)
+        },
+        next: (run, message) => {
+          if (message.exec_client_message?.read_result?.success && message.exec_client_message.id === 1) {
+            injectionState(run, injectionId, "delivered")
+            run.send({ conversation_checkpoint_update: CHECKPOINT })
+            run.send({ exec_server_message: { id: 2, exec_id: "exec-2", read_args: { path: file, tool_call_id: "tc-2" } } })
+          } else if (message.exec_client_message?.id === 2) {
+            run.send({ conversation_checkpoint_update: answeredSteer })
+            run.send({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } })
+          } else if (message.run_request) {
+            endTurn(run, "About the new question.")
+          }
+        },
+      })
+      const message = announce("Then read probe.txt twice.")
+      const step = readStep(readCall(await first), file, message.text)
+      const second = readCall(await collect(model, step, sessionKey))
+      expect(second).toBeDefined()
+      await collect(model, [
+        ...step,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: second.toolCallId, toolName: "read", input: JSON.parse(second.input) }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: second.toolCallId, toolName: "read", output: { type: "text", value: `Read file ${file}, lines 1-1\n1: alpha` } }] },
+        user("A new question."),
+      ] as Prompt, sessionKey)
+      const original = runs[0]!.received[0]!.run_request
+      const next = runs.at(-1)!.received[0]!.run_request
+      expect(runs).toHaveLength(2)
+      expect(next.conversation_id).toBe(original.conversation_id)
+      expect(Uint8Array.from(next.conversation_state)).toEqual(answeredSteer)
+    })
+  }, 30_000)
+
   it("is answered once when the Run drops after Cursor checkpointed it", async () => {
     await withModel("resume", async (model) => {
       const sessionKey = "ses_early_resume"

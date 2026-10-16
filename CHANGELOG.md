@@ -11,6 +11,7 @@
 - A Run whose stream is cancelled mid-generation, as OpenCode 1.x does on Stop, is cancelled at Cursor so the next message resumes from where it stopped, and a tool result Cursor has withdrawn is no longer sent back ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov))
 - A turn stopped mid-step keeps its Cursor conversation and prompt cache at the next message, also after a restart ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov), [#74](https://github.com/oakimov/cursor-opencode-provider/issues/74))
 - On OpenCode 2, plain-text steers without files or skills can reach Cursor during a background-shell wait; queued messages are preserved after Stop and mixed tool continuations, and answered copies are deduplicated across restarts and retries while preserving later identical requests and neighboring attachments ([#57](https://github.com/oakimov/cursor-opencode-provider/pull/57) by [@nkoynov](https://github.com/nkoynov))
+- On OpenCode 2, a steer that Cursor took after tool results is no longer sent twice when its Run drops and cannot be recovered; the retried step rebuilds from host history ([#92](https://github.com/oakimov/cursor-opencode-provider/pull/92) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.2] - 2026-10-15
 
