@@ -2490,6 +2490,7 @@ export async function drainSessionUntilTurnEnded(
         }
         trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
         keepUndeliveredHostNotes(session)
+        settleEarlySteers(session.openCodeSessionId, session.sessionId)
         if (session.openCodeSessionId) {
           await persistConversationState(
             session.cacheDir ?? opencodeGlobalCacheDir(),
