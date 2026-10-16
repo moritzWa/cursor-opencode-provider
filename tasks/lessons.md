@@ -275,6 +275,12 @@ it supersedes. Cite tests and symbols rather than line numbers, which drift.
   and Stop cases lost a request because fresh Runs selected only the last
   message. The live-turn range must agree with the range excluded from seeded
   history (`liveUserTurn`, `test/early-steer.test.ts`).
+- **Scope receipts wherever a host copy is consumed.** PR #57 scoped copies
+  handled after an answer but missed promotions after tool results, so a later
+  identical request disappeared. Rejecting the whole message range when one
+  neighbor carried an attachment also repeated an answered request. The
+  Greptile receipt regressions cover both promotion paths and preserve the
+  unmatched message parts and image bytes (`test/early-steer.test.ts`).
 - **A busy or incomplete fresh-turn drain does not establish a safe
   checkpoint.** Rebuild from the host's results while keeping the new user
   request, and never deduplicate commands by their text.

@@ -3318,16 +3318,18 @@ function injectHostSteer(session: CursorSession, steer: HostSteer): boolean {
   return true
 }
 
-/** Trailing user messages as plain text, after `notes` (host notes among them) are set aside. */
+/** Match only wholly textual messages; keep attachment-bearing neighbors opaque and intact. */
 function trailingUserTexts(prompt: LanguageModelV3CallOptions["prompt"]): {
   start: number
   texts: Array<{ index: number; text: string }>
+  nonText: number[]
   notes: LanguageModelV3CallOptions["prompt"]
 } | undefined {
   let start = prompt.length
   while (start > 0 && (prompt[start - 1].role === "user" || prompt[start - 1].role === "system")) start--
   if (start === prompt.length) return undefined
   const texts: Array<{ index: number; text: string }> = []
+  const nonText: number[] = []
   const notes: LanguageModelV3CallOptions["prompt"] = []
   for (let index = start; index < prompt.length; index++) {
     const message = prompt[index]
@@ -3335,10 +3337,18 @@ function trailingUserTexts(prompt: LanguageModelV3CallOptions["prompt"]): {
       notes.push(message)
       continue
     }
-    if (message.role !== "user" || message.content.some((part) => part.type !== "text")) return undefined
+    if (message.role !== "user" || message.content.some((part) => part.type !== "text")) {
+      nonText.push(index)
+      continue
+    }
     texts.push({ index, text: message.content.map((part) => (part as { text: string }).text).join("\n") })
   }
-  return { start, texts, notes }
+  return { start, texts, nonText, notes }
+}
+
+/** The same host history boundary must scope both answered copies and already-promoted receipts. */
+function steerHostTurn(prompt: LanguageModelV3CallOptions["prompt"], start: number): string {
+  return createHash("sha256").update(JSON.stringify(prompt[start - 1])).digest("hex")
 }
 
 type SnapshotSource = Parameters<typeof persistTerminalCheckpoint>[0]
@@ -3373,9 +3383,8 @@ async function leaveOutAnsweredEarlySteers(
   if (prompt[tail.start - 1]?.role === "assistant" && detectForeignHistory({
     sessionKey, conversationId: peekConversationId(sessionKey), prompt,
   })) return undefined
-  const hostTurn = createHash("sha256").update(JSON.stringify(prompt[tail.start - 1])).digest("hex")
+  const hostTurn = steerHostTurn(prompt, tail.start)
   const notes = tail.notes.map(hostTailNote)
-  if (notes.some((note) => note?.media)) return undefined
   const answered = new Map<number, EarlySteer>()
   for (const { index, text } of tail.texts) {
     const taken = [...answered.values()]
@@ -3390,11 +3399,9 @@ async function leaveOutAnsweredEarlySteers(
     `fresh turn: the model already answered ${answered.size} early steer(s) ` +
       `inboxIDs=${[...answered.values()].map((record) => record.inboxID).join(",")} — left out of this step`,
   )
-  // The fresh turn clears the records once its Run is open, so a retried step still matches them.
-  // It sends the last user message and the host notes just before it.
-  if (answered.size < tail.texts.length) {
-    const kept = tail.texts.filter(({ index }) => !answered.has(index)).map(({ index }) => prompt[index])
-    return [...prompt.slice(0, tail.start), ...kept.slice(0, -1), ...tail.notes, kept.at(-1)!]
+  // Remove only matching copies. Preserve all other messages, their parts and their ordering.
+  if (answered.size < tail.texts.length || tail.nonText.length || notes.some((note) => note?.media?.length)) {
+    return prompt.filter((_message, index) => !answered.has(index))
   }
   const run = steerAnsweringRuns.get(sessionKey)
   // Host notes in this step reach Cursor with the next user turn instead.
@@ -3432,7 +3439,8 @@ function continuationAfterEarlySteers(
   const held = sessionKey ? sessionManager.findOpenByOpenCodeSessionId(sessionKey) : undefined
   if (!held || held.pending.size === 0) return undefined
   const tail = trailingUserTexts(prompt)
-  if (!tail || prompt[tail.start - 1]?.role !== "tool") return undefined
+  if (!tail || tail.nonText.length || prompt[tail.start - 1]?.role !== "tool") return undefined
+  const hostTurn = steerHostTurn(prompt, tail.start)
   const steers: EarlySteer[] = []
   const newTexts: string[] = []
   for (const { text } of tail.texts) {
@@ -3450,7 +3458,7 @@ function continuationAfterEarlySteers(
   for (const text of newTexts) {
     const record: EarlySteer = {
       sessionID: sessionKey!, inboxID: crypto.randomUUID(), injectionId: crypto.randomUUID(),
-      run: held.sessionId, text, delivered: false, checkpointed: false, answered: false, promoted: true,
+      run: held.sessionId, text, delivered: false, checkpointed: false, answered: false, promoted: true, hostTurn,
     }
     if (!recordEarlySteer(record)) {
       forgetEarlySteerRecords(sessionKey!, added)
@@ -3458,7 +3466,10 @@ function continuationAfterEarlySteers(
     }
     added.push(record)
   }
-  for (const steer of steers) steer.promoted = true
+  for (const steer of steers) {
+    steer.promoted = true
+    steer.hostTurn = hostTurn
+  }
   trace(
     `continuation: ${results.length} trailing tool result(s) before ${steers.length} early steer(s) ` +
       `the held Run already has inboxIDs=${steers.map((steer) => steer.inboxID).join(",")}`,

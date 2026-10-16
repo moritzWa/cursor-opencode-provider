@@ -317,6 +317,93 @@ function probeFile(dir: string): string {
   return file
 }
 
+describe("Greptile receipt matching regressions", () => {
+  for (const mode of ["taken", "not taken", "mixed follow-up"] as const) {
+    for (const restart of [false, true]) {
+      it(`delivers identical new requests after promotion (${mode}, ${restart ? "restart" : "same process"})`, async () => {
+        await withModel(`promotion-scope-${mode.replaceAll(" ", "-")}-${restart}`, async (model, cacheDir) => {
+          const sessionKey = `ses_promotion_scope_${mode}_${restart}`
+          const file = probeFile(cacheDir)
+          let injectionId = ""
+          const { first, announce } = await waitingRun(model, sessionKey, {
+            inject: (run, id) => { injectionId = id; readOnSteer(file)(run, id) },
+            next: (run, message) => {
+              if (message.exec_client_message?.read_result) {
+                if (mode !== "not taken") injectionState(run, injectionId, "delivered")
+                endTurn(run, "Read complete.")
+              } else if (message.run_request) endTurn(run, "FOLLOWUP_COMPLETE")
+            },
+          })
+          const early = announce("REPEATABLE_PROMOTED_STEER")
+          const step = readStep(readCall(await first), file, early.text)
+          const repeated = mode === "mixed follow-up" ? "REPEATABLE_FOLLOWUP" : early.text
+          if (mode === "mixed follow-up") step.push(user(repeated))
+          const answer = textOf(await collect(model, step, sessionKey))
+          const countBefore = runs.length
+          if (restart) {
+            coldMemory()
+            cacheHttp2SessionForTests(ORIGIN, client)
+            model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+          }
+          onRun = (run, message) => { if (message.run_request) endTurn(run, "NEW_REQUEST_ANSWERED") }
+          expect(textOf(await collect(model, [...step, assistant(answer), user(repeated)], sessionKey))).toBe("NEW_REQUEST_ANSWERED")
+          expect(runs).toHaveLength(countBefore + 1)
+          expect(userText(runs.at(-1)!)).toContain(repeated)
+          const original = runs[0]!.received[0]!.run_request
+          const next = runs.at(-1)!.received[0]!.run_request
+          expect(next.conversation_id).toBe(original.conversation_id)
+          expect(next.conversation_state).toEqual(CHECKPOINT)
+          expect(next.action.user_message_action.request_context).toEqual(original.action.user_message_action.request_context)
+        })
+      }, 30_000)
+    }
+  }
+
+  for (const kind of ["image", "image only", "tool media", "same words with image"] as const) {
+    for (const copyFirst of [false, true]) {
+      for (const restart of [false, true]) {
+        it(`removes an answered copy beside ${kind} (${copyFirst ? "copy first" : "copy last"}, ${restart ? "restart" : "same process"})`, async () => {
+          await withModel(`attachment-copy-${kind.replaceAll(" ", "-")}-${copyFirst}-${restart}`, async (model, cacheDir) => {
+            const sessionKey = `ses_attachment_copy_${kind}_${copyFirst}_${restart}`
+            const { first, announce } = await waitingRun(model, sessionKey, { inject: answerSteer })
+            const early = announce("ANSWERED_REQUEST_WITH_IMAGE_NEIGHBOR")
+            const answer = textOf(await first)
+            const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7])
+            const text = kind === "same words with image" ? early.text : "DESCRIBE_NEW_ATTACHMENT"
+            const attached: Prompt[number] = {
+              role: "user",
+              content: [
+                ...(kind === "image only" ? [] : [{ type: "text" as const, text: kind === "tool media" ? "Attached media from tool result:" : text }]),
+                { type: "file", mediaType: "image/png", filename: "receipt-test.png", data: bytes },
+              ],
+            }
+            const tail = copyFirst ? [user(early.text), attached] : [attached, user(early.text)]
+            if (restart) {
+              coldMemory()
+              cacheHttp2SessionForTests(ORIGIN, client)
+              model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir }).languageModel("composer-2.5")
+            }
+            onRun = (run, message) => { if (message.run_request) endTurn(run, "ATTACHMENT_ANSWERED") }
+            const result = await collect(model, [ask, assistant(answer), ...tail], sessionKey)
+            expect(textOf(result)).toBe("ATTACHMENT_ANSWERED")
+            const sent = userText(runs.at(-1)!)
+            expect(sent.split(early.text).length - 1).toBe(kind === "same words with image" ? 1 : 0)
+            if (kind === "image") expect(sent).toContain(text)
+            const images = runs.at(-1)!.received[0]!.run_request.action.user_message_action.user_message.selected_context?.selected_images
+            expect(images).toHaveLength(1)
+            expect(Uint8Array.from(images[0].data)).toEqual(bytes)
+            const original = runs[0]!.received[0]!.run_request
+            const next = runs.at(-1)!.received[0]!.run_request
+            expect(next.conversation_id).toBe(original.conversation_id)
+            expect(next.conversation_state).toEqual(CHECKPOINT)
+            expect(next.action.user_message_action.request_context).toEqual(original.action.user_message_action.request_context)
+          })
+        }, 30_000)
+      }
+    }
+  }
+})
+
 describe("host steer registry", () => {
   const record = (overrides: Partial<EarlySteer> & { text: string }): EarlySteer => {
     const steer: EarlySteer = {
