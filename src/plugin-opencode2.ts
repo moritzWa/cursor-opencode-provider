@@ -10,6 +10,14 @@ import { resolveAgentUrl } from "./agent-url.js"
 import { applyHostPromptEvent, sessionActivity } from "./activity.js"
 import { notifyHostInterrupt } from "./host-interrupt.js"
 import {
+  announceHostSteer,
+  forgetEarlySteerOfInbox,
+  forgetEarlySteers,
+  rememberQueuedSteer,
+  takeQueuedSteer,
+  type HostSteer,
+} from "./host-steer.js"
+import {
   fetchOpenCodeWebSearchText,
   parseExaWebSearchResults,
 } from "./web-tools.js"
@@ -717,6 +725,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       if (id) {
         sessionActivity.removeSession(id)
         clearSessionTodos(id)
+        forgetEarlySteers(id)
         clearActiveCursorMode(id)
         cancelHostAgentModeSwitch(id)
       }
@@ -736,6 +745,32 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
     case "session.usage.recorded": {
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
+      break
+    }
+    case "session.inbox.enqueued": {
+      const id = payload?.sessionID
+      if (id) sessionActivity.recordActivity(id)
+      const steer = inboxSteer(id, payload?.inboxID, payload?.item)
+      if (!steer) break
+      if (payload.item.delivery === "steer") announceInboxSteer(steer)
+      else rememberQueuedSteer(steer)
+      break
+    }
+    case "session.inbox.delivery.changed": {
+      const id = payload?.sessionID
+      if (id) sessionActivity.recordActivity(id)
+      if (payload?.delivery !== "steer" || typeof payload?.inboxID !== "string") break
+      const steer = takeQueuedSteer(payload.inboxID)
+      if (steer) announceInboxSteer(steer)
+      break
+    }
+    case "session.inbox.delivered":
+    case "session.inbox.cancelled": {
+      const id = payload?.sessionID
+      if (id) sessionActivity.recordActivity(id)
+      if (typeof payload?.inboxID !== "string") break
+      takeQueuedSteer(payload.inboxID)
+      if (event.type === "session.inbox.cancelled" && typeof id === "string") forgetEarlySteerOfInbox(id, payload.inboxID)
       break
     }
     default: {
@@ -758,6 +793,25 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       break
     }
   }
+}
+
+/** A plain-text user message; one with files or skills reaches the prompt in another shape. */
+function inboxSteer(sessionID: unknown, inboxID: unknown, item: any): HostSteer | undefined {
+  if (typeof sessionID !== "string" || !sessionID || typeof inboxID !== "string" || !inboxID) return undefined
+  if (item?.type !== "user" || (item.delivery !== "steer" && item.delivery !== "queue")) return undefined
+  const prompt = item.payload
+  if (typeof prompt?.text !== "string" || !prompt.text.trim()) return undefined
+  if (prompt.files?.length || prompt.skills?.length) return undefined
+  return { sessionID, inboxID, text: prompt.text }
+}
+
+function announceInboxSteer(steer: HostSteer): void {
+  const taken = announceHostSteer(steer)
+  if (taken === undefined) return
+  trace(
+    `steer: OpenCode enqueued a mid-step message sessionID=${steer.sessionID} inboxID=${steer.inboxID} ` +
+      `chars=${steer.text.length} ${taken ? "injected into the pumping Run" : "left for the next step"}`,
+  )
 }
 
 export default plugin
