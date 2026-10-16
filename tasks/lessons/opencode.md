@@ -106,6 +106,16 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Injection needs acknowledgement and ordered fallback.** A written note is
   not necessarily consumed. Retry/defer it with its owning turn; an action may
   remove only the batches it captured (`test/host-notes.test.ts`).
+- **Every provider-minted tool-call id must stay recognizable.** Early-row ids
+  routed only through a live-Run table were dropped once the Run closed, so the
+  completed edit never reached Cursor. Keep routes like tombstones and parse the
+  id after a restart (`parseEarlyRowToolCallId`, `test/early-tool-rows.test.ts`).
+- **Carry a lost request only where history cannot.** A Run without a checkpoint
+  seeds host history, which already holds it; prepending as well sent it twice
+  (`carryLostRequest`, `test/lost-request-run.test.ts`).
+- **A renewal source may extend a lease, never shorten it.** A running tool near
+  its 4 h ceiling cut an activity-renewed lease (`refreshHardDeadline`,
+  `test/session.test.ts`).
 
 ## Planning and file mutations
 

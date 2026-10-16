@@ -91,8 +91,29 @@ describe("Cursor provider errors", () => {
 
     const host = hostFacingError(failure)
     expect(APICallError.isInstance(host)).toBe(true)
-    expect(host).toMatchObject({ message, statusCode: 400, isRetryable: false })
+    expect(host).toMatchObject({
+      message,
+      statusCode: 400,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
     expect((host as APICallError).cause).toBe(failure)
+  })
+
+  it("keeps a non-retryable verdict on codes whose HTTP status reads as retryable", () => {
+    // ErrorDetails{details{title:"Limit", is_retryable:false}}
+    const value = Buffer.from([0x12, 0x09, 0x0a, 0x05, ...Buffer.from("Limit"), 0x20, 0x00]).toString("base64")
+    for (const [code, statusCode] of [["resource_exhausted", 429], ["internal", 500], ["aborted", 409], ["constructor", 500]] as const) {
+      const failure = connectFrameError(JSON.stringify({
+        error: { code, details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+      }))
+      expect(failure).toMatchObject({ transient: false, retryable: false })
+      expect(hostFacingError(failure)).toMatchObject({
+        statusCode,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+    }
   })
 
   it("obeys an explicit retryable verdict and keeps other errors unchanged for the host", () => {

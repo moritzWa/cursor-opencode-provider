@@ -8,12 +8,31 @@ export type EarlyToolRow = {
   path: string
 }
 
+const EARLY_ROW_PREFIX = "cursor-early_"
+
 /**
  * Does not match `cursor_<session>_<execId>`. Continuation finds a bound row
  * through the session route table; a row that was closed never gets a route.
  */
 export function earlyRowToolCallId(sessionId: string, cursorCallId: string): string {
-  return `cursor-early_${sessionId}_${cursorCallId}`
+  return `${EARLY_ROW_PREFIX}${sessionId}_${cursorCallId}`
+}
+
+/** No exec has this id: the result is this provider's, but its exec is unknown. */
+export const UNBOUND_EXEC_ID = -1
+
+/**
+ * An early-row id whose route is gone (process restart, evicted route) still
+ * belongs to this provider. Its result proves the Run lost a completed call,
+ * so it must rebuild from host history like any other orphaned result.
+ * The session id is a UUID, so it ends at the first underscore.
+ */
+export function parseEarlyRowToolCallId(toolCallId: string): { sessionId: string; execId: number } | undefined {
+  if (!toolCallId.startsWith(EARLY_ROW_PREFIX)) return undefined
+  const rest = toolCallId.slice(EARLY_ROW_PREFIX.length)
+  const separator = rest.indexOf("_")
+  if (separator <= 0 || separator === rest.length - 1) return undefined
+  return { sessionId: rest.slice(0, separator), execId: UNBOUND_EXEC_ID }
 }
 
 /** Edit path from a `partial_tool_call`, once Cursor has included one. */

@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, setSystemTime } from "bun:test"
-import { applyHostPromptEvent, applyHostToolEvent, RUNNING_TOOL_CAP_MS, SessionActivityTracker } from "../src/activity.js"
+import {
+  applyHostPromptEvent,
+  applyHostToolEvent,
+  createSessionActivityState,
+  RUNNING_TOOL_CAP_MS,
+  SessionActivityTracker,
+} from "../src/activity.js"
 
 afterEach(() => setSystemTime())
 
@@ -144,5 +150,23 @@ describe("running host tools", () => {
     applyHostToolEvent(tracker, "session.tool.called", { sessionID: "s", id: "call-3" })
     applyHostToolEvent(tracker, "session.idle", { sessionID: "s" })
     expect(tracker.runningToolDeadline("s", Date.now(), RUNNING_TOOL_CAP_MS)).toBeUndefined()
+  })
+
+  it("sees a child's running tool and open prompt from another module copy sharing the state", () => {
+    const state = createSessionActivityState()
+    // The plugin copy receives host events; the provider copy holds the parent's Run.
+    const plugin = new SessionActivityTracker(state)
+    const provider = new SessionActivityTracker(state)
+    plugin.linkSession("child", "parent")
+    applyHostToolEvent(plugin, "session.tool.called", { sessionID: "child", id: "call-1", executed: false })
+    const now = Date.now()
+    expect(provider.runningToolDeadline("parent", now, RUNNING_TOOL_CAP_MS)).toBeGreaterThan(now)
+    applyHostToolEvent(plugin, "session.tool.success", { sessionID: "child", id: "call-1" })
+    expect(provider.runningToolDeadline("parent", now, RUNNING_TOOL_CAP_MS)).toBeUndefined()
+
+    setSystemTime(new Date(now + 60_000))
+    applyHostPromptEvent(plugin, "permission.asked", { sessionID: "child", id: "perm-1" })
+    setSystemTime(new Date(now + 120_000))
+    expect(provider.lastActivityAt("parent")).toBe(now + 120_000)
   })
 })

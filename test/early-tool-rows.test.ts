@@ -5,11 +5,13 @@ import path from "node:path"
 import { encodeMessage } from "../src/protocol/messages.js"
 import { hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
 import {
+  UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
   earlyRowToolCallId,
+  parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
 } from "../src/early-tool-rows.js"
-import { extractTrailingToolResults, pump } from "../src/language-model.js"
+import { extractTrailingToolResults, findContinuationSession, pump } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -156,6 +158,11 @@ describe("early edit rows", () => {
       tool_call: { task_tool_call: { args: { description: "look" } } },
     })).toBeUndefined()
     expect(earlyRowToolCallId("sess", "call")).toBe("cursor-early_sess_call")
+    expect(parseEarlyRowToolCallId(earlyRowToolCallId("sess", "toolu_01_x")))
+      .toEqual({ sessionId: "sess", execId: UNBOUND_EXEC_ID })
+    expect(parseEarlyRowToolCallId("cursor_sess_4")).toBeUndefined()
+    expect(parseEarlyRowToolCallId("cursor-early_sess")).toBeUndefined()
+    expect(parseEarlyRowToolCallId("cursor-early_sess_")).toBeUndefined()
   })
 
   it("binds the announced row to the exec and routes its result", async () => {
@@ -202,7 +209,7 @@ describe("early edit rows", () => {
     expect(parts.filter((part) => part.type === "tool-call" && !part.providerExecuted)).toHaveLength(1)
     expect(parts.findIndex((part) => part.type === "tool-input-start"))
       .toBeLessThan(parts.findIndex((part) => part.type === "tool-input-end"))
-    const continued = extractTrailingToolResults([
+    const prompt = [
       { role: "assistant", content: [{ type: "text", text: "editing" }] },
       {
         role: "tool",
@@ -213,9 +220,21 @@ describe("early edit rows", () => {
           output: { type: "text", value: "ok" },
         }],
       },
-    ] as never)
+    ] as never
+    const continued = extractTrailingToolResults(prompt)
     expect(continued).toMatchObject([{ sessionId: session.sessionId, execId: 18 }])
-    sessionManager.resolve(session.sessionId, 18)
+
+    // A result that arrives after the Run closed still names its exec, so the
+    // turn rebuilds from host history instead of dropping the completed edit.
+    sessionManager.close(session, "hard-cap-expired")
+    const late = extractTrailingToolResults(prompt)
+    expect(late).toMatchObject([{ sessionId: session.sessionId, execId: 18 }])
+    expect(findContinuationSession(late)).toBeUndefined()
+    expect(sessionManager.classify(session.sessionId, 18)).toEqual({ kind: "terminal", reason: "hard-cap-expired" })
+
+    // After a restart the route is gone; the id is still recognized as this provider's.
+    sessionManager.dispose()
+    expect(extractTrailingToolResults(prompt)).toMatchObject([{ sessionId: session.sessionId, execId: UNBOUND_EXEC_ID }])
   })
 
   it("closes the row when the exec is a different tool", async () => {
@@ -249,11 +268,14 @@ describe("early edit rows", () => {
     await run(session, parts)
     const startAt = parts.findIndex((part) => part.type === "tool-input-start")
     const textAt = parts.findIndex((part) => part.type === "text-delta")
+    const textEndAt = parts.findIndex((part) => part.type === "text-end")
     const closedAt = parts.findIndex((part) => part.type === "tool-call" && part.providerExecuted)
     const finishAt = parts.findIndex((part) => part.type === "finish")
     expect(startAt).toBeGreaterThanOrEqual(0)
     expect(textAt).toBeGreaterThan(startAt)
-    expect(closedAt).toBeGreaterThan(textAt)
+    // Open text ends before the closing tool-call, as at every other tool-call.
+    expect(textEndAt).toBeGreaterThan(textAt)
+    expect(closedAt).toBeGreaterThan(textEndAt)
     expect(finishAt).toBeGreaterThan(closedAt)
   })
 

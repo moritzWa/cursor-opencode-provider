@@ -406,7 +406,7 @@ export class SessionManager {
   // of continuing the held-open one — the prior entry is stale and superseded.
   private byOpenCodeSessionId = new Map<string, CursorSession>()
   private tombstones = new Map<string, Tombstone>()
-  /** Early-row tool call id → the exec that bound it. Lives only while the Run does. */
+  /** Early-row tool call id → the exec that bound it. Bounded like the tombstones. */
   private toolCallRoutes = new Map<string, { sessionId: string; execId: number }>()
   private readonly now: () => number
   private readonly setTimer: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>
@@ -880,9 +880,6 @@ export class SessionManager {
       if (this.isTerminalReason(reason)) this.putTombstone(key, reason)
     }
     session.pending.clear()
-    for (const [toolCallId, route] of this.toolCallRoutes) {
-      if (route.sessionId === session.sessionId) this.toolCallRoutes.delete(toolCallId)
-    }
     session.pendingFrameRead = undefined
     session.pushbackFrame = undefined
     session.parallelStep = undefined
@@ -954,39 +951,50 @@ export class SessionManager {
   /**
    * The host tool-call id a continuation will send for this exec, when it is
    * not `cursor_<session>_<execId>` (an early row bound to the real exec).
+   * The route outlives its Run, like a tombstone, so a result that arrives
+   * after the Run closed still names its exec and rebuilds from host history.
    */
   bindToolCall(toolCallId: string, sessionId: string, execId: number): void {
+    this.toolCallRoutes.delete(toolCallId)
     this.toolCallRoutes.set(toolCallId, { sessionId, execId })
+    while (this.toolCallRoutes.size > this.tombstoneLimit) {
+      const oldest = this.toolCallRoutes.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.toolCallRoutes.delete(oldest)
+    }
   }
 
   toolCallExec(toolCallId: string): { sessionId: string; execId: number } | undefined {
     return this.toolCallRoutes.get(toolCallId)
   }
 
+  /**
+   * Leases only grow. Session activity renews from its own time; a running
+   * host tool renews from now, but never past that tool's own ceiling. The
+   * ceiling limits the tool's extension, not the lease activity already gave.
+   */
   private refreshHardDeadline(session: CursorSession, pending: PendingExec): number {
-    if (session.openCodeSessionId) {
-      const toolCapAt = this.activitySource.runningToolDeadline?.(
-        session.openCodeSessionId,
-        this.now(),
-        RUNNING_TOOL_CAP_MS,
-      )
-      if (toolCapAt !== undefined && toolCapAt > this.now()) {
-        const renewed = Math.min(this.now() + session.policy.hardCapMs, toolCapAt)
-        const capped = Math.min(Math.max(pending.hardDeadlineAt, renewed), toolCapAt)
-        if (capped !== pending.hardDeadlineAt) {
-          pending.hardDeadlineAt = capped
-          trace("continuation lease renewed while a host tool is running")
-        }
-        return pending.hardDeadlineAt
+    if (!session.openCodeSessionId) return pending.hardDeadlineAt
+    const now = this.now()
+    const toolCapAt = this.activitySource.runningToolDeadline?.(
+      session.openCodeSessionId,
+      now,
+      RUNNING_TOOL_CAP_MS,
+    )
+    const activityAt = this.activitySource.lastActivityAt(session.openCodeSessionId)
+    if (activityAt !== undefined && activityAt > pending.registeredAt) {
+      const renewedDeadline = activityAt + session.policy.hardCapMs
+      if (renewedDeadline > pending.hardDeadlineAt) {
+        pending.hardDeadlineAt = renewedDeadline
+        trace("continuation lease renewed from OpenCode session activity")
       }
     }
-    if (!session.openCodeSessionId) return pending.hardDeadlineAt
-    const activityAt = this.activitySource.lastActivityAt(session.openCodeSessionId)
-    if (activityAt === undefined || activityAt <= pending.registeredAt) return pending.hardDeadlineAt
-    const renewedDeadline = activityAt + session.policy.hardCapMs
-    if (renewedDeadline > pending.hardDeadlineAt) {
-      pending.hardDeadlineAt = renewedDeadline
-      trace("continuation lease renewed from OpenCode session activity")
+    if (toolCapAt !== undefined) {
+      const renewedDeadline = Math.min(now + session.policy.hardCapMs, toolCapAt)
+      if (renewedDeadline > pending.hardDeadlineAt) {
+        pending.hardDeadlineAt = renewedDeadline
+        trace("continuation lease renewed while a host tool is running")
+      }
     }
     return pending.hardDeadlineAt
   }

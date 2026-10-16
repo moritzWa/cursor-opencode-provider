@@ -170,6 +170,7 @@ import {
   EarlyToolRows,
   cursorEditAnnouncement,
   earlyRowToolCallId,
+  parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
   type EarlyToolRow,
 } from "./early-tool-rows.js"
@@ -1566,19 +1567,24 @@ async function startSession(
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (liveTurn?.text || extractUserText(lastUser) || ".")
   if (sessionKey && liveTurn && recovery?.kind !== "rebase") {
+    // A Run without a checkpoint seeds the host history, which already holds
+    // the earlier request; only a checkpoint can be missing it.
+    const rebuildFromHistory = !conversationState?.length
     userText = carryLostRequest({
       sessionKey,
       conversationId,
       checkpoint: conversationState,
       text: userText,
-      rebuildFromHistory: false,
+      rebuildFromHistory,
     })
-    rememberLostRequest({
-      sessionKey,
-      conversationId,
-      checkpoint: conversationState,
-      text: userText,
-    })
+    if (!rebuildFromHistory) {
+      rememberLostRequest({
+        sessionKey,
+        conversationId,
+        checkpoint: conversationState,
+        text: userText,
+      })
+    }
   } else if (sessionKey && recovery?.kind === "rebase") {
     dropLostRequest(sessionKey)
   }
@@ -4234,6 +4240,8 @@ export async function pump(
   }
   const closeEarlyRow = (row: EarlyToolRow) => {
     replaySafety.markBarrier("visible-tool-row")
+    // Text that streamed while the row was open ends before its tool-call.
+    closeOpenSpans()
     safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
     safeEnqueue({
       type: "tool-call",
@@ -5771,6 +5779,7 @@ function correlateToolResults(results: ToolResultContent[]): ExtractedToolResult
   return results.flatMap(result => {
     const parsed = parseExecIdFromToolCallId(result.toolCallId)
       ?? sessionManager.toolCallExec(result.toolCallId)
+      ?? parseEarlyRowToolCallId(result.toolCallId)
     return parsed ? [{ ...result, ...parsed }] : []
   })
 }

@@ -7,6 +7,8 @@ export type LostRequest = {
   text: string
 }
 
+const MAX_RECORDS = 1_024
+
 const records = () => processShared("lost-request.v1", () => new Map<string, LostRequest>())
 
 export function checkpointKey(bytes: Uint8Array | undefined): string {
@@ -50,11 +52,23 @@ export function rememberLostRequest(input: {
   text: string
 }): void {
   if (!input.sessionKey || !input.text || input.text === ".") return
-  records().set(input.sessionKey, {
+  setRecord(input.sessionKey, {
     conversationId: input.conversationId,
     checkpointKey: checkpointKey(input.checkpoint),
     text: input.text,
   })
+}
+
+/** A session that never sends another turn must not keep its record forever. */
+function setRecord(sessionKey: string, record: LostRequest): void {
+  const map = records()
+  map.delete(sessionKey)
+  map.set(sessionKey, record)
+  while (map.size > MAX_RECORDS) {
+    const oldest = map.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
 }
 
 /** A checkpoint other than the one this turn was sent on means Cursor kept the turn. */
@@ -90,7 +104,7 @@ export function restoreLostRequest(sessionKey: string, raw: string | undefined):
     || typeof parsed.text !== "string"
     || parsed.text.length === 0
   ) return
-  records().set(sessionKey, {
+  setRecord(sessionKey, {
     conversationId: parsed.conversationId,
     checkpointKey: parsed.checkpointKey,
     text: parsed.text,

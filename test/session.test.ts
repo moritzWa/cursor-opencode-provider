@@ -295,7 +295,9 @@ describe("SessionManager", () => {
   })
 
   it("renews every pending while a host tool runs, up to that tool's own ceiling", () => {
-    let now = 1_000
+    // Real-clock times: the tracker prunes records older than a day by Date.now().
+    const base = Date.now()
+    let now = base
     const tracker = new SessionActivityTracker()
     const mgr = new SessionManager({
       now: () => now,
@@ -308,22 +310,53 @@ describe("SessionManager", () => {
     s.policy = { heartbeatMs: 10, semanticIdleMs: 50, hardCapMs: 100 }
     mgr.registerPending(9, s, "read_result")
     mgr.registerPending(10, s, "shell_result")
-    tracker.toolStarted("parent", "read", 1_000)
+    tracker.toolStarted("parent", "read", base)
 
-    now = 1_500
+    now = base + 500
     mgr.sweepHardDeadlines()
     expect(s.closed).toBe(false)
-    expect(mgr.pendingFor(s.sessionId, 9)?.hardDeadlineAt).toBe(1_600)
-    expect(mgr.pendingFor(s.sessionId, 10)?.hardDeadlineAt).toBe(1_600)
+    expect(mgr.pendingFor(s.sessionId, 9)?.hardDeadlineAt).toBe(base + 600)
+    expect(mgr.pendingFor(s.sessionId, 10)?.hardDeadlineAt).toBe(base + 600)
 
-    tracker.toolStarted("parent", "later", 1_000 + 3 * 60 * 60 * 1_000)
-    now = 1_000 + 4 * 60 * 60 * 1_000 + 1
+    tracker.toolStarted("parent", "later", base + 3 * 60 * 60 * 1_000)
+    now = base + 4 * 60 * 60 * 1_000 + 1
     mgr.sweepHardDeadlines()
     expect(s.closed).toBe(false)
 
-    now = 1_000 + 3 * 60 * 60 * 1_000 + 4 * 60 * 60 * 1_000 + 1
+    now = base + 3 * 60 * 60 * 1_000 + 4 * 60 * 60 * 1_000 + 1
     mgr.sweepHardDeadlines()
     expect(s.closed).toBe(true)
+    mgr.dispose()
+  })
+
+  it("never shortens a lease when a running tool is near its own ceiling", () => {
+    let now = 1_000
+    let activityAt: number | undefined
+    let toolCapAt: number | undefined
+    const mgr = new SessionManager({
+      now: () => now,
+      activitySource: {
+        lastActivityAt: () => activityAt,
+        runningToolDeadline: () => toolCapAt,
+      },
+      setTimer: () => ({ unref() {} }) as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => {},
+    })
+    const s = fakeSession()
+    s.openCodeSessionId = "parent"
+    s.policy = { heartbeatMs: 10, semanticIdleMs: 50, hardCapMs: 100 }
+    mgr.registerPending(9, s, "read_result")
+
+    // Activity renewed the lease to 1_150; a tool whose ceiling is 1_060 must not cut it.
+    now = 1_050
+    activityAt = 1_050
+    toolCapAt = 1_060
+    mgr.sweepHardDeadlines()
+    expect(mgr.pendingFor(s.sessionId, 9)?.hardDeadlineAt).toBe(1_150)
+
+    now = 1_100
+    mgr.sweepHardDeadlines()
+    expect(s.closed).toBe(false)
     mgr.dispose()
   })
 

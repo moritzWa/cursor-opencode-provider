@@ -5,6 +5,31 @@ export const RUNNING_TOOL_CAP_MS = 4 * 60 * 60 * 1_000
 
 type RunningTool = { sessionId: string; startedAt: number }
 
+/**
+ * Everything the tracker knows, as plain data. The plugin that receives host
+ * events and the provider that holds the Run can be different module copies
+ * (OpenCode 2 loads one per location), so the process-wide tracker keeps this
+ * in `processShared`: parent links, activity and prompts must all be seen by
+ * the copy that renews the Run's lease.
+ */
+export type SessionActivityState = {
+  parentBySession: Map<string, string>
+  lastActivityBySession: Map<string, number>
+  /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
+  openPrompts: Map<string, { sessionId: string; openedAt: number }>
+  /** `${sessionId}\0${callId}` → when that host tool started running. */
+  runningTools: Map<string, RunningTool>
+}
+
+export function createSessionActivityState(): SessionActivityState {
+  return {
+    parentBySession: new Map(),
+    lastActivityBySession: new Map(),
+    openPrompts: new Map(),
+    runningTools: new Map(),
+  }
+}
+
 export type SessionActivitySource = {
   lastActivityAt(sessionId: string): number | undefined
   /**
@@ -26,15 +51,16 @@ const ACTIVITY_RETENTION_MS = 24 * 60 * 60 * 1_000
  * counts as current activity for its session and every ancestor.
  */
 export class SessionActivityTracker implements SessionActivitySource {
-  private readonly parentBySession = new Map<string, string>()
-  private readonly lastActivityBySession = new Map<string, number>()
-  /** Open host prompts: `${sessionId}\0${requestId}` → session id and when it opened. */
-  private readonly openPrompts = new Map<string, { sessionId: string; openedAt: number }>()
-  /** `${sessionId}\0${callId}` → when that host tool started running. */
+  private readonly parentBySession: Map<string, string>
+  private readonly lastActivityBySession: Map<string, number>
+  private readonly openPrompts: Map<string, { sessionId: string; openedAt: number }>
   private readonly runningTools: Map<string, RunningTool>
 
-  constructor(runningTools?: Map<string, RunningTool>) {
-    this.runningTools = runningTools ?? new Map()
+  constructor(state: SessionActivityState = createSessionActivityState()) {
+    this.parentBySession = state.parentBySession
+    this.lastActivityBySession = state.lastActivityBySession
+    this.openPrompts = state.openPrompts
+    this.runningTools = state.runningTools
   }
 
   linkSession(sessionId: string, parentId?: string): void {
@@ -190,6 +216,12 @@ export class SessionActivityTracker implements SessionActivitySource {
     for (const [key, tool] of this.runningTools) {
       if (tool.startedAt < oldestAllowed) this.runningTools.delete(key)
     }
+    // A tool whose end event never arrived must not grow the map without bound.
+    while (this.runningTools.size > MAX_TRACKED_SESSIONS) {
+      const oldest = this.runningTools.keys().next().value as string | undefined
+      if (!oldest) break
+      this.runningTools.delete(oldest)
+    }
   }
 
   private belongsTo(toolSessionId: string, sessionId: string): boolean {
@@ -209,7 +241,7 @@ export class SessionActivityTracker implements SessionActivitySource {
 }
 
 export const sessionActivity = new SessionActivityTracker(
-  processShared("running-tools.v1", () => new Map<string, RunningTool>()),
+  processShared("session-activity.v1", createSessionActivityState),
 )
 
 /**

@@ -79,8 +79,11 @@ const CONNECT_CODE_HTTP_STATUS: Readonly<Record<string, number>> = {
 
 /**
  * The error the host receives. A request Cursor declared not retryable becomes
- * an AI SDK `APICallError` with the Connect code's HTTP status: OpenCode 2
- * retries any failure that has no status or recognized code.
+ * an AI SDK `APICallError` with the Connect code's HTTP status (an unrecognized
+ * code is Connect `unknown`): OpenCode 2 retries any failure that has no status
+ * or recognized code. A host may classify by status alone, and 408/409/429/5xx
+ * read as retryable, so the verdict also travels as the conventional
+ * `x-should-retry: false` response header, which overrides the status.
  */
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
@@ -89,7 +92,10 @@ export function hostFacingError(error: unknown): Error {
     message: error.message,
     url: "cursor://agent.v1.AgentService/Run",
     requestBodyValues: {},
-    statusCode: error.code === undefined ? undefined : CONNECT_CODE_HTTP_STATUS[error.code],
+    statusCode: error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
+      ? CONNECT_CODE_HTTP_STATUS[error.code]
+      : CONNECT_CODE_HTTP_STATUS.unknown,
+    responseHeaders: { "x-should-retry": "false" },
     isRetryable: false,
     cause: error,
   })
