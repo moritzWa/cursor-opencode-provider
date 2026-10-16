@@ -194,6 +194,25 @@ describe("lost request through startSession", () => {
     }
   }, 30_000)
 
+  it("keeps a request the user repeats after a different one", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-run-"))
+    try {
+      restoreConversationBinding("ses_lost_repeat", "conv-lost-repeat")
+      setCheckpoint("conv-lost-repeat", Uint8Array.from([0x0a, 0x01, 0x78]))
+      const prompt: LanguageModelV3Prompt = [user("Use red")]
+      await failedTurn(root, "ses_lost_repeat", prompt)
+      prompt.push(partial, user("Use blue"))
+      await failedTurn(root, "ses_lost_repeat", [...prompt])
+      prompt.push(partial, user("Use red"))
+      await failedTurn(root, "ses_lost_repeat", prompt)
+
+      expect(sentTexts).toHaveLength(3)
+      expect(sentTexts[2]).toContain("Use red\n\nUse blue\n\nUse red")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("does not prepend a request that the seeded host history already carries", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-lost-run-"))
     try {

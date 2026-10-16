@@ -31,6 +31,15 @@ function remember(sessionKey: string, conversationId: string, checkpoint: Uint8A
   rememberLostRequest({ sessionKey, conversationId, checkpoint, text })
 }
 
+/** Failed attempts on one checkpoint, recorded as `startSession` does: what was sent, and the attempt's own text. */
+function attempts(checkpoint: Uint8Array): (text: string) => string {
+  return (text) => {
+    const sent = carryLostRequest({ sessionKey: "ses", conversationId: "conv", checkpoint, text, rebuildFromHistory: false })
+    rememberLostRequest({ sessionKey: "ses", conversationId: "conv", checkpoint, text: sent, latest: text })
+    return sent
+  }
+}
+
 describe("lost requests", () => {
   it("prepends text Cursor never checkpointed, and drops it on a newer checkpoint, stop, or history rebuild", () => {
     const checkpoint = Uint8Array.from([1, 2, 3])
@@ -111,19 +120,23 @@ describe("lost requests", () => {
   it("does not pile up a note the host repeats on every failed retry", () => {
     const checkpoint = Uint8Array.from([5])
     const note = "The previous response was interrupted. Continue from where you left off."
-    const carry = (text: string) => {
-      const sent = carryLostRequest({ sessionKey: "ses", conversationId: "conv", checkpoint, text, rebuildFromHistory: false })
-      remember("ses", "conv", checkpoint, sent)
-      return sent
-    }
+    const carry = attempts(checkpoint)
     expect(carry("the request")).toBe("the request")
     for (let attempt = 0; attempt < 10; attempt++) expect(carry(note)).toBe(`the request\n\n${note}`)
-    // A genuinely new message is still added once, and repeating any earlier part adds nothing.
     expect(carry("next message")).toBe(`the request\n\n${note}\n\nnext message`)
-    expect(carry(note)).toBe(`the request\n\n${note}\n\nnext message`)
+    // Only a repeat of the previous attempt is a retry.
     expect(carry("next message")).toBe(`the request\n\n${note}\n\nnext message`)
-    // A part only matches whole: a longer message that merely starts the same way is new.
-    expect(carry("next message, please")).toBe(`the request\n\n${note}\n\nnext message\n\nnext message, please`)
+  })
+
+  it("keeps a repeated request that follows a different one", () => {
+    const carry = attempts(Uint8Array.from([8]))
+    expect(carry("Use red")).toBe("Use red")
+    expect(carry("Use blue")).toBe("Use red\n\nUse blue")
+    // The user changed their mind back; Cursor must see red last.
+    expect(carry("Use red")).toBe("Use red\n\nUse blue\n\nUse red")
+    // A new message equal to the last paragraph of a longer one is new too.
+    expect(carry("Plan it.\n\nShip it.")).toBe("Use red\n\nUse blue\n\nUse red\n\nPlan it.\n\nShip it.")
+    expect(carry("Ship it.")).toBe("Use red\n\nUse blue\n\nUse red\n\nPlan it.\n\nShip it.\n\nShip it.")
   })
 
   it("keeps at most 1,024 sessions, dropping the least recently written", () => {

@@ -4,12 +4,15 @@ import { processShared } from "./process-shared.js"
 export type LostRequest = {
   conversationId: string
   checkpointKey: string
+  /** Everything Cursor has not checkpointed, as the last attempt sent it. */
   text: string
+  /** That attempt's own live text, before anything was prepended. */
+  latest: string
 }
 
 const MAX_RECORDS = 1_024
 
-const records = () => processShared("lost-request.v1", () => new Map<string, LostRequest>())
+const records = () => processShared("lost-request.v2", () => new Map<string, LostRequest>())
 
 export function checkpointKey(bytes: Uint8Array | undefined): string {
   if (!bytes?.length) return "none"
@@ -19,9 +22,10 @@ export function checkpointKey(bytes: Uint8Array | undefined): string {
 /**
  * Prepend a user message whose Run never received a newer checkpoint.
  * A history rebuild already contains it, so that path drops the record.
- * An exact retry of the same text is left as-is. Live text the record already
- * carries as one of its parts (a host retry that sends the same note on every
- * attempt) sends the record unchanged, so failed retries do not pile up.
+ * A retry is the previous attempt's live text again: it sends what that
+ * attempt sent. A host that sends the same note before every attempt must not
+ * pile it up. Any other text is a new request and is appended, even when it
+ * repeats an older one (red, blue, then red again).
  */
 export function carryLostRequest(input: {
   sessionKey: string
@@ -42,30 +46,28 @@ export function carryLostRequest(input: {
     map.delete(input.sessionKey)
     return input.text
   }
+  if (input.text === record.latest) return record.text
+  // The host already resends the lost text ahead of this one (OpenCode 1.x
+  // merges user messages left without a reply into one live turn).
   if (input.text === record.text || input.text.startsWith(`${record.text}\n\n`)) return input.text
-  if (carriesPart(record.text, input.text)) return record.text
   map.delete(input.sessionKey)
   return `${record.text}\n\n${input.text}`
 }
 
-/** `part` is one whole `\n\n`-separated piece of `text`, as `carryLostRequest` joins them. */
-function carriesPart(text: string, part: string): boolean {
-  return text.startsWith(`${part}\n\n`)
-    || text.endsWith(`\n\n${part}`)
-    || text.includes(`\n\n${part}\n\n`)
-}
-
+/** `text` is what this turn sends; `latest` is its own live text (defaults to `text`). */
 export function rememberLostRequest(input: {
   sessionKey: string
   conversationId: string
   checkpoint: Uint8Array | undefined
   text: string
+  latest?: string
 }): void {
   if (!input.sessionKey || !input.text || input.text === ".") return
   setRecord(input.sessionKey, {
     conversationId: input.conversationId,
     checkpointKey: checkpointKey(input.checkpoint),
     text: input.text,
+    latest: input.latest ?? input.text,
   })
 }
 
@@ -117,11 +119,13 @@ export function restoreLostRequest(sessionKey: string, raw: string | undefined):
     || typeof parsed.checkpointKey !== "string"
     || typeof parsed.text !== "string"
     || parsed.text.length === 0
+    || (parsed.latest !== undefined && typeof parsed.latest !== "string")
   ) return
   setRecord(sessionKey, {
     conversationId: parsed.conversationId,
     checkpointKey: parsed.checkpointKey,
     text: parsed.text,
+    latest: parsed.latest ?? parsed.text,
   })
 }
 

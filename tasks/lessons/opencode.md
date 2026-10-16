@@ -116,8 +116,10 @@ These are failure lessons shared by both hosts, not a replacement for
   seeds host history, which already holds it; prepending as well sent it twice.
   A failed Run reached no save, so a restart lost the record. Storing the
   combined text re-prepended it on every failed host retry, stacking OpenCode
-  2's identical interruption note ten times; a part already carried is not
-  added again (`carryLostRequest`, `test/lost-request-run.test.ts`).
+  2's identical interruption note ten times. Deduplicating any carried part
+  then swallowed a deliberate repeat (red, blue, red); only a repeat of the
+  previous attempt's own text is a retry (`carryLostRequest`,
+  `test/lost-request-run.test.ts`).
 - **Predict the tool the remap will produce.** An announced edit on a new file
   becomes `write`; predicting `edit` showed a failed row beside every created
   file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).

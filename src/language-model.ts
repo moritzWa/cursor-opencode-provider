@@ -1580,6 +1580,7 @@ async function startSession(
     // A Run without a checkpoint seeds the host history, which already holds
     // the earlier request; only a checkpoint can be missing it.
     const rebuildFromHistory = !conversationState?.length
+    const liveText = userText
     userText = carryLostRequest({
       sessionKey,
       conversationId,
@@ -1593,6 +1594,7 @@ async function startSession(
         conversationId,
         checkpoint: conversationState,
         text: userText,
+        latest: liveText,
       })
     }
   } else if (sessionKey && recovery?.kind === "rebase") {
