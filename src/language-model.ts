@@ -1276,7 +1276,8 @@ export async function pumpWithRecovery(input: {
       // a newer pump owner still retain their session, and a host interrupt
       // closes its Run itself after draining Cursor's checkpoint.
       if (sessionManager.endPump(pumpedSession, pumpOwner) && !pumpedSession.hostInterrupted) {
-        sessionManager.closeUnlessPending(pumpedSession)
+        // Held for the host's tools: keep answering what Cursor sends meanwhile.
+        if (!sessionManager.closeUnlessPending(pumpedSession)) readHeldRun(pumpedSession)
       }
     }
   }
@@ -2323,6 +2324,113 @@ function applyExecControl(session: CursorSession, control: Record<string, unknow
     `exec control: Cursor aborted execId=${id} (${where}) sessionId=${session.sessionId} ` +
       `${marked ? "— no result will be written for it" : "— not an exec the host still owes"}`,
   )
+}
+
+const ASM_EXEC_SERVER_CONTROL_FIELD = 5
+
+type HeldControlFrame =
+  | { kind: "heartbeat" }
+  | { kind: "kv"; kv: Record<string, unknown> }
+  | { kind: "exec-control"; control: Record<string, unknown> }
+
+/** A frame the held reader may take: a server heartbeat, a KV request or exec control, and nothing else. */
+function heldControlFrame(frame: Frame): HeldControlFrame | undefined {
+  if (frame.flags & 0x02) return undefined
+  let payload: Uint8Array
+  try {
+    payload = decodeFramePayload(frame)
+  } catch {
+    return undefined
+  }
+  const fields = readAllFieldsStrict(payload)
+  if (!fields || fields.length !== 1 || fields[0]!.wt !== 2) return undefined
+  const field = fields[0]!
+  if (field.fn === ASM_INTERACTION_UPDATE_FIELD) {
+    const update = field.bytes ? readAllFieldsStrict(field.bytes) : undefined
+    const heartbeat = update?.length === 1
+      && update[0]!.fn === INTERACTION_UPDATE_HEARTBEAT_FIELD
+      && update[0]!.wt === 2
+    return heartbeat ? { kind: "heartbeat" } : undefined
+  }
+  if (field.fn !== ASM_KV_SERVER_MESSAGE_FIELD && field.fn !== ASM_EXEC_SERVER_CONTROL_FIELD) return undefined
+  let asm: Record<string, unknown>
+  try {
+    asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
+  } catch {
+    return undefined
+  }
+  const kv = asm.kv_server_message as Record<string, unknown> | undefined
+  if (kv) return { kind: "kv", kv }
+  const control = asm.exec_server_control_message as Record<string, unknown> | undefined
+  return control ? { kind: "exec-control", control } : undefined
+}
+
+const heldRunReaders = new WeakSet<CursorSession>()
+
+function isHeldRunIdle(session: CursorSession, frames: CursorSession["frames"]): boolean {
+  return !session.closed
+    && !session.hostInterrupted
+    && !sessionManager.isActivelyPumping(session)
+    && session.pending.size > 0
+    && !session.pushbackFrame
+    && session.frames === frames
+}
+
+/**
+ * While the host runs a step's tools nothing pumps the Run, but Cursor can
+ * still write a KV blob or abort an exec. Cursor CLI's single reader handles
+ * those at once, and an unanswered KV write can hold Cursor's side of the
+ * stream until the tool finishes. Take only those (and server heartbeats) from
+ * the shared read. The first other frame stays in `pendingFrameRead`, so the
+ * next pump reads it first; a pump that starts meanwhile awaits the same read
+ * and this reader leaves it alone.
+ */
+export function readHeldRun(session: CursorSession): void {
+  const frames = session.frames
+  if (heldRunReaders.has(session) || !isHeldRunIdle(session, frames)) return
+  heldRunReaders.add(session)
+  void readHeldFrames(session, frames).finally(() => heldRunReaders.delete(session))
+}
+
+async function readHeldFrames(session: CursorSession, frames: CursorSession["frames"]): Promise<void> {
+  while (isHeldRunIdle(session, frames)) {
+    const read = session.pendingFrameRead ??= frames.next()
+    void read.catch(() => {})
+    let result: IteratorResult<Frame>
+    try {
+      result = await read
+    } catch {
+      return // the next pump reads the same rejection
+    }
+    if (!isHeldRunIdle(session, frames) || session.pendingFrameRead !== read || result.done) return
+    const held = heldControlFrame(result.value)
+    const kvReply = held?.kind === "kv" ? handleKvServerMessage(held.kv, session) : undefined
+    // A KV request this client cannot answer fails the Run in the pump, which reads it next.
+    if (!held || (held.kind === "kv" && !kvReply)) {
+      trace(`held Run: leaving a frame for the next pump sessionId=${session.sessionId}`)
+      return
+    }
+    session.pendingFrameRead = undefined
+    sessionManager.recordSemanticProgress(session)
+    if (held.kind === "exec-control") {
+      applyExecControl(session, held.control, "held")
+      if (![...session.pending.values()].some((pending) => isOwedCursorExec(pending) && !pending.aborted)) {
+        trace(`held Run: Cursor aborted every exec it was waiting on sessionId=${session.sessionId}`)
+      }
+    } else if (kvReply) {
+      try {
+        await writeWithBackpressure(session.stream, kvReply.reply, `held KV ${kvReply.kind}_blob reply id=${kvReply.id}`)
+        trace(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
+      } catch (error) {
+        trace(`held Run: KV reply failed sessionId=${session.sessionId}: ${(error as Error).message}`)
+        sessionManager.close(session, "reply-write-failed", toCursorProviderError(error, {
+          replaySafe: false,
+          fallback: "Cursor KV reply failed",
+        }))
+        return
+      }
+    }
+  }
 }
 
 /** Save a Run's conversation before Cursor ends its turn, with the latest checkpoint Cursor sent. */

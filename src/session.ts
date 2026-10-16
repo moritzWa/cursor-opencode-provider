@@ -593,8 +593,9 @@ export class SessionManager {
       for (const candidate of this.sessions) {
         if (candidate === justRegistered || this.isPumping(candidate)) continue
         // Held-open Runs with pending tools must not be cap-evicted — that is
-        // mid-exec supersede by another name and throws away the prefix.
-        if (candidate.pending.size > 0) continue
+        // mid-exec supersede by another name and throws away the prefix. An
+        // exec Cursor aborted no longer waits on the host, so it does not hold.
+        if ([...candidate.pending.values()].some((pending) => !pending.aborted)) continue
         if (!oldest || candidate.createdAt < oldest.createdAt) oldest = candidate
       }
       if (!oldest) {
