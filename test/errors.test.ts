@@ -116,6 +116,39 @@ describe("Cursor provider errors", () => {
     }
   })
 
+  it("keeps OpenCode 1.x from retrying a non-retryable verdict through its message text", () => {
+    // OpenCode 1.19 SessionRetry retries any APIError whose message matches these,
+    // even with isRetryable false (upstream packages/opencode/src/session/retry.ts).
+    const opencode1Retries = (message: string) => [
+      /429|500|502|503|504|524/i,
+      /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+      /overloaded|service unavailable|internal error|server error|provider returned error/i,
+      /terminated|fetch failed|network[-_\s]error|connection error|socket hang up|econnreset|etimedout/i,
+      /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+    ].some((pattern) => pattern.test(message))
+    // ErrorDetails{details{title, detail, is_retryable:false}}, shaped like a live usage-limit refusal.
+    const title = Buffer.from("You've hit your usage limit")
+    const detail = Buffer.from("Saved $1500 on the 500k tier. Rate limit: try again later.")
+    const inner = Buffer.from([0x0a, title.length, ...title, 0x12, detail.length, ...detail, 0x20, 0x00])
+    const value = Buffer.from([0x12, inner.length, ...inner]).toString("base64")
+    const failure = connectFrameError(JSON.stringify({
+      error: { code: "resource_exhausted", details: [{ type: "aiserver.v1.ErrorDetails", value }] },
+    }))
+    expect(failure).toMatchObject({ code: "resource_exhausted", retryable: false })
+    expect(opencode1Retries(failure.message)).toBe(true)
+
+    const host = hostFacingError(failure) as APICallError
+    expect(host).toMatchObject({ statusCode: 429, isRetryable: false })
+    expect(opencode1Retries(host.message)).toBe(false)
+    expect(host.message.toLowerCase()).not.toMatch(/exhausted|unavailable/)
+    expect(host.message.replaceAll("\u2060", "")).toBe(
+      "Cursor API error (code=capacity_limit): You've hit your usage limit " +
+        "Saved $1500 on the 500k tier. Rate limit: try again later.",
+    )
+    expect(sanitizeHostTerminalMessage("Request blocked by Anthropic")).toBe("Request blocked by Anthropic")
+  })
+
   it("obeys an explicit retryable verdict and keeps other errors unchanged for the host", () => {
     // ErrorDetails{details{title:"Busy", is_retryable:true}}
     const value = Buffer.from([0x12, 0x08, 0x0a, 0x04, ...Buffer.from("Busy"), 0x20, 0x01]).toString("base64")

@@ -89,9 +89,10 @@ export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
   if (!(error instanceof CursorServerError) || error.retryable !== false) return error
   return new APICallError({
-    message: error.message,
     url: "cursor://agent.v1.AgentService/Run",
     requestBodyValues: {},
+    // OpenCode 1.x retries on message text even when isRetryable is false.
+    message: sanitizeHostTerminalMessage(error.message),
     statusCode: error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
       ? CONNECT_CODE_HTTP_STATUS[error.code]
       : CONNECT_CODE_HTTP_STATUS.unknown,
@@ -180,22 +181,54 @@ export function isRejectedCredentialError(error: unknown): error is CursorAuthEr
 }
 
 /**
- * OpenCode's SessionRetry treats several substrings in provider error messages
- * as always-retryable — notably bare "unavailable" and "exhausted", plus a
- * broader regex set (resource_exhausted, service unavailable, …).
- *
- * When this provider has already spent its Run retry budget, or has decided a
- * replay would be unsafe, the host-facing message must not re-arm that loop.
- * Keep the real gRPC/HTTP code on structured fields (`code`, `grpcStatus`).
+ * OpenCode 1.x SessionRetry retries an error whose message matches these
+ * patterns even when it is marked non-retryable (`RETRYABLE_MESSAGE_PATTERNS`
+ * and the `exhausted` / `unavailable` / `too_many_requests` substrings in
+ * upstream `packages/opencode/src/session/retry.ts`, v1.19). The status
+ * patterns match anywhere, so "$1500" or "500k" also re-arm it.
+ */
+const HOST_RETRY_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /429|500|502|503|504|524/gi,
+  /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests|too_many_requests/gi,
+  /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/gi,
+  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/gi,
+  /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/gi,
+  /try your request again|retry your request|resource exhausted|resource_exhausted/gi,
+  /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/gi,
+  /exhausted|unavailable/gi,
+]
+
+/** Invisible U+2060 WORD JOINER: the text reads the same but no longer matches. */
+const WORD_JOINER = "\u2060"
+
+/**
+ * When this provider has already spent its Run retry budget, decided a replay
+ * would be unsafe, or Cursor declared the request not retryable, the
+ * host-facing message must not re-arm OpenCode's SessionRetry loop. Common
+ * trigger words get readable replacements; any remaining match (status-like
+ * digits, Cursor's own wording) is split with a word joiner. Keep the real
+ * gRPC/HTTP code on structured fields (`code`, `grpcStatus`).
  */
 export function sanitizeHostTerminalMessage(message: string): string {
-  return message
+  let text = message
     .replace(/\bresource[_\s-]?exhausted\b/gi, "capacity_limit")
     .replace(/\bservice[_\s-]?unavailable\b/gi, "capacity_limit")
     .replace(/\bunavailable\b/gi, "capacity_limit")
     .replace(/\boverloaded\b/gi, "capacity_limit")
     .replace(/\bretry exhausted\b/gi, "retries finished")
     .replace(/\bexhausted\b/gi, "finished")
+  // A joiner can add a `\b` boundary, so repeat until nothing matches.
+  for (let pass = 0; pass < 4; pass++) {
+    let changed = false
+    for (const pattern of HOST_RETRY_MESSAGE_PATTERNS) {
+      text = text.replace(pattern, (match) => {
+        changed = true
+        return `${match[0]}${WORD_JOINER}${match.slice(1)}`
+      })
+    }
+    if (!changed) break
+  }
+  return text
 }
 
 export class CursorRetryExhaustedError extends CursorProviderError {

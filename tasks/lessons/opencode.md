@@ -317,7 +317,23 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Model metadata has separate owners.** Keep wire parameters isolated; make
   metadata-changing variants separate catalog entries. Invalidate cache schema
   before config consumes it; live negative capabilities outrank docs
-  (`test/model-metadata.test.ts`).
+  (`test/model-metadata.test.ts`). PRs #84/#86/#95 showed that tier selection
+  must precede speed preference, defaults must survive catalog partitioning,
+  and unmatched hints must not rewrite an advertised tuple. Exercise marked
+  non-1M tiers and duplicate ids (`test/model-selection-review.test.ts`,
+  `test/model-effort-review.test.ts`, `test/model-selection-run.test.ts`).
+  Collapsing an absent max marker to false also disabled the 1M fallback;
+  preserve absence through discovery and cache, test explicit false separately,
+  and invalidate caches that already erased the distinction (`test/models.test.ts`).
+  A max marker is not a context size: Opus 300k Fast is marked, so budgets come
+  from the resolved `context` parameter (`test/turn-provenance.test.ts`). Effort
+  ties break toward the tier default, as Cursor CLI does, or a hint silently
+  dropped Claude thinking (`test/model-effort-review.test.ts`).
+  Context-tier splits must retain persisted base/Fast variant ids and collision
+  labels, including a Fast entry whose variants all move to another tier. Keep
+  legacy selections usable with their old static budget; dedicated entries
+  provide the larger budget (`test/model-selection-review.test.ts`,
+  `test/model-selection-run.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).
@@ -332,7 +348,9 @@ These are failure lessons shared by both hosts, not a replacement for
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. Keep AGENTS.md to
+  compare with the release, not an intermediate PR state. Concurrent Unreleased
+  insertions can conflict despite independent code; compare the union of entries
+  after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in
   the owning host lesson instead of growing implementation transcripts.
   Acceptance checklists stay reusable; dated counts and logs stay in run reports.

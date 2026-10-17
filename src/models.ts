@@ -1,6 +1,5 @@
 import { MODEL_CACHE_FILE, MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "./shared.js"
 import { unaryAvailableModels } from "./transport/connect.js"
-import { buildRequestedModelParams } from "./protocol/thinking.js"
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -19,6 +18,11 @@ export type ModelVariant = {
   displayName: string
   isDefaultNonMax: boolean
   isDefaultMax: boolean
+  /**
+   * Cursor's `AvailableModelVariant.is_max_mode`: this tuple runs only with
+   * request-level max mode. Absent when discovery omits the marker.
+   */
+  isMaxMode?: boolean
 }
 
 export type ModelInfo = {
@@ -32,6 +36,11 @@ export type ModelInfo = {
   /** Context window when max-mode is on (proto field 16). */
   maxContextForMaxMode?: number
   supportsMaxMode?: boolean
+  /**
+   * `AvailableModel.supports_non_max_mode`; `false` means every variant runs
+   * in max mode. Absent when discovery omits it.
+   */
+  supportsNonMaxMode?: boolean
   variants: ModelVariant[]
 }
 
@@ -128,11 +137,13 @@ function normalizeVariant(value: unknown, fallbackName: string): ModelVariant | 
     value,
     ["isDefaultMax", "isDefaultMaxConfig", "is_default_max_config"],
   )
+  const isMaxMode = optionalBoolean(value, ["isMaxMode", "is_max_mode"])
   if (
     key === null ||
     displayName === null ||
     isDefaultNonMax === null ||
-    isDefaultMax === null
+    isDefaultMax === null ||
+    isMaxMode === null
   ) {
     return null
   }
@@ -148,6 +159,7 @@ function normalizeVariant(value: unknown, fallbackName: string): ModelVariant | 
     parameterValues: parameters,
     isDefaultNonMax: isDefaultNonMax ?? false,
     isDefaultMax: isDefaultMax ?? false,
+    ...(isMaxMode === undefined ? {} : { isMaxMode }),
   }
 }
 
@@ -164,6 +176,7 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
   const supportsAgent = optionalBoolean(value, ["supportsAgent", "supports_agent"])
   const supportsImages = optionalBoolean(value, ["supportsImages", "supports_images"])
   const supportsMaxMode = optionalBoolean(value, ["supportsMaxMode", "supports_max_mode"])
+  const supportsNonMaxMode = optionalBoolean(value, ["supportsNonMaxMode", "supports_non_max_mode"])
   const maxContext = optionalPositiveNumber(
     value,
     ["maxContext", "contextTokenLimit", "context_token_limit"],
@@ -179,6 +192,7 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
     supportsAgent === null ||
     supportsImages === null ||
     supportsMaxMode === null ||
+    supportsNonMaxMode === null ||
     maxContext === null ||
     maxContextForMaxMode === null
   ) {
@@ -194,6 +208,7 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
     ...(maxContext === undefined ? {} : { maxContext }),
     ...(maxContextForMaxMode === undefined ? {} : { maxContextForMaxMode }),
     ...(supportsMaxMode === undefined ? {} : { supportsMaxMode }),
+    ...(supportsNonMaxMode === undefined ? {} : { supportsNonMaxMode }),
     variants: variants as ModelVariant[],
   }
 }
@@ -249,7 +264,10 @@ export function resolveCursorWireModelId(
   return typeof value === "string" && value.trim() ? value : fallback
 }
 
-/** True when resolved params select the long-context (1m) tier. */
+/**
+ * True when resolved params select the long-context (1m) tier. Fallback for
+ * variants without Cursor's `isMaxMode` marker.
+ */
 export function paramsImplyMaxMode(params: ModelParameterValue[]): boolean {
   return params.some(
     (parameter) =>
@@ -258,15 +276,35 @@ export function paramsImplyMaxMode(params: ModelParameterValue[]): boolean {
   )
 }
 
+function sameParameterTuple(a: ModelParameterValue[], b: ModelParameterValue[]): boolean {
+  const byId = new Map(b.map((parameter) => [parameter.id, parameter.value]))
+  return (
+    a.length === b.length &&
+    new Set(a.map((parameter) => parameter.id)).size === a.length &&
+    byId.size === b.length &&
+    a.every((parameter) => byId.get(parameter.id) === parameter.value)
+  )
+}
+
+/** Cursor's per-variant max-mode marker, else the 1m-context fallback. */
+function variantIsMaxMode(v: ModelVariant): boolean {
+  return v.isMaxMode ?? paramsImplyMaxMode(v.parameterValues)
+}
+
 /**
- * Resolve the request-level max_mode bit. An explicit variant pick owns the
- * context tier; otherwise a standalone maxMode hint may select max mode.
+ * Resolve the request-level max_mode bit. Like Cursor CLI, a cataloged variant
+ * requires max mode when Cursor marks it `isMaxMode` (Grok 4.7's 500k tier as
+ * well as 1m tiers) or the model does not support non-max mode. An explicit
+ * variant pick owns the context tier; otherwise a standalone maxMode hint may
+ * select max mode.
  */
 export function resolveVariantMaxMode(
   params: ModelParameterValue[],
-  opts: { picked?: ModelParameterValue[]; maxMode?: boolean } = {},
+  opts: { picked?: ModelParameterValue[]; maxMode?: boolean; model?: ModelInfo } = {},
 ): boolean {
-  return paramsImplyMaxMode(params) || (opts.picked === undefined && opts.maxMode === true)
+  if (opts.model?.supportsNonMaxMode === false) return true
+  const marked = opts.model?.variants.find((v) => sameParameterTuple(v.parameterValues, params))?.isMaxMode
+  return (marked ?? paramsImplyMaxMode(params)) || (opts.picked === undefined && opts.maxMode === true)
 }
 
 // Cursor encodes a model's context window as a variant parameter `id: "context"`
@@ -294,32 +332,22 @@ function variantContextTokens(v: ModelVariant | undefined): number | undefined {
   return parseCursorContextLimit(raw)
 }
 
-function isLongContextVariant(v: ModelVariant): boolean {
-  return variantContextTokens(v) === 1_000_000
-}
-
-function sameParameterTuple(a: ModelParameterValue[], b: ModelParameterValue[]): boolean {
-  const byId = new Map(b.map((parameter) => [parameter.id, parameter.value]))
-  return (
-    a.length === b.length &&
-    new Set(a.map((parameter) => parameter.id)).size === a.length &&
-    byId.size === b.length &&
-    a.every((parameter) => byId.get(parameter.id) === parameter.value)
-  )
-}
-
-/** Same parameters as `target` except `fast`. */
-function isNonFastTwinOf(v: ModelVariant, target: ModelVariant): boolean {
+/** Same parameters as `target` except the ignored ids. */
+function isTwinOf(v: ModelVariant, target: ModelVariant, ignored: readonly string[]): boolean {
   return (
     v.parameterValues.length === target.parameterValues.length &&
     sameParameterTuple(
-      v.parameterValues.filter((p) => p.id !== "fast"),
-      target.parameterValues.filter((p) => p.id !== "fast"),
+      v.parameterValues.filter((p) => !ignored.includes(p.id)),
+      target.parameterValues.filter((p) => !ignored.includes(p.id)),
     )
   )
 }
 
-/** Find Cursor's declared default within a catalog subset, retaining its effort. */
+/**
+ * Find Cursor's declared default within a catalog subset, retaining its effort:
+ * the declared variant, else its speed twin, else its twin in another context
+ * tier (a 500k entry when the declared max default is 1m).
+ */
 export function findDefaultVariant(
   model: ModelInfo,
   candidates: ModelVariant[],
@@ -328,7 +356,15 @@ export function findDefaultVariant(
   const isDeclared = (v: ModelVariant) => maxMode ? v.isDefaultMax : v.isDefaultNonMax
   const declared = model.variants.find(isDeclared)
   return candidates.find(isDeclared) ??
-    (declared === undefined ? undefined : candidates.find((v) => isNonFastTwinOf(v, declared)))
+    (declared === undefined
+      ? undefined
+      : candidates.find((v) => isTwinOf(v, declared, ["fast"])) ??
+        candidates.find((v) => isTwinOf(v, declared, ["fast", "context"])))
+}
+
+/** Send an advertised tuple verbatim; never rewrite one of its values. */
+function copyParameters(parameters: ModelParameterValue[]): ModelParameterValue[] {
+  return parameters.map((parameter) => ({ ...parameter }))
 }
 
 function positiveNumber(value: unknown): number | undefined {
@@ -410,32 +446,43 @@ export function mapAvailableModelsResponse(
       if (!parameterValues) {
         throw new Error(`AvailableModels returned invalid parameter values for ${name}`)
       }
+      const isMaxMode = optionalBoolean(v, ["isMaxMode", "is_max_mode"])
+      if (isMaxMode === null) {
+        throw new Error(`AvailableModels returned a non-boolean isMaxMode for ${name}`)
+      }
       variants.push({
         key: name,
         parameterValues,
         displayName: (v.displayName ?? v.display_name ?? name) as string,
         isDefaultNonMax: apiBoolean(v, ["isDefaultNonMaxConfig", "is_default_non_max_config"]),
         isDefaultMax: apiBoolean(v, ["isDefaultMaxConfig", "is_default_max_config"]),
+        ...(isMaxMode === undefined ? {} : { isMaxMode }),
       })
     }
 
     // Derive the context window from the variant `context` param (primary
     // source). Base tier ← default non-max variant; max tier ← default max
     // variant. Fall back to the (often empty) proto fields, then undefined.
-    // Prefer a non-1m context when isDefaultNonMax is missing so a leading
+    // Prefer a non-max context when isDefaultNonMax is missing so a leading
     // max-mode variant cannot inflate the base window.
     const variantBaseContext =
       variantContextTokens(variants.find((v) => v.isDefaultNonMax)) ??
       variantContextTokens(
         variants.find((v) =>
+          !variantIsMaxMode(v) && variantContextTokens(v) !== undefined &&
           variantContextTokens(v) !== 1_000_000,
         ),
       ) ??
       variantContextTokens(variants.find((v) => v.parameterValues.some((p) => p.id === "context")))
-    const variantMaxContext = variantContextTokens(variants.find((v) => v.isDefaultMax))
+    const variantMaxContext = variantContextTokens(variants.find((v) => v.isDefaultMax)) ??
+      variantContextTokens(variants.find((v) => variantIsMaxMode(v) && variantContextTokens(v) !== undefined))
     const supportsImages = optionalBoolean(e, ["supportsImages", "supports_images"])
     if (supportsImages === null) {
       throw new Error(`AvailableModels returned invalid supportsImages for ${name}`)
+    }
+    const supportsNonMaxMode = optionalBoolean(e, ["supportsNonMaxMode", "supports_non_max_mode"])
+    if (supportsNonMaxMode === null) {
+      throw new Error(`AvailableModels returned invalid supportsNonMaxMode for ${name}`)
     }
 
     models.push({
@@ -449,6 +496,7 @@ export function mapAvailableModelsResponse(
         variantMaxContext ??
         positiveNumber(e.contextTokenLimitForMaxMode ?? e.context_token_limit_for_max_mode),
       supportsMaxMode: apiBoolean(e, ["supportsMaxMode", "supports_max_mode"]),
+      ...(supportsNonMaxMode === undefined ? {} : { supportsNonMaxMode }),
       variants,
     })
   }
@@ -494,59 +542,52 @@ export function resolveVariantParameters(
     v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning" || p.id === "reasoning_effort")?.value
   const isFast = (v: ModelVariant): boolean =>
     v.parameterValues.find((p) => p.id === "fast")?.value === "true"
-  const isMaxVariant = (v: ModelVariant): boolean =>
-    v.isDefaultMax || isLongContextVariant(v)
-
-  const wantMax = opts.maxMode ?? false
-  // Non-fast pool for hint-based resolution only. Exact `picked` matching
-  // searches all variants so Fast selections are not silently dropped.
-  const pool = model.variants.filter((v) => !isFast(v))
-  const scoped = pool.length > 0 ? pool : model.variants
+  const wantMax = (opts.maxMode ?? false) || model.supportsNonMaxMode === false
 
   // 1. Variant explicitly picked by opencode (verbatim — preserves context, fast, …).
   if (picked !== undefined) {
-    const pickedById = new Map(picked.map((parameter) => [parameter.id, parameter.value]))
-    const exact = model.variants.find(
-      (v) =>
-        v.parameterValues.length === picked.length &&
-        new Set(v.parameterValues.map((parameter) => parameter.id)).size === v.parameterValues.length &&
-        pickedById.size === picked.length &&
-        v.parameterValues.every((parameter) => pickedById.get(parameter.id) === parameter.value),
-    )
+    const exact = model.variants.find((v) => sameParameterTuple(v.parameterValues, picked))
     if (exact) {
-      return buildRequestedModelParams(exact.parameterValues)
+      return copyParameters(exact.parameterValues)
     }
     throw new CursorVariantSelectionError(
       `is stale for model ${JSON.stringify(model.id)}: its exact parameter tuple is unavailable`,
     )
   }
 
-  // When maxMode is requested, prefer max-tier variants for effort matching
-  // so "high + max" lands on 1m high rather than the first 300k high.
-  const maxScoped = wantMax ? scoped.filter(isMaxVariant) : []
-  const effortPool = maxScoped.length > 0 ? maxScoped : scoped
+  // Choose the tier before preferring non-Fast variants. Otherwise a Fast-only
+  // max tier disappears, or a leading max variant steals an effort-only hint.
+  // isDefaultMax is a preference, not a requirement to run in max mode.
+  const tier = model.variants.filter((v) => variantIsMaxMode(v) === wantMax)
+  const candidates = tier.length > 0 ? tier : model.variants
+  const nonFast = candidates.filter((v) => !isFast(v))
+  const scoped = nonFast.length > 0 ? nonFast : candidates
 
-  // 2. Effort hint (e.g. user passed reasoningEffort through the CLI).
+  // Cursor can declare a Fast variant as a default (Grok, GPT max defaults);
+  // the tier default retains the declared default's effort when its speed
+  // twin is needed (same parameters except `fast`).
+  const byDefault = (wantMax
+    ? findDefaultVariant(model, scoped, true) ?? scoped.find(variantIsMaxMode)
+    : undefined) ?? findDefaultVariant(model, scoped, false) ?? scoped[0]
+
+  // 2. Effort hint (e.g. user passed reasoningEffort through the CLI). Like
+  // Cursor CLI, break ties toward the tier default so the hint changes only
+  // effort, not thinking or other parameters (Claude lists thinking=false first).
   if (opts.reasoningEffort) {
-    const match = effortPool.find((v) => effortOf(v) === opts.reasoningEffort)
+    const shared = (v: ModelVariant) => v.parameterValues.filter((parameter) =>
+      byDefault.parameterValues.some((d) => d.id === parameter.id && d.value === parameter.value)).length
+    const match = scoped
+      .filter((v) => effortOf(v) === opts.reasoningEffort)
+      .reduce<ModelVariant | undefined>((best, v) => best && shared(best) >= shared(v) ? best : v, undefined)
     if (match) {
-      return buildRequestedModelParams(match.parameterValues, {
-        reasoningEffort: opts.reasoningEffort,
-        maxMode: wantMax,
-      })
+      return copyParameters(match.parameterValues)
     }
   }
 
-  // 3. Max-mode hint → prefer the default max variant (1m context).
-  if (wantMax) {
-    const max = scoped.find((v) => v.isDefaultMax) ?? scoped.find(isLongContextVariant)
-    if (max) return buildRequestedModelParams(max.parameterValues, { maxMode: true })
-  }
-
-  // Retain the declared default effort when its speed twin is needed.
-  const byDefault = findDefaultVariant(model, scoped, false) ?? scoped[0]
+  // 3. Max-mode hint → the default max variant (the max tier).
+  // 4. Otherwise the default non-max variant, else the first candidate.
   // An unsupported effort must not synthesize a tuple Cursor never advertised.
-  return buildRequestedModelParams(byDefault.parameterValues)
+  return copyParameters(byDefault.parameterValues)
 }
 
 // ── Fetch + cache orchestration ──

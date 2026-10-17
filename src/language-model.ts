@@ -253,7 +253,7 @@ import {
   retrySuppressedError,
   toCursorProviderError,
 } from "./errors.js"
-import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
+import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, parseCursorContextLimit, type ModelInfo, type ModelParameterValue } from "./models.js"
 import { getFrozenRequestContext, getOrBuildRequestContext, resetFrozenRequestContextsForTests } from "./context/frozen.js"
 import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
 import { loadMergedConfig, type OpencodeJson } from "./context/rules.js"
@@ -1846,10 +1846,12 @@ async function startSession(
     picked,
   })
   // An explicit pick owns the context tier; otherwise honor the maxMode hint.
-  // OpenCode's variant paramMap does not include maxMode when the user selects 1m.
+  // OpenCode's variant paramMap does not include maxMode, so the cataloged
+  // variant's isMaxMode marker decides it (1m tiers, Grok 4.7's 500k).
   const maxMode = resolveVariantMaxMode(parameterValues, {
     picked,
     maxMode: hintMaxMode,
+    model: modelInfo,
   })
 
   if (foreignHistory || checkpointUnusable || unfinishedPriorRun) {
@@ -1857,6 +1859,7 @@ async function startSession(
       modelInfo,
       cursorModelId,
       maxMode,
+      parameters: parameterValues,
       history,
       systemPrompt,
       userText,
@@ -6767,14 +6770,21 @@ export function assertForeignHistoryRebaseFits(input: {
   modelInfo: ModelInfo | undefined
   cursorModelId: string
   maxMode: boolean
+  /** Resolved variant tuple; its `context` is the Run's window when present. */
+  parameters?: ModelParameterValue[]
   history: SeedHistoryMessage[]
   systemPrompt: string | undefined
   userText: string
 }): void {
   const documented = getDocumentedCursorModelContext(input.cursorModelId)
-  const limit = input.maxMode
+  // Max mode does not imply the model's largest tier: Opus 300k Fast is a
+  // max-mode variant with a 300k window.
+  const variantContext = parseCursorContextLimit(
+    input.parameters?.find((parameter) => parameter.id === "context")?.value,
+  )
+  const limit = variantContext ?? (input.maxMode
     ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
-    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
+    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000))
   const chars = input.history.reduce((sum, message) => sum + message.content.length, 0)
     + (input.systemPrompt?.length ?? 0)
     + input.userText.length
