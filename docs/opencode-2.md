@@ -143,7 +143,7 @@ A prompt sent before those servers finish connecting will not see their tools. O
 |---|---|
 | `config` hook registers provider + models | `ctx.provider.transform` + `editor.add` + `reload()` |
 | `auth` hook (OAuth + API key) | `ctx.integration.transform` + `/connect` |
-| `tool` hook (`custom_websearch`, `cursor_image_save`) | `ctx.tool.transform` registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema) so generated images can be committed. `todowrite`/`todoread` only when `CURSOR_OPENCODE2_TODOS=1` (or `true`) and the host catalog omits them. Off by default. OpenCode 2's native `websearch` tool owns permission checks and uses the provider registered through `ctx.websearch.transform`. The public 2.0 `ToolContext` has no permission-request method, so this entrypoint does not advertise a direct web-search fallback; image save uses catalog `edit` gating plus containment when `ask` is absent. |
+| `tool` hook (`custom_websearch`, `cursor_image_save`) | `ctx.tool.transform` registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema). Image writes use the public plugin `ctx.permission.assert` for external-directory and edit checks. `todowrite`/`todoread` register only when `CURSOR_OPENCODE2_TODOS=1` (or `true`) and the host catalog omits them. Off by default. OpenCode 2's native `websearch` tool owns permission checks and uses the provider registered through `ctx.websearch.transform`; this entrypoint does not advertise a direct web-search fallback. |
 | `event` hook (session activity) | `ctx.event.subscribe` |
 | `tool.execute.before` / `.after` | `ctx.tool.hook(...)` |
 | `shell.env` injects the timeout wrapper | `ctx.shell.hook("create.before")` injects the same env; wrapper-file fallback remains for shells that ignore env |
@@ -156,7 +156,7 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
-Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
+Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Both raise `external_directory` for targets outside the workspace, then `edit`, before writing. OpenCode 2 uses the public plugin `ctx.permission.assert` API, including the session, agent and tool-call source. A native rejection keeps its original error so the host can end the step. Older 2.0 snapshots without that API retain catalog `edit` gating and containment. The id is opaque, so the model cannot write arbitrary files.
 
 ## Planning and prompt ownership
 
