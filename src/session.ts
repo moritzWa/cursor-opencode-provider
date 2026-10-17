@@ -12,6 +12,7 @@ import type {
 } from "./protocol/tools.js"
 import type { CursorConversationTokenDetails } from "./protocol/token-details.js"
 import type { HostNoteBatch } from "./protocol/host-notes.js"
+import type { RunHistoryImages } from "./protocol/sent-history-images.js"
 import type { ParallelStepState } from "./parallel-step.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
@@ -204,6 +205,8 @@ export type CursorSession = {
   cacheDir?: string
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
+  /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
+  historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
   tokenDetails?: CursorConversationTokenDetails
   /** True only after this Run receives a checkpoint containing token details. */
