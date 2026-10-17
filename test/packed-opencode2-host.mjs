@@ -78,7 +78,7 @@ try {
     transform: () => registration(`${name}.transform`),
   }, { get: (target, key) => key in target ? target[key] : () => Effect.void })
   const host = Object.fromEntries([
-    "agent", "aisdk", "command", "credential", "event", "generate", "integration", "mcp", "model",
+    "agent", "aisdk", "command", "credential", "event", "generate", "integration", "mcp", "message", "model",
     "permission", "plugin", "provider", "reference", "session", "shell", "skill", "storage", "tool", "vcs", "websearch", "worktree",
   ].map((name) => [name, domain(name)]))
   host.app = { name: "opencode", version: "2.0.0", channel: "dev" }
@@ -88,6 +88,7 @@ try {
   host.experimental = { terminal: domain("terminal") }
   host.rpc = Object.assign(() => { throw new Error("unexpected RPC") }, { register: () => Effect.void })
   host.vcs.branch = domain("branch")
+  host.session.instructions = { entry: domain("session.instructions.entry") }
   host.integration.connection = {
     active: () => Effect.succeed(undefined), resolve: () => Effect.succeed(undefined), status: () => Effect.void,
   }
