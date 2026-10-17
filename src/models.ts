@@ -295,6 +295,39 @@ function isLongContextVariant(v: ModelVariant): boolean {
   return variantContextTokens(v) === 1_000_000
 }
 
+function sameParameterTuple(a: ModelParameterValue[], b: ModelParameterValue[]): boolean {
+  const byId = new Map(b.map((parameter) => [parameter.id, parameter.value]))
+  return (
+    a.length === b.length &&
+    new Set(a.map((parameter) => parameter.id)).size === a.length &&
+    byId.size === b.length &&
+    a.every((parameter) => byId.get(parameter.id) === parameter.value)
+  )
+}
+
+/** Same parameters as `target` except `fast`. */
+function isNonFastTwinOf(v: ModelVariant, target: ModelVariant): boolean {
+  return (
+    v.parameterValues.length === target.parameterValues.length &&
+    sameParameterTuple(
+      v.parameterValues.filter((p) => p.id !== "fast"),
+      target.parameterValues.filter((p) => p.id !== "fast"),
+    )
+  )
+}
+
+/** Find Cursor's declared default within a catalog subset, retaining its effort. */
+export function findDefaultVariant(
+  model: ModelInfo,
+  candidates: ModelVariant[],
+  maxMode: boolean,
+): ModelVariant | undefined {
+  const isDeclared = (v: ModelVariant) => maxMode ? v.isDefaultMax : v.isDefaultNonMax
+  const declared = model.variants.find(isDeclared)
+  return candidates.find(isDeclared) ??
+    (declared === undefined ? undefined : candidates.find((v) => isNonFastTwinOf(v, declared)))
+}
+
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? value
@@ -506,20 +539,8 @@ export function resolveVariantParameters(
     if (max) return buildRequestedModelParams(max.parameterValues, { maxMode: true })
   }
 
-  // 4. Default non-max variant. Cursor can declare a Fast variant as the default (Grok);
-  // `scoped` has no Fast variants, so take the declared default's non-Fast twin (same
-  // parameters except `fast`) before falling back to the first variant, the lowest level.
-  const declaredDefault = model.variants.find((v) => v.isDefaultNonMax)
-  const isNonFastTwinOfDefault = (v: ModelVariant): boolean =>
-    declaredDefault !== undefined &&
-    v.parameterValues.length === declaredDefault.parameterValues.length &&
-    v.parameterValues.every(
-      (p) =>
-        p.id === "fast" ||
-        declaredDefault.parameterValues.some((d) => d.id === p.id && d.value === p.value),
-    )
-  const byDefault =
-    scoped.find((v) => v.isDefaultNonMax) ?? scoped.find(isNonFastTwinOfDefault) ?? scoped[0]
+  // Retain the declared default effort when its speed twin is needed.
+  const byDefault = findDefaultVariant(model, scoped, false) ?? scoped[0]
   return buildRequestedModelParams(byDefault.parameterValues, {
     reasoningEffort: opts.reasoningEffort,
     maxMode: false,
