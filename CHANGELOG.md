@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Generated image writes on OpenCode 2 use native external-directory and edit permission prompts when the host exposes the public permission API.
+- Reloading the OpenCode 2 plugin cancels its event subscription even when the session is quiet.
+
 ## [0.8.1] - 2026-10-08
 
 ### Added

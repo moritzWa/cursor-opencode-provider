@@ -585,7 +585,8 @@ function subscribeSessionActivity(
   onCredentialSwitch?: () => void,
 ): (() => void) | undefined {
   try {
-    const stream = ctx.event.subscribe()
+    const controller = new AbortController()
+    const stream = ctx.event.subscribe({ signal: controller.signal })
     if (!stream || typeof stream[Symbol.asyncIterator] !== "function") return undefined
     let stopped = false
     void (async () => {
@@ -597,6 +598,9 @@ function subscribeSessionActivity(
     })().catch(() => {})
     return () => {
       stopped = true
+      // A quiet subscription can be awaiting next() indefinitely. A boolean
+      // alone only takes effect when the next event happens to arrive.
+      controller.abort()
     }
   } catch {
     return undefined

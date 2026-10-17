@@ -78,6 +78,11 @@ void (() =>
   }))
 
 void (() => ctx.integration.transform(applyCursorIntegration))
+void (() => ctx.event.subscribe({ signal: new AbortController().signal }))
+void (() => ctx.permission.assert({
+  sessionID: "s", agent: "build", action: "edit", resources: ["assets/image.png"], save: ["*"],
+  source: { type: "tool", messageID: "m", id: "c" },
+}))
 void (() =>
   ctx.tool.transform((hostEditor) => {
     registerTodoTools(hostEditor)

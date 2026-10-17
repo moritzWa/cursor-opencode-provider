@@ -1,4 +1,5 @@
-import { executeCursorImageSave } from "../image-save.js"
+import path from "node:path"
+import { executeCursorImageSave, type ImageSaveToolContext } from "../image-save.js"
 import { cursorImageSaveTool } from "../image-save-tool.js"
 import { CURSOR_IMAGE_SAVE_TOOL } from "../protocol/generate-image.js"
 import { getSessionDirectory } from "../session-directory.js"
@@ -64,8 +65,8 @@ async function workspaceForSession(
 /**
  * Register the handle-only image commit tool on the OpenCode 2.0 direct
  * catalog. Catalog `permission: "edit"` hides it when the host agent denies
- * edits. Per-call `ask` is used when the runtime context provides it;
- * otherwise containment still gates the write (opaque `image_id` only).
+ * edits. The public plugin permission domain supplies per-resource checks;
+ * older runtimes without it retain the containment-only fallback.
  */
 export function registerCursorImageSaveTool(draft: ToolDraft, ctx: PluginContext): void {
   if (hostHasTool(draft, CURSOR_IMAGE_SAVE_TOOL)) return
@@ -76,22 +77,54 @@ export function registerCursorImageSaveTool(draft: ToolDraft, ctx: PluginContext
     input: IMAGE_SAVE_INPUT_SCHEMA,
     output: IMAGE_SAVE_OUTPUT_SCHEMA,
     options: { ...OPENCODE2_DIRECT_TOOL_OPTIONS, permission: "edit" },
-    execute: async (input: { image_id?: unknown }, context: { sessionID?: string }) => {
+    execute: async (input: { image_id?: unknown }, context: { sessionID?: string; agent?: string; messageID?: string; id?: string }) => {
       const sessionID = context.sessionID
       if (typeof sessionID !== "string" || !sessionID) {
         throw new Error("OpenCode 2.0 image-save context did not provide a sessionID")
       }
       const directory = await workspaceForSession(ctx, sessionID)
+      let refusal: { error: unknown } | undefined
+      const permission = ctx.permission
+      const ask = permission
+        ? async (request: Parameters<NonNullable<ImageSaveToolContext["ask"]>>[0]) => {
+          try {
+            // OpenCode 2 file permissions use absolute resources for external
+            // files; classic ask uses a worktree-relative edit pattern instead.
+            const externalEdit = request.permission === "edit" && request.patterns.some(
+              (pattern) => pattern === ".." || pattern.startsWith(`..${path.sep}`) || path.isAbsolute(pattern),
+            )
+            await permission.assert({
+              sessionID,
+              agent: context.agent,
+              action: request.permission,
+              resources: externalEdit && typeof request.metadata.filepath === "string"
+                ? [request.metadata.filepath]
+                : request.patterns,
+              save: request.always,
+              metadata: request.metadata,
+              ...(context.messageID && context.id
+                ? { source: { type: "tool" as const, messageID: context.messageID, id: context.id } }
+                : {}),
+            })
+          } catch (error) {
+            refusal = { error }
+            throw error
+          }
+        }
+        : toolAsk(context) ?? null
       const result = await executeCursorImageSave(
         { image_id: input?.image_id },
         {
           worktree: directory,
           directory,
-          // The public 2.0 ToolContext has no permission prompt; catalog
-          // `permission: "edit"` and containment gate the write instead.
-          ask: toolAsk(context) ?? null,
+          ask,
         },
-      )
+      ).catch((error: unknown) => {
+        // Native declines must preserve their identity: the host distinguishes
+        // a plain user rejection (ends the step) from a tool failure. The
+        // shared image helper wraps classic refusals for Cursor's wire reply.
+        throw refusal ? refusal.error : error
+      })
       return {
         output: {
           path: result.title,
