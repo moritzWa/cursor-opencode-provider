@@ -101,9 +101,12 @@ function optionalPositiveNumber(
 export function normalizeModelParameterValues(value: unknown): ModelParameterValue[] | null {
   if (!Array.isArray(value)) return null
   const parameters: ModelParameterValue[] = []
+  const ids = new Set<string>()
   for (const parameter of value) {
     if (!isPlainRecord(parameter)) return null
     if (!isNonEmptyString(parameter.id) || typeof parameter.value !== "string") return null
+    if (ids.has(parameter.id)) return null
+    ids.add(parameter.id)
     parameters.push({ id: parameter.id, value: parameter.value })
   }
   return parameters
@@ -488,7 +491,7 @@ export function resolveVariantParameters(
   }
 
   const effortOf = (v: ModelVariant): string | undefined =>
-    v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning")?.value
+    v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning" || p.id === "reasoning_effort")?.value
   const isFast = (v: ModelVariant): boolean =>
     v.parameterValues.find((p) => p.id === "fast")?.value === "true"
   const isMaxVariant = (v: ModelVariant): boolean =>
@@ -506,6 +509,7 @@ export function resolveVariantParameters(
     const exact = model.variants.find(
       (v) =>
         v.parameterValues.length === picked.length &&
+        new Set(v.parameterValues.map((parameter) => parameter.id)).size === v.parameterValues.length &&
         pickedById.size === picked.length &&
         v.parameterValues.every((parameter) => pickedById.get(parameter.id) === parameter.value),
     )
@@ -541,10 +545,8 @@ export function resolveVariantParameters(
 
   // Retain the declared default effort when its speed twin is needed.
   const byDefault = findDefaultVariant(model, scoped, false) ?? scoped[0]
-  return buildRequestedModelParams(byDefault.parameterValues, {
-    reasoningEffort: opts.reasoningEffort,
-    maxMode: false,
-  })
+  // An unsupported effort must not synthesize a tuple Cursor never advertised.
+  return buildRequestedModelParams(byDefault.parameterValues)
 }
 
 // ── Fetch + cache orchestration ──
