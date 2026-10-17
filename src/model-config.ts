@@ -313,6 +313,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       contextTier: ContextTier
       fast: boolean
       variants: ModelVariant[]
+      advertisedVariants: ModelVariant[]
       suffix: string
     }> = []
     const extraContexts = new Set(m.variants
@@ -324,11 +325,19 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       const tierSuffix = contextTier === "base" ? ""
         : contextTier === "long" ? "-1m" : `-${contextSuffix(contextTier)}`
       const suffixFor = (fast: boolean) => `${tierSuffix}${fast ? "-fast" : ""}`
-      for (const group of speedGroups(variantsForTier(m, contextTier), splitFast)) {
+      const tierVariants = new Set(variantsForTier(m, contextTier))
+      // Base/Fast ids and labels are persisted by the host. Keep their pre-split
+      // non-1M variants available while dedicated entries supply accurate limits.
+      const advertised = contextTier === "base"
+        ? m.variants.filter((variant) => !isLongContextVariant(variant))
+        : [...tierVariants]
+      for (const group of speedGroups(advertised, splitFast)) {
+        const tierGroup = group.variants.filter((variant) => tierVariants.has(variant))
         groups.push({
           contextTier,
           fast: group.fast,
-          variants: group.variants,
+          variants: tierGroup.length > 0 ? tierGroup : group.variants,
+          advertisedVariants: group.variants,
           suffix: suffixFor(group.fast),
         })
       }
@@ -354,6 +363,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
         variants: group.variants,
         fast: group.fast,
       })
+      config.variants = modelInfoVariants(m, group.advertisedVariants)
       out[catalogId] = applyCursorModelCost(pricingId, config)
     }
   }

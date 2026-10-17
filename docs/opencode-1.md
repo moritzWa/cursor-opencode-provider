@@ -97,6 +97,8 @@ Variant, long-context, Fast, image, and Max Mode behavior is the same on every h
 Choose `cursor/grok-4.7-500k` (or `-500k-fast`) for its advertised 500k tier;
 the base `cursor/grok-4.7` entry keeps its 256k limit. Selecting a model entry
 without a variant retains Cursor's declared default effort for that tier.
+Saved 500k variants on the base/Fast entries remain valid after upgrading;
+reselect the dedicated 500k entry to use its full host context budget.
 
 ## File editing
 

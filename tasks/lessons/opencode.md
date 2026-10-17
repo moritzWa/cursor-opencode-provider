@@ -329,6 +329,11 @@ These are failure lessons shared by both hosts, not a replacement for
   from the resolved `context` parameter (`test/turn-provenance.test.ts`). Effort
   ties break toward the tier default, as Cursor CLI does, or a hint silently
   dropped Claude thinking (`test/model-effort-review.test.ts`).
+  Context-tier splits must retain persisted base/Fast variant ids and collision
+  labels, including a Fast entry whose variants all move to another tier. Keep
+  legacy selections usable with their old static budget; dedicated entries
+  provide the larger budget (`test/model-selection-review.test.ts`,
+  `test/model-selection-run.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).

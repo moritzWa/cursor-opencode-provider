@@ -35,6 +35,7 @@
 - Models Cursor reports as not supporting non-max mode run every variant in max mode, as Cursor CLI does ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 - A configured reasoning effort changes only the effort of Cursor's default variant; Claude models with a thinking parameter no longer switch to their non-thinking variant ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 - Unmarked 1M variants retain their max-mode fallback after model discovery and cache reload; explicit non-max markers remain authoritative ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
+- Saved 500k variant selections on base and Fast model entries remain available after upgrading; dedicated 500k entries still provide the full host context budget ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95), reported by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.2] - 2026-10-15
 

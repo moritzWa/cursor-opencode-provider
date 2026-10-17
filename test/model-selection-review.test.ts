@@ -57,7 +57,7 @@ describe("adversarial model selection", () => {
     expect(config["grok-4.7-500k-fast"].limit.context).toBe(500_000)
     expect(config["grok-4.7-500k"].options[CURSOR_VARIANT_PARAMETERS_KEY])
       .toEqual(variant("500k", "high").parameterValues)
-    expect(Object.values(config["grok-4.7"].variants)).toHaveLength(2)
+    expect(Object.values(config["grok-4.7"].variants)).toHaveLength(4)
     expect(Object.values(config["grok-4.7-500k"].variants)).toHaveLength(2)
     expect(config["grok-4.7-500k"].cost).toEqual(getCursorModelCost("grok-4.7"))
     const catalog2 = modelsToCatalogModelMap([model])
@@ -74,6 +74,58 @@ describe("adversarial model selection", () => {
       { id: "grok-4.7-500k-fast", variants: [] }])
     expect(colliding["grok-4.7-500k-2"].limit.context).toBe(500_000)
     expect(colliding["grok-4.7-500k-2-fast"].limit.context).toBe(500_000)
+  })
+
+  it("retains saved 500k variant ids on base and Fast entries in both host catalogs", () => {
+    const slow = { ...variant("500k", "high"), displayName: "Grok 4.7 High 500k" }
+    const fast = { ...variant("500k", "high", true), displayName: "Grok 4.7 High Fast 500k Fast" }
+    const model: ModelInfo = {
+      id: "grok-4.7", maxContext: 256_000, maxContextForMaxMode: 500_000,
+      variants: [variant("256k", "high"), variant("256k", "high", true), slow, fast],
+    }
+    const classic = modelsToConfig([model])
+    const modern = modelsToCatalogModelMap([model])
+    for (const [id, saved] of [["grok-4.7", slow], ["grok-4.7-fast", fast]] as const) {
+      const originalParams = saved.parameterValues
+      const picked = classic[id].variants[saved.displayName]?.[CURSOR_VARIANT_PARAMETERS_KEY]
+      expect(picked).toEqual(originalParams)
+      expect(modern[id]?.variants.find((v) => v.id === saved.displayName)?.settings)
+        .toEqual({ [CURSOR_VARIANT_PARAMETERS_KEY]: originalParams })
+      expect(resolveVariantParameters(model, { picked })).toEqual(originalParams)
+      expect(resolveVariantMaxMode(originalParams, { model, picked: originalParams })).toBe(true)
+      expect(classic[id].limit.context).toBe(256_000)
+    }
+    expect(classic["grok-4.7-500k"].limit.context).toBe(500_000)
+    expect(classic["grok-4.7-500k-fast"].limit.context).toBe(500_000)
+    expect(classic["grok-4.7-fast"].options[CURSOR_VARIANT_PARAMETERS_KEY])
+      .toEqual(variant("256k", "high", true).parameterValues)
+  })
+
+  it("keeps the old Fast entry when its only variants moved to a max tier", () => {
+    const fast = variant("500k", "high", true)
+    const model: ModelInfo = {
+      id: "grok-4.7", maxContext: 256_000,
+      variants: [variant("256k", "high"), fast],
+    }
+    const config = modelsToConfig([model])
+    expect(config["grok-4.7-fast"].variants[fast.displayName]?.[CURSOR_VARIANT_PARAMETERS_KEY])
+      .toEqual(fast.parameterValues)
+    expect(config["grok-4.7-fast"].options[CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(fast.parameterValues)
+    expect(config["grok-4.7-500k-fast"].limit.context).toBe(500_000)
+    expect(modelsToCatalogModelMap([model])["grok-4.7-fast"]?.variants[0]?.id).toBe(fast.displayName)
+  })
+
+  it("preserves pre-split collision labels without adding 1M variants to the base picker", () => {
+    const max = { ...variant("500k", "high"), displayName: "Shared" }
+    const base = { ...variant("256k", "high"), displayName: "Shared", isDefaultNonMax: true }
+    const long = { ...variant("1m", "high"), displayName: "Long" }
+    const model: ModelInfo = { id: "tiered", maxContext: 256_000, variants: [max, base, long] }
+    const config = modelsToConfig([model])
+    expect(config.tiered.variants.Shared[CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(max.parameterValues)
+    expect(config.tiered.variants["Shared 256k"][CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(base.parameterValues)
+    expect(config.tiered.variants.Long).toBeUndefined()
+    expect(config["tiered-500k"].variants.Shared[CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(max.parameterValues)
+    expect(resolveVariantParameters(model)).toEqual(base.parameterValues)
   })
 
   it("keeps an intrinsic marked context on its original model id", () => {
