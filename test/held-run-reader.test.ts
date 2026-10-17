@@ -137,6 +137,50 @@ describe("held Run reader", () => {
     sessionManager.endPump(session, owner)
   })
 
+  it("applies a queued abort once the pump registers its exec, even if the step ended first", async () => {
+    // Exec 0 runs; Cursor lists a call, requests exec 1 and aborts it at once.
+    const { session, send } = heldRun()
+    sessionManager.registerPending(0, session, "shell_result", "bash", false)
+    readHeldRun(session)
+    send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+    send({ exec_server_message: { id: 1, shell_args: { command: "sleep 8", tool_call_id: "call-shell-1" } } })
+    send({ exec_server_control_message: { abort: { id: 1 } } })
+    send({ interaction_update: { text_delta: { text: "after" } } })
+    await settle()
+    // Exec 1 is not registered yet, so its abort waits behind its request.
+    expect(session.heldFrames).toHaveLength(4)
+
+    // The continuation pump takes the list and exec 1, registers it, and ends the step.
+    const owner = Symbol("continuation pump")
+    sessionManager.beginPump(session, owner)
+    await readSessionFrame(session)
+    await readSessionFrame(session)
+    sessionManager.registerPending(1, session, "shell_result", "bash", false)
+    sessionManager.endPump(session, owner)
+    // The reader from before the pump is still waiting on the stream; holding the Run again applies the abort.
+    readHeldRun(session)
+
+    expect(session.pending.get(1)?.aborted).toBe(true)
+    expect(session.pending.get(0)?.aborted).toBeUndefined()
+    // The applied abort leaves the queue; the text behind it stays in order for the pump.
+    expect(session.heldFrames).toHaveLength(1)
+    const next = decodeMessage<Record<string, any>>("AgentServerMessage", ((await readSessionFrame(session)).value as Frame).payload)
+    expect(next.interaction_update?.text_delta?.text).toBe("after")
+  })
+
+  it("applies a queued abort when the reader next wakes", async () => {
+    const { session, send } = heldRun()
+    sessionManager.registerPending(0, session, "shell_result", "bash", false)
+    session.heldFrames = [{ flags: 0, payload: encodeMessage("AgentServerMessage", { exec_server_control_message: { abort: { id: 2 } } }) }]
+    readHeldRun(session)
+    // Exec 2 is registered while the reader waits, without a pump calling readHeldRun again.
+    sessionManager.registerPending(2, session, "read_result", "read", false)
+    send(heartbeat)
+    await settle()
+    expect(session.pending.get(2)?.aborted).toBe(true)
+    expect(session.heldFrames).toEqual([])
+  })
+
   it("does not read a Run that owes nothing, and keeps a pushed-back frame first", async () => {
     const idle = heldRun()
     readHeldRun(idle.session)

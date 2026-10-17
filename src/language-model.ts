@@ -2400,13 +2400,37 @@ function abortsPendingExec(session: CursorSession, control: Record<string, unkno
  */
 export function readHeldRun(session: CursorSession): void {
   const frames = session.frames
-  if (heldRunReaders.has(session) || !isHeldRunIdle(session, frames)) return
+  if (!isHeldRunIdle(session, frames)) return
+  // A reader from before the last pump may still be waiting on the stream.
+  applyQueuedAborts(session)
+  if (heldRunReaders.has(session)) return
   heldRunReaders.add(session)
   void readHeldFrames(session, frames).finally(() => heldRunReaders.delete(session))
 }
 
+/**
+ * An abort queued behind its own exec request waits only until a pump has
+ * registered that exec. If the pump ended its step before reaching the abort,
+ * apply it now, as Cursor CLI does on its control channel; otherwise the exec
+ * runs, keeps its heartbeats and has its late result written.
+ */
+function applyQueuedAborts(session: CursorSession): void {
+  const queued = session.heldFrames
+  if (!queued?.length) return
+  for (let index = 0; index < queued.length;) {
+    const held = heldControlFrame(queued[index]!)
+    if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      queued.splice(index, 1)
+      applyExecControl(session, held.control, "held queue")
+    } else {
+      index++
+    }
+  }
+}
+
 async function readHeldFrames(session: CursorSession, frames: CursorSession["frames"]): Promise<void> {
   while (isHeldRunIdle(session, frames)) {
+    applyQueuedAborts(session)
     const read = session.pendingFrameRead ??= frames.next()
     void read.catch(() => {})
     let result: IteratorResult<Frame>

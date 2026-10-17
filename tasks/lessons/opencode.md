@@ -87,7 +87,10 @@ These are failure lessons shared by both hosts, not a replacement for
   Stopping at the first other frame was not enough: Cursor sends
   `tool_requests_listed` or a checkpoint right after a step, ahead of its KV
   writes. Handle KV and aborts at once and queue the rest in order
-  (`readHeldRun`, `test/held-run-reader.test.ts`).
+  (`readHeldRun`, `test/held-run-reader.test.ts`). A queued frame is not
+  necessarily reached by the next pump: one that ends its step on a queued
+  exec leaves that exec's abort behind it, so re-check the queue whenever the
+  Run is held again (`test/held-run-run.test.ts`).
 - **Backpressure belongs to every response-required write.** KV replies filled
   the stream before an awaited heartbeat exposed it. Serialize writes, label the
   failing operation, and do not replay ambiguous buffered delivery

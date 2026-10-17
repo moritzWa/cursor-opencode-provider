@@ -156,4 +156,46 @@ describe("a Run held on a host tool", () => {
       fs.rmSync(root, { recursive: true, force: true })
     }
   }, 30_000)
+
+  it("applies an abort that arrives right behind its exec request while another exec runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-held-run-"))
+    try {
+      const prompt: LanguageModelV3Prompt = [{ role: "user", content: [{ type: "text", text: "run it" }] }]
+      const first = await streamParts(root, prompt)
+      const call0 = first.find((part) => part.type === "tool-call")!
+
+      // While exec 0 runs, Cursor lists a call, requests exec 1 and aborts it at once.
+      send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+      send({ exec_server_message: { id: 1, shell_args: { command: "sleep 8", tool_call_id: "call-shell-1" } } })
+      send({ exec_server_control_message: { abort: { id: 1 } } })
+      await wait(100)
+
+      // Exec 0 returns; the pump emits exec 1 from the queue and ends the step there.
+      const history: LanguageModelV3Prompt = [
+        ...prompt,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: call0.toolCallId, toolName: "bash", input: { command: "sleep 600" } }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call0.toolCallId, toolName: "bash", output: { type: "text", value: "done" } }] },
+      ] as LanguageModelV3Prompt
+      const second = await streamParts(root, history)
+      const call1 = second.find((part) => part.type === "tool-call")!
+      expect(call1?.toolCallId.endsWith("_1")).toBe(true)
+
+      // Exec 1 was aborted before the host ran it: no heartbeats while the host runs it anyway.
+      await wait(3_300)
+      expect(received.filter((message) => message.exec_client_control_message?.heartbeat?.id === 1)).toHaveLength(0)
+
+      // Its late result is dropped, and Cursor's later output reaches the host.
+      send({ interaction_update: { text_delta: { text: "Skipped the second shell." } } })
+      send({ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } })
+      const third = await streamParts(root, [
+        ...history,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: call1.toolCallId, toolName: "bash", input: { command: "sleep 8" } }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call1.toolCallId, toolName: "bash", output: { type: "text", value: "late" } }] },
+      ] as LanguageModelV3Prompt)
+      expect(received.filter((message) => message.exec_client_message?.id === 1)).toHaveLength(0)
+      expect(third.filter((part) => part.type === "text-delta").map((part) => part.delta).join("")).toBe("Skipped the second shell.")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 })
