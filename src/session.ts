@@ -1,8 +1,9 @@
 import type { BidiStream, BidiTerminalEvent } from "./transport/connect.js"
 import { trace } from "./debug.js"
+import { releaseUnstartedTerminal } from "./terminal-runner.js"
 import { CursorProtocolError, type CursorProviderError } from "./errors.js"
 import { StreamWriteDrainError, writeStreamMessage } from "./stream-write.js"
-import { sessionActivity, type SessionActivitySource } from "./activity.js"
+import { RUNNING_TOOL_CAP_MS, sessionActivity, type SessionActivitySource } from "./activity.js"
 import type {
   HostSubagentCatalog,
   HostToolDialect,
@@ -18,6 +19,7 @@ import type { RunCostEstimate } from "./billing.js"
 export type Frame = { flags: number; payload: Uint8Array }
 
 export type CursorContinuationOptions = {
+  /** A Run that owes the host nothing fails after this long without any inbound frame. */
   semanticIdleMs?: number
   /** @deprecated Use semanticIdleMs. Kept as a strict alias for compatibility. */
   softHealthMs?: number
@@ -137,9 +139,16 @@ export type PendingExec = {
    * exec result back to Cursor — just clear pending and keep pumping.
    */
   bridged?: boolean
+  /**
+   * Cursor withdrew the exec (`ExecServerControlMessage.abort`). As in Cursor
+   * CLI, nothing is written back for it, but the host's late result still
+   * finds this Run so the turn goes on.
+   */
+  aborted?: boolean
 }
 
 export type ContinuationTerminalReason =
+  | "host-interrupted"
   | "hard-cap-expired"
   | "remote-clean-close"
   | "remote-error"
@@ -238,6 +247,8 @@ export type CursorSession = {
   }
   /** OpenCode session whose own or descendant activity renews tool leases. */
   openCodeSessionId?: string
+  /** OpenCode session whose Stop cancels this Run, also for a helper isolated from it. */
+  stoppedWithSessionId?: string
   /** Host primary agent whose prompt/permissions this Run was seeded with. */
   hostAgent?: string
   /** Stable host-system + provider-guidance identity for restart validation. */
@@ -265,6 +276,12 @@ export type CursorSession = {
    * after the host settles emitted tools. Timed-out reads use pendingFrameRead.
    */
   pushbackFrame?: Frame
+  /**
+   * Frames the held-Run reader took while the host ran tools and the next pump
+   * must see, in arrival order. They follow `pushbackFrame` and precede any
+   * unread frame.
+   */
+  heldFrames?: Frame[]
   /**
    * In-progress parallel tool-call step (field 27 hold). Cleared when the step
    * finishes; added to priorParallelStepCallIds for late-completion filtering.
@@ -351,12 +368,20 @@ export type CursorSession = {
   deferredTerminalReason: "remote-clean-close" | "remote-error" | null
   policy: CursorContinuationPolicy
   createdAt: number
+  /** When the host's model call that opened this Run started; it may open the Run after a stop. */
+  requestedAt?: number
   lastInboundAt: number
   lastHeartbeatWriteAt: number
   semanticDeadlineAt: number
   closeError: CursorProviderError | null
   closed: boolean
-  reopenWithUserMessage?: (text: string) => Promise<void>
+  /** The host stopped the turn (OpenCode 2 interrupt); the Run is being cancelled and must not be continued. */
+  hostInterrupted?: string
+  reopenWithUserMessage?: (text: string, signal?: AbortSignal) => Promise<void>
+}
+
+export function stoppedWith(session: CursorSession): string | undefined {
+  return session.stoppedWithSessionId ?? session.openCodeSessionId
 }
 
 type Tombstone = {
@@ -387,6 +412,8 @@ export class SessionManager {
   // of continuing the held-open one — the prior entry is stale and superseded.
   private byOpenCodeSessionId = new Map<string, CursorSession>()
   private tombstones = new Map<string, Tombstone>()
+  /** Early-row tool call id → the exec that bound it. Bounded like the tombstones. */
+  private toolCallRoutes = new Map<string, { sessionId: string; execId: number }>()
   private readonly now: () => number
   private readonly setTimer: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void
@@ -493,18 +520,54 @@ export class SessionManager {
     return this.isPumping(session)
   }
 
+  /** Every open Run a Stop of this OpenCode session cancels, including one a newer Run did not supersede. */
+  openSessionsStoppedWith(openCodeSessionId: string | undefined): CursorSession[] {
+    return [...this.sessions].filter((session) =>
+      !session.closed && (openCodeSessionId === undefined || stoppedWith(session) === openCodeSessionId))
+  }
+
   /**
-   * Clear display-only bridged pendings that do not require a Cursor exec write.
-   * Used when the host starts a fresh user turn instead of returning the bridged
-   * tool result (e.g. human `continue` while a todowrite mirror is outstanding).
+   * Forget every result the host still owed this Run, without writing any: the
+   * host stopped the turn, and the Run is about to be cancelled.
    *
-   * @returns number of bridged pendings settled
+   * @returns number of pendings dropped
+   */
+  abandonPending(session: CursorSession): number {
+    if (session.closed) return 0
+    const dropped = session.pending.size
+    for (const [execId, pending] of session.pending) {
+      const directory = pending.resultMetadata?.managed_job_directory
+      if (typeof directory === "string") releaseUnstartedTerminal(directory)
+      const key = this.key(session.sessionId, execId)
+      this.byExecId.delete(key)
+      this.putTombstone(key, "host-interrupted")
+    }
+    session.pending.clear()
+    this.scheduleHardDeadline(session)
+    return dropped
+  }
+
+  /** Cursor withdrew this exec; returns false when it is not one the host still owes. */
+  markExecAborted(session: CursorSession, execId: number): boolean {
+    const pending = session.pending.get(execId)
+    if (session.closed || !pending || pending.bridged || pending.aborted || pending.state !== "pending") return false
+    pending.aborted = true
+    return true
+  }
+
+  /**
+   * Clear pendings that do not require a Cursor exec write: display-only bridged
+   * ones and execs Cursor aborted. Used when the host starts a fresh user turn
+   * instead of returning the result (e.g. human `continue` while a todowrite
+   * mirror is outstanding).
+   *
+   * @returns number of pendings settled
    */
   settleBridgedPending(session: CursorSession): number {
     if (session.closed) return 0
     let settled = 0
     for (const [execId, pending] of [...session.pending.entries()]) {
-      if (!pending.bridged) continue
+      if (!pending.bridged && !pending.aborted) continue
       if (pending.state === "claimed") continue
       const key = this.key(session.sessionId, execId)
       this.putTombstone(key, "delivered")
@@ -536,8 +599,9 @@ export class SessionManager {
       for (const candidate of this.sessions) {
         if (candidate === justRegistered || this.isPumping(candidate)) continue
         // Held-open Runs with pending tools must not be cap-evicted — that is
-        // mid-exec supersede by another name and throws away the prefix.
-        if (candidate.pending.size > 0) continue
+        // mid-exec supersede by another name and throws away the prefix. An
+        // exec Cursor aborted no longer waits on the host, so it does not hold.
+        if ([...candidate.pending.values()].some((pending) => !pending.aborted)) continue
         if (!oldest || candidate.createdAt < oldest.createdAt) oldest = candidate
       }
       if (!oldest) {
@@ -673,7 +737,7 @@ export class SessionManager {
 
     let framesWritten = 0
     try {
-      if (!pending.bridged && frames.length === 0) {
+      if (!pending.bridged && !pending.aborted && frames.length === 0) {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {
@@ -748,7 +812,8 @@ export class SessionManager {
     session.pumpActive = false
     const deferred = session.deferredTerminalReason
     session.deferredTerminalReason = null
-    if (deferred) this.close(session, deferred)
+    // A Run the host stopped is closed by its cancel, after it has read what Cursor sent last.
+    if (deferred && !session.hostInterrupted) this.close(session, deferred)
     return true
   }
 
@@ -772,6 +837,7 @@ export class SessionManager {
     session.frames = next.frames()[Symbol.asyncIterator]()
     session.pendingFrameRead = undefined
     session.pushbackFrame = undefined
+    session.heldFrames = undefined
     session.parallelStep = undefined
     session.priorParallelStepCallIds = undefined
     this.subscribeTerminal(session)
@@ -814,7 +880,9 @@ export class SessionManager {
     session.terminalUnsubscribe?.()
     session.terminalUnsubscribe = null
     session.deferredTerminalReason = null
-    for (const id of session.pending.keys()) {
+    for (const [id, pending] of session.pending) {
+      const directory = pending.resultMetadata?.managed_job_directory
+      if (typeof directory === "string") releaseUnstartedTerminal(directory)
       const key = this.key(session.sessionId, id)
       this.byExecId.delete(key)
       if (this.isTerminalReason(reason)) this.putTombstone(key, reason)
@@ -822,6 +890,7 @@ export class SessionManager {
     session.pending.clear()
     session.pendingFrameRead = undefined
     session.pushbackFrame = undefined
+    session.heldFrames = undefined
     session.parallelStep = undefined
     session.priorParallelStepCallIds = undefined
     session.pumpOwner = null
@@ -863,6 +932,7 @@ export class SessionManager {
   dispose(): void {
     for (const session of [...this.sessions]) this.close(session, "process-disposed")
     this.byExecId.clear()
+    this.toolCallRoutes.clear()
   }
 
   sweepHardDeadlines(): void {
@@ -880,21 +950,60 @@ export class SessionManager {
     if (event.kind === "local-close" || session.closed) return
     const reason = event.kind === "remote-error" ? "remote-error" : "remote-clean-close"
     if (event.kind === "remote-error") session.closeError = event.error
-    if (session.pumpOwner !== null) {
+    if (session.pumpOwner !== null || session.hostInterrupted) {
       session.deferredTerminalReason = reason
       return
     }
     this.close(session, reason, event.kind === "remote-error" ? event.error : undefined)
   }
 
+  /**
+   * The host tool-call id a continuation will send for this exec, when it is
+   * not `cursor_<session>_<execId>` (an early row bound to the real exec).
+   * The route outlives its Run, like a tombstone, so a result that arrives
+   * after the Run closed still names its exec and rebuilds from host history.
+   */
+  bindToolCall(toolCallId: string, sessionId: string, execId: number): void {
+    this.toolCallRoutes.delete(toolCallId)
+    this.toolCallRoutes.set(toolCallId, { sessionId, execId })
+    while (this.toolCallRoutes.size > this.tombstoneLimit) {
+      const oldest = this.toolCallRoutes.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.toolCallRoutes.delete(oldest)
+    }
+  }
+
+  toolCallExec(toolCallId: string): { sessionId: string; execId: number } | undefined {
+    return this.toolCallRoutes.get(toolCallId)
+  }
+
+  /**
+   * Leases only grow. Session activity renews from its own time; a running
+   * host tool renews from now, but never past that tool's own ceiling. The
+   * ceiling limits the tool's extension, not the lease activity already gave.
+   */
   private refreshHardDeadline(session: CursorSession, pending: PendingExec): number {
     if (!session.openCodeSessionId) return pending.hardDeadlineAt
+    const now = this.now()
+    const toolCapAt = this.activitySource.runningToolDeadline?.(
+      session.openCodeSessionId,
+      now,
+      RUNNING_TOOL_CAP_MS,
+    )
     const activityAt = this.activitySource.lastActivityAt(session.openCodeSessionId)
-    if (activityAt === undefined || activityAt <= pending.registeredAt) return pending.hardDeadlineAt
-    const renewedDeadline = activityAt + session.policy.hardCapMs
-    if (renewedDeadline > pending.hardDeadlineAt) {
-      pending.hardDeadlineAt = renewedDeadline
-      trace("continuation lease renewed from OpenCode session activity")
+    if (activityAt !== undefined && activityAt > pending.registeredAt) {
+      const renewedDeadline = activityAt + session.policy.hardCapMs
+      if (renewedDeadline > pending.hardDeadlineAt) {
+        pending.hardDeadlineAt = renewedDeadline
+        trace("continuation lease renewed from OpenCode session activity")
+      }
+    }
+    if (toolCapAt !== undefined) {
+      const renewedDeadline = Math.min(now + session.policy.hardCapMs, toolCapAt)
+      if (renewedDeadline > pending.hardDeadlineAt) {
+        pending.hardDeadlineAt = renewedDeadline
+        trace("continuation lease renewed while a host tool is running")
+      }
     }
     return pending.hardDeadlineAt
   }
@@ -977,6 +1086,8 @@ export async function readSessionFrame(
     session.pushbackFrame = undefined
     return { done: false, value }
   }
+  const held = session.heldFrames?.shift()
+  if (held) return { done: false, value: held }
   const pending = session.pendingFrameRead ??= session.frames.next()
   // A timed-out read can reject while no pump is consuming it. Preserve the
   // rejection for the next reader without an unhandled detached promise.

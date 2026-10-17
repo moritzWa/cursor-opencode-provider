@@ -1,4 +1,6 @@
 import { trace } from "../debug.js"
+import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
+import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -51,6 +53,8 @@ export async function hydrateConversationState(
   }
 
   restoreConversationBinding(sessionKey, persisted.conversationId)
+  restoreEarlySteers(sessionKey, persisted.earlySteers)
+  restoreLostRequest(sessionKey, persisted.lostRequest)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
@@ -80,7 +84,11 @@ export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
 }
 
-/** Persist the complete resumable state only after Cursor confirms TurnEnded. */
+/**
+ * Persist the resumable state at Cursor's TurnEnded, or before it
+ * (`runInProgress`) so a Run the host interrupts, or a restart, resumes from
+ * the latest checkpoint and still recognizes the step in progress.
+ */
 export async function persistConversationState(
   cacheDir: string,
   input: {
@@ -92,6 +100,7 @@ export async function persistConversationState(
     hostAgent?: string
     systemPromptHash?: string
     hostNote?: string
+    runInProgress?: boolean
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -104,7 +113,9 @@ export async function persistConversationState(
     return
   }
   const checkpoint = getCheckpoint(input.conversationId)
-  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint)
+  const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint, {
+    keepInMemory: input.runInProgress,
+  })
   const blobs = blobCompaction.blobs
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
@@ -119,12 +130,14 @@ export async function persistConversationState(
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
+    earlySteers: serializeEarlySteers(input.sessionKey),
+    lostRequest: serializeLostRequest(input.sessionKey),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
   })
   trace(
-    `conversation persistence: saved sessionKey=${input.sessionKey} ` +
+    `conversation persistence: saved${input.runInProgress ? " in-progress" : ""} sessionKey=${input.sessionKey} ` +
       `conversationId=${input.conversationId} checkpoint=${checkpoint?.length ?? 0}B ` +
       `blobs=${blobCompaction.beforeCount}->${blobCompaction.afterCount} ` +
       `blobBytes=${blobCompaction.beforeBytes}->${blobCompaction.afterBytes}` +

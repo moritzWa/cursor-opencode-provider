@@ -255,7 +255,12 @@ export async function fetchAgentUrl(
 
 export type BidiStream = {
   write(msg: Uint8Array): boolean | void
-  waitForDrain?(timeoutMs: number): Promise<void>
+  /**
+   * Resolves once a backpressured write has drained. There is no deadline, as
+   * in Cursor CLI's transport: a stream error or close (remote or local) settles
+   * it, and the read-idle watchdog bounds a stream that stops answering.
+   */
+  waitForDrain?(): Promise<void>
   end(): void
   frames(): AsyncIterable<{ flags: number; payload: Uint8Array }>
   destroy(): void
@@ -343,6 +348,12 @@ function cursorRunGrpcError(
 const _http2Sessions = new Map<string, http2.ClientHttp2Session>()
 const _http2SessionCreatedAt = new WeakMap<http2.ClientHttp2Session, number>()
 const _http2SessionListenerCleanup = new WeakMap<http2.ClientHttp2Session, () => void>()
+// As in Cursor CLI's transport (@connectrpc/connect-node 1.6.1
+// Http2SessionManager), a cached session keeps the process alive only while a
+// Run stream or a reuse ping is live on it: unref'd once connected, ref'd while
+// it holds one. A Run held open on a pending exec keeps its stream, so it stays
+// ref'd; an idle session would otherwise stop a headless host from exiting.
+const _http2SessionHolds = new WeakMap<http2.ClientHttp2Session, number>()
 // Validation and connect work for the same origin shares one Promise.
 const _http2Connecting = new Map<string, Promise<http2.ClientHttp2Session>>()
 
@@ -352,8 +363,16 @@ const _http2Connecting = new Map<string, Promise<http2.ClientHttp2Session>>()
 const CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_SESSION_PING_TIMEOUT_MS = 5_000
 const DEFAULT_READ_IDLE_MS = 120_000
-const WRITE_DRAIN_TIMEOUT_CODE = "CURSOR_WRITE_DRAIN_TIMEOUT"
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
+// Every Run shares one session per origin. Node and Bun count its unsent bytes
+// against maxSessionMemory (10 MB by default) and, once over it, fail every new
+// stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
+// response headers); Node also fails a single write over it while the uplink
+// holds the bytes back. Run requests and KV replies run to many megabytes, and
+// the provider holds those bytes anyway, so the limit only adds a failure.
+// 256 MB clears the 100 MiB checkpoint transfer budget with room to spare.
+// Cursor CLI's transport sets no maxSessionMemory, so it keeps the default (#76).
+const RUN_SESSION_OPTIONS = { maxSessionMemory: 256 } satisfies http2.ClientSessionOptions
 
 export function shouldReuseHttp2Session(
   state: { destroyed: boolean; closed: boolean },
@@ -385,6 +404,29 @@ function dropSession(origin: string, session: http2.ClientHttp2Session): void {
 function retireCachedSession(origin: string, session: http2.ClientHttp2Session): void {
   dropSession(origin, session)
   try { session.close() } catch { /* already closed */ }
+}
+
+function holdHttp2Session(session: http2.ClientHttp2Session): void {
+  const holds = _http2SessionHolds.get(session) ?? 0
+  _http2SessionHolds.set(session, holds + 1)
+  if (holds === 0) session.ref()
+}
+
+function releaseHttp2Session(session: http2.ClientHttp2Session): void {
+  const holds = (_http2SessionHolds.get(session) ?? 0) - 1
+  if (holds > 0) {
+    _http2SessionHolds.set(session, holds)
+    return
+  }
+  _http2SessionHolds.delete(session)
+  if (!session.destroyed) session.unref()
+}
+
+/** Offer a connected session for new Runs; it stays unref'd until one holds it. */
+function cacheReadySession(origin: string, session: http2.ClientHttp2Session): void {
+  if (!_http2SessionHolds.has(session)) session.unref()
+  _http2SessionCreatedAt.set(session, Date.now())
+  _http2Sessions.set(origin, session)
 }
 
 /** Test cleanup for local HTTP/2 fixtures; production sessions stay process-cached. */
@@ -490,9 +532,10 @@ export function cacheHttp2SessionForTests(
   origin: string,
   session: http2.ClientHttp2Session,
 ): void {
+  // Tests re-cache one client per turn; replace its listeners rather than stack them.
+  _http2SessionListenerCleanup.get(session)?.()
   installSessionInvalidation(origin, session)
-  _http2SessionCreatedAt.set(session, Date.now())
-  _http2Sessions.set(origin, session)
+  cacheReadySession(origin, session)
 }
 
 function invalidateSession(origin: string, session: http2.ClientHttp2Session): void {
@@ -592,8 +635,7 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
       }
       // The TLS socket (if any) is owned by the HTTP/2 session from here on.
       tunnelSocket = undefined
-      _http2SessionCreatedAt.set(session, Date.now())
-      _http2Sessions.set(origin, session)
+      cacheReadySession(origin, session)
       trace(`h2 session connected: origin=${origin}`)
       resolve(session)
     }
@@ -622,10 +664,11 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
           }
           tunnelSocket = tlsSocket
           session = http2.connect(origin, {
+            ...RUN_SESSION_OPTIONS,
             createConnection: () => tlsSocket,
           })
         } else {
-          session = http2.connect(origin)
+          session = http2.connect(origin, RUN_SESSION_OPTIONS)
         }
         if (settled) {
           try { session.destroy() } catch { /* ignore */ }
@@ -664,7 +707,12 @@ export function getSession(
         retireCachedSession(origin, existing)
       } else {
         try {
-          await validateCachedSession(existing, pingTimeoutMs)
+          holdHttp2Session(existing)
+          try {
+            await validateCachedSession(existing, pingTimeoutMs)
+          } finally {
+            releaseHttp2Session(existing)
+          }
           if (_http2Sessions.get(origin) === existing && !existing.destroyed && !existing.closed) {
             trace(`h2 cached session ping ok: origin=${origin}`)
             return existing
@@ -723,6 +771,7 @@ export async function bidiRunStream(
   const stream = session.request(headers as unknown as http2.OutgoingHttpHeaders, {
     endStream: false,
   })
+  holdHttp2Session(session)
 
   let writable = true
   let locallyClosed = false
@@ -768,6 +817,13 @@ export async function bidiRunStream(
       return streamFailure
     }
     return undefined
+  }
+  const drainTerminalError = (event: BidiTerminalEvent): CursorProviderError => {
+    if (event.kind === "local-close") {
+      return new CursorLocalCancellationError("Cursor Run stream closed locally during drain")
+    }
+    if (event.kind === "remote-error") return event.error
+    return observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream ended before drain")
   }
   const settleTerminal = (event: BidiTerminalEvent) => {
     if (terminalEvent) return
@@ -919,6 +975,7 @@ export async function bidiRunStream(
   })
   stream.on("close", () => {
     writable = false
+    releaseHttp2Session(session)
     remotelyClosed = !locallyClosed
     if (remotelyClosed) {
       dropSession(origin, session)
@@ -934,6 +991,14 @@ export async function bidiRunStream(
     scheduleTerminalSettlement()
   })
 
+  // Reset with CANCEL, as Cursor CLI's transport does for an aborted call
+  // (@connectrpc/connect-node 1.6.1). A plain close() leaves a stream whose
+  // request write is still buffered open for good, which also keeps its
+  // session held and the process alive.
+  const closeLocally = () => {
+    try { stream.close(http2.constants.NGHTTP2_CANCEL) } catch { /* already closing */ }
+  }
+
   if (abortSignal) {
     abortHandler = () => {
       if (!locallyClosed) {
@@ -944,7 +1009,7 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
-        stream.close()
+        closeLocally()
       }
     }
     abortSignal.addEventListener("abort", abortHandler, { once: true })
@@ -975,18 +1040,18 @@ export async function bidiRunStream(
         throw streamFailure
       }
     },
-    waitForDrain(timeout) {
+    waitForDrain() {
       if (!backpressured) return Promise.resolve()
-      const drainTimeoutMs = timeoutMs("Cursor write drain timeout", timeout, timeout)
+      if (terminalEvent) return Promise.reject(drainTerminalError(terminalEvent))
       return new Promise<void>((resolve, reject) => {
         let settled = false
         const finish = (error?: CursorProviderError) => {
           if (settled) return
           settled = true
-          clearTimeout(timer)
           stream.removeListener("drain", onDrain)
           stream.removeListener("error", onError)
           stream.removeListener("close", onClose)
+          terminalListeners.delete(onTerminal)
           if (error) reject(error)
           else resolve()
         }
@@ -1006,18 +1071,14 @@ export async function bidiRunStream(
               : observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream closed before drain"),
           )
         }
-        const timer = setTimeout(() => {
-          streamFailure ??= new CursorTransportError(
-            `Cursor Run stream backpressure did not drain after ${drainTimeoutMs}ms`,
-            { transient: false, replaySafe: false, code: WRITE_DRAIN_TIMEOUT_CODE },
-          )
-          finish(streamFailure)
-          try { stream.destroy(streamFailure) } catch { /* already closing */ }
-        }, drainTimeoutMs)
-        timer.unref?.()
+        // The Run's end settles it too: Node holds back `close` while a write
+        // is buffered, and a response can end while the request is still
+        // blocked, after which the read-idle watchdog no longer runs.
+        const onTerminal = (event: BidiTerminalEvent) => finish(drainTerminalError(event))
         stream.once("drain", onDrain)
         stream.once("error", onError)
         stream.once("close", onClose)
+        terminalListeners.add(onTerminal)
       })
     },
     end() {
@@ -1028,7 +1089,10 @@ export async function bidiRunStream(
       finishInbound()
       stopInboundReader()
       settleTerminal({ kind: "local-close" })
-      stream.end()
+      // A blocked write cannot finish gracefully; discard it rather than leave
+      // its stream and session referenced after the drain has been rejected.
+      if (backpressured) closeLocally()
+      else stream.end()
     },
     async *frames() {
       try {
@@ -1069,8 +1133,10 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
-        stream.close()
       }
+      // end() may already have half-closed the request. destroy() must still
+      // reset the stream if the peer has left its response open.
+      closeLocally()
     },
     isClosed() {
       return remotelyClosed || locallyClosed || stream.closed || stream.destroyed

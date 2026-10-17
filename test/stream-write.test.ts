@@ -7,7 +7,7 @@ type FakeStream = BidiStream & { written: number[] }
 
 function stream(options: {
   write?: (message: Uint8Array) => boolean | void
-  waitForDrain?: ((timeoutMs: number) => Promise<void>) | null
+  waitForDrain?: (() => Promise<void>) | null
 } = {}): FakeStream {
   const written: number[] = []
   const fake = {
@@ -27,6 +27,23 @@ describe("writeStreamMessage", () => {
   it("returns once an accepted write is buffered", async () => {
     const s = stream()
     await writeStreamMessage(s, frame(1), "test")
+    expect(s.written).toEqual([1])
+  })
+
+  it("asks shouldWrite only when the message's turn comes, and skips it on false", async () => {
+    let drain!: () => void
+    const s = stream({
+      write: (message) => message[0] !== 1,
+      waitForDrain: () => new Promise<void>((resolve) => { drain = resolve }),
+    })
+    let allowed = true
+    const first = writeStreamMessage(s, frame(1), "first")
+    const second = writeStreamMessage(s, frame(2), "second", () => allowed)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    allowed = false
+    drain()
+    await first
+    expect(await second).toBe(false)
     expect(s.written).toEqual([1])
   })
 
