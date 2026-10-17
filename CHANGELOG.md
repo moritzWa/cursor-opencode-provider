@@ -21,6 +21,7 @@
 - A message Cursor never checkpointed is sent again ahead of the next message on the same conversation. Stopping the turn, or a rebuild from the host's history, drops it. It also survives an OpenCode restart after the failed turn, and repeated failed retries no longer add the same interruption note again each time ([#66](https://github.com/oakimov/cursor-opencode-provider/issues/66))
 - On OpenCode 2, a title or summary request sent while a tool is still running no longer cancels the Cursor Run waiting on that tool
 - While a tool runs, the provider answers Cursor's blob requests and stop requests at once, as Cursor CLI does, instead of after the tool finishes
+- A large request, such as the first one after a restart in a session with screenshots, no longer fails with "backpressure drain failed" when it takes more than 5 s to upload; stopping a turn mid-upload ends it at once ([#75](https://github.com/oakimov/cursor-opencode-provider/issues/75), based on [#77](https://github.com/oakimov/cursor-opencode-provider/pull/77) by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.2] - 2026-10-15
 
