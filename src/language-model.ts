@@ -4414,8 +4414,12 @@ export async function pump(
     if (display?.variant !== "task_tool_call") return undefined
     const requested = opencodePathArg(parsed.args) ?? ""
     const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    const target = resolveReadTargetPath(requested, workspaceRoot)
+    if (!taskToolCallAttachments(session.displayToolCalls.get(displayCallId)).some(
+      (attachment) => resolveReadTargetPath(attachment, workspaceRoot) === target,
+    )) return undefined
     const ok = await writeExecFrames(
-      buildTaskAttachmentReadMessages(parsed.id, resolveReadTargetPath(requested, workspaceRoot), requested),
+      buildTaskAttachmentReadMessages(parsed.id, target, requested),
       `reply to task attachment read id=${parsed.id}`,
     )
     if (!ok) return false
@@ -5319,6 +5323,16 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        // Task prerequisites take precedence over the runtime-file reader:
+        // even a terminal/catalog attachment must keep its Task's display owner.
+        if (session.allowTools && esm.read_args) {
+          const parsedRead = parseExecServerMessage(esm, session.hostToolDialect)
+          if (parsedRead) {
+            const attachmentRead = await answerTaskAttachmentRead(parsedRead, displayCallId)
+            if (attachmentRead === false) return
+            if (attachmentRead) continue
+          }
+        }
         const runtimeMessages = await runtimeExecMessages(esm, session.requestContext, session.allowTools)
         if (runtimeMessages) {
           for (const message of runtimeMessages) {
@@ -5527,10 +5541,6 @@ export async function pump(
             if (finishStepOrContinue({ callId: displayCallId ?? toolCallId })) return
             continue
           }
-          // Not a host read: it needs neither the read tool nor its permission.
-          const attachmentRead = await answerTaskAttachmentRead(parsed, displayCallId)
-          if (attachmentRead === false) return
-          if (attachmentRead) continue
           // Cursor has native capabilities (Task, filesystem, shell, etc.) in
           // addition to the MCP descriptors sent by this provider. The model
           // can request one even when the current OpenCode agent omitted its

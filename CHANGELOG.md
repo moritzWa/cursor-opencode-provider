@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A Cursor Task with attached files hands the subagent the file paths to open itself, keeps Cursor's task title, and no longer reads the attachments into the parent session as an extra step ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82), based on a fix by [@nkoynov](https://github.com/nkoynov))
+- A Cursor Task with attached files hands the subagent exact file paths to open itself, keeps Cursor's description, and avoids extra parent reads, including runtime metadata attachments; unstatable attachments report failure ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82), based on a fix by [@nkoynov](https://github.com/nkoynov))
 - After a restart, a turn that resumes a saved conversation no longer attaches every image in the session's history again, and an image you attach is not sent again as history on the next turn ([#78](https://github.com/oakimov/cursor-opencode-provider/pull/78) by [@nkoynov](https://github.com/nkoynov), [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75))
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
 - Patch conversions preserve blank lines and reject paths or file content they cannot preserve exactly

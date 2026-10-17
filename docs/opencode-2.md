@@ -186,6 +186,14 @@ immediately; running jobs retain their records.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
 
+## Task attachments
+
+Cursor Task attachments reach the native `subagent` prompt as exact, quoted
+file paths, retaining Cursor's description input. The child opens each file
+through its own permission-checked tools; attachment bytes are not read into
+the parent. Choose an image-capable child model for image inspection. See
+[shared subagent routing](../README.md#native-subagent-routing).
+
 ## File editing
 
 OpenCode 2 selects `patch` (input `{ patchText }`) for eligible GPT models and

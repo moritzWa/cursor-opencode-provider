@@ -880,8 +880,20 @@ export function buildTaskAttachmentReadMessages(
   sourcePath: string,
   resultPath = sourcePath,
 ): Uint8Array[] {
-  const rejected = classifyMissingReadTarget(sourcePath)
-  if (rejected) return buildReadRejectionMessages(execId, rejected)
+  // Unlike an ordinary host read, this path has no later executor to surface
+  // stat errors. Never mistake EACCES/ELOOP (or invalid input) for a real file.
+  try {
+    const rejected = classifyReadTargetStat(sourcePath, fs.statSync(sourcePath))
+    if (rejected) return buildReadRejectionMessages(execId, rejected)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    const rejected = code === "ENOENT" || code === "ENOTDIR"
+      ? { file_not_found: { path: sourcePath } }
+      : undefined
+    return buildReadRejectionMessages(execId, rejected ?? {
+      error: { path: resultPath, error: error instanceof Error ? error.message : String(error) },
+    })
+  }
   return [
     encodeMessage("AgentClientMessage", {
       exec_client_message: {
@@ -910,7 +922,7 @@ export function appendTaskAttachments(
 ): void {
   if (parsed.resultField !== "subagent_result" || attachments.length === 0) return
   const prompt = str(parsed.args.prompt) ?? ""
-  const paths = attachments.map((item) => `- ${resolveReadTargetPath(item.trim(), workspaceRoot)}`)
+  const paths = attachments.map((item) => `- ${JSON.stringify(resolveReadTargetPath(item, workspaceRoot))}`)
   parsed.args.prompt = `${prompt}\n\nAttached files (open them with your file tools):\n${paths.join("\n")}`
 }
 
@@ -1961,6 +1973,10 @@ export function classifyMissingReadTarget(
     }
     return undefined
   }
+  return classifyReadTargetStat(absolutePath, stat)
+}
+
+function classifyReadTargetStat(absolutePath: string, stat: fs.Stats): Record<string, unknown> | undefined {
   if (stat.isDirectory()) {
     return { invalid_file: { path: absolutePath, reason: "Path is a directory, not a file" } }
   }
