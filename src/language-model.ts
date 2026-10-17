@@ -3363,10 +3363,14 @@ async function deliverContinuationResultsNow(
         }
         if (frames.length === 0) {
           const images = r.error ? [] : execResultImages(pending.resultField, r.images)
+          // A failed host tool reports one text as both output and error. As in
+          // Cursor CLI, shell stdout carries only what the command printed, so
+          // that text reaches Cursor once, as stderr.
+          const failureText = shellResult !== undefined && r.error !== undefined && r.output === r.error
           frames = buildExecClientMessages({
             execId: r.execId,
             resultField: pending.resultField,
-            output: shellResult?.output ?? r.output,
+            output: failureText ? "" : shellResult?.output ?? r.output,
             error: r.error ?? shellResult?.error,
             refusal: r.refusal,
             interrupted: r.interrupted,

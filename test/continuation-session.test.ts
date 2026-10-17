@@ -682,6 +682,36 @@ describe("deliverContinuationResults", () => {
     expect(live.pending.size).toBe(0)
   })
 
+  // Cursor CLI streams only what the command wrote; a host failure is not stdout.
+  it.each(["shell_stream", "shell_result"])("sends a failed shell call's error once, as stderr, on %s", async (resultField) => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession(`failed-${resultField}`)
+    live.stream.write = frame => { writes.push(frame) }
+    const toolCallId = `cursor_${live.sessionId}_13`
+    const error = "Working directory does not exist: /workspace/nope"
+    // The host projects a failed tool as one error text, as both output and error.
+    const [result] = extractTrailingToolResults([{ role: "tool", content: [{
+      type: "tool-result", toolCallId, toolName: "shell", output: { type: "error-text", value: error },
+    }] }] as LanguageModelV3CallOptions["prompt"])
+    expect(result).toMatchObject({ output: error, error })
+    sessionManager.registerPending(13, live, resultField, "shell", false, { command: "ls", working_directory: "/workspace/nope" })
+    await deliverContinuationResults(live, [{ ...result!, sessionId: live.sessionId, execId: 13 }])
+    const messages = writes.map(frame => decodeMessage<{
+      exec_client_message?: {
+        shell_stream?: { start?: object; stdout?: { data: string }; stderr?: { data: string }; exit?: { code: number } }
+        shell_result?: { failure?: { stdout: string; stderr: string; exit_code: number } }
+      }
+    }>("AgentClientMessage", frame))
+    if (resultField === "shell_stream") {
+      const events = messages.flatMap(message => Object.keys(message.exec_client_message?.shell_stream ?? {}))
+      expect(events).toEqual(["start", "stderr", "exit"])
+      expect(messages[1]?.exec_client_message?.shell_stream?.stderr?.data).toBe(error)
+    } else {
+      expect(messages[0]?.exec_client_message?.shell_result?.failure).toMatchObject({ stdout: "", stderr: error, exit_code: 1 })
+    }
+    expect(live.pending.size).toBe(0)
+  })
+
   it("returns a sanitized OpenCode timeout as Cursor's typed aborted shell exit", async () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("timeout-write")
