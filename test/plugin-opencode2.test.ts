@@ -2,6 +2,7 @@ import { describe, expect, test, beforeEach, afterEach, setSystemTime } from "bu
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { APICallError } from "@ai-sdk/provider"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
 import { sessionActivity } from "../src/activity.js"
@@ -1049,9 +1050,18 @@ describe("opencode2 setup", () => {
       await hooks.get("aisdk.sdk")!(event)
       expect(event.sdk).not.toBe(fallback)
       expect(resolves).toBe(0)
-      await expect(event.sdk.languageModel("m").doStream({
+      const failure: unknown = await event.sdk.languageModel("m").doStream({
         prompt: [{ role: "user", content: [{ type: "text", text: "Respond briefly" }] }],
-      })).rejects.toThrow("synthetic credential unavailable")
+      }).catch((error: unknown) => error)
+      expect(APICallError.isInstance(failure)).toBe(true)
+      if (!APICallError.isInstance(failure)) throw new Error("Expected terminal sign-in failure")
+      expect(failure).toMatchObject({
+        statusCode: 401,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+      expect(failure.message).toContain("synthetic credential capacity_limit")
+      expect(failure.cause).toBeInstanceOf(CursorAuthError)
       expect(resolves).toBe(1)
     } finally {
       await cleanup()

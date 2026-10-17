@@ -305,6 +305,9 @@ These are failure lessons shared by both hosts, not a replacement for
   The IDE's 1272-hour renewal threshold applies to browser sessions; raw keys
   use their own exchange and never stand in for that refresh. An idle expired
   session requires login again (`src/auth.ts`, `test/auth-renewal.test.ts`).
+  Cursor's final error details precede the Connect login code; reading
+  `unauthenticated` first reopened final usage refusals with a renewed token
+  (`test/run-interruption.test.ts`).
 - **Keep secrets out of serializable SDK options.** OpenCode exposes provider
   options. Resolve credentials on demand, persist only unchanged credentials,
   and hash secrets only for private lookup keys (`test/plugin.test.ts`).
@@ -340,6 +343,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Make tests capable of failing.** Type guards once sat outside tsc's include;
   root ignored permission fixtures. Use real usages, deterministic faults and
   independent host/frame evidence (`test/workspace-facts.test.ts`).
+- **Publication checks must stop publication.** A failed history scan did not
+  stop later pushes in the same shell sequence. Require successful exit before
+  publishing, and scan commit bodies and coauthor trailers as well as author /
+  committer identities. A clean file diff alone does not establish privacy.
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
