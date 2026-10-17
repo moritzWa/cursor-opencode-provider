@@ -13,6 +13,7 @@ import { resetTurnStateForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 
 const ORIGIN = "https://agentn.held-run-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -88,6 +89,7 @@ afterEach(() => {
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
+  resetToolRequestsListedSeenForTests()
   runStream = undefined
   received = []
 })

@@ -21,6 +21,7 @@ import { getPersistedConversation, resetConversationPersistenceForTests } from "
 import { resetConversationBindingsForTests, restoreConversationBinding } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests, setCheckpoint } from "../src/protocol/checkpoint.js"
 import { finishEmittedStep, parseTurnProvenance, recordEmittedPart, trackTurnProvenance } from "../src/protocol/turn-provenance.js"
+import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { resetCursorShellCalls } from "../src/shell-timeout.js"
 import { sessionFixture } from "./session-fixture.js"
@@ -167,6 +168,7 @@ afterEach(() => {
   resetConversationPersistenceForTests()
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
+  resetToolRequestsListedSeenForTests()
 })
 
 afterAll(() => rmSync(cacheDir, { recursive: true, force: true }))

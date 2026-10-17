@@ -3,7 +3,7 @@
  * startSession → bidiRunStream → pump against a local HTTP/2 server that plays
  * Cursor's Run endpoint. No network access.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -22,6 +22,7 @@ import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import { resetConversationPersistenceForTests, setConversationPersistenceHookForTests } from "../src/protocol/conversation-persistence.js"
 import { resetTurnProvenanceForTests } from "../src/protocol/turn-provenance.js"
+import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 
 type Prompt = LanguageModelV3CallOptions["prompt"]
 type ClientMessage = Record<string, any>
@@ -108,7 +109,11 @@ function restartProcess(): void {
   resetConversationBindingsForTests()
   resetCheckpointsForTests()
   resetConversationBlobsForTests()
+  resetToolRequestsListedSeenForTests()
 }
+
+// Each test starts as a new process, whatever an earlier test file left behind.
+beforeEach(restartProcess)
 
 afterEach(() => {
   setHostCacheDirOverride(undefined)
