@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test"
 import {
   CURSOR_VARIANT_PARAMETERS_KEY,
   mapAvailableModelsResponse,
+  normalizeModelCache,
   resolveVariantMaxMode,
   resolveVariantParameters,
   type ModelInfo,
@@ -107,6 +108,41 @@ describe("adversarial model selection", () => {
       expect(params).toEqual(max.parameterValues)
       expect(resolveVariantMaxMode(params, { model, maxMode: true })).toBe(true)
     }
+  })
+
+  it("runs every variant in max mode when Cursor reports no non-max support", () => {
+    // Cursor CLI: requiresMaxMode = supportsNonMaxMode === false || variant.isMaxMode.
+    const unmarked = (effort: string, isDefaultNonMaxConfig = false) => ({
+      parameterValues: [{ id: "reasoning_effort", value: effort }], isDefaultNonMaxConfig,
+    })
+    const [model] = mapAvailableModelsResponse({ models: [{ name: "max-only", supportsNonMaxMode: false,
+      variants: [unmarked("low"), unmarked("high", true)] }] })
+    expect(model?.supportsNonMaxMode).toBe(false)
+    expect(normalizeModelCache({ models: [model], fetchedAt: 1 })?.models[0]?.supportsNonMaxMode).toBe(false)
+    const picked = [{ id: "reasoning_effort", value: "low" }]
+    expect(resolveVariantMaxMode(resolveVariantParameters(model, { picked }), { model, picked })).toBe(true)
+    expect(resolveVariantMaxMode(resolveVariantParameters(model), { model })).toBe(true)
+    const [plain] = mapAvailableModelsResponse({ models: [{ name: "plain", supportsNonMaxMode: true,
+      variants: [unmarked("low")] }] })
+    expect(resolveVariantMaxMode(resolveVariantParameters(plain), { model: plain })).toBe(false)
+    expect(() => mapAvailableModelsResponse({ models: [{ name: "bad", supportsNonMaxMode: "no" }] }))
+      .toThrow(/supportsNonMaxMode for bad/)
+  })
+
+  it("retains the declared max effort in a max tier that lacks the declared context", () => {
+    const tiered = (context: string, effort: string, fast: boolean): ModelVariant => ({
+      ...variant(context, effort, fast), isDefaultNonMax: false,
+      isDefaultMax: context === "1m" && effort === "high" && fast,
+    })
+    const model: ModelInfo = { id: "multi-tier", maxContext: 256_000, maxContextForMaxMode: 1_000_000,
+      variants: ["256k", "500k", "1m"].flatMap((context) =>
+        ["low", "high"].flatMap((effort) => [false, true].map((fast) => tiered(context, effort, fast)))) }
+    const catalog = modelsToConfig([model])
+    expect(catalog["multi-tier-500k"].options[CURSOR_VARIANT_PARAMETERS_KEY])
+      .toEqual(variant("500k", "high").parameterValues)
+    // No separate Fast pricing, so the 1m entry holds the declared Fast default.
+    expect(catalog["multi-tier-1m"].options[CURSOR_VARIANT_PARAMETERS_KEY])
+      .toEqual(variant("1m", "high", true).parameterValues)
   })
 
   it("keeps a valid default tuple when the requested effort exists only in max mode", () => {

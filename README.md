@@ -217,6 +217,7 @@ One 20 MiB decoded-byte budget covers all image-bearing pending results in a con
 Cursor IDE has a separate **Max Mode** toggle that sets `requested_model.max_mode` and selects the default max variant. OpenCode has no equivalent custom toggle, so this provider approximates it:
 
 - Selecting a variant that Cursor's model list marks as max mode sets wire `max_mode` to `true`, as Cursor CLI does. That covers `*-1m` models and other max tiers such as Grok 4.7's 500k variants; a variant without the marker falls back to `context=1m`
+- A model Cursor reports as not supporting non-max mode always runs in max mode
 - An explicit `providerOptions.cursor.maxMode` hint without a picked variant also turns it on and selects the declared max default, using its non-Fast twin when available. A tier with only Fast variants remains selectable
 
 There is no independent Max Mode chrome in OpenCode beyond choosing the 1M model / long-context variant.
