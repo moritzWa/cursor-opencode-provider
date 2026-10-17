@@ -163,7 +163,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   (`sent-history-images.ts`; hashes per conversation id + checkpoint SHA-256,
   snapshot fields 16/17). A Run's own images count once its turn ends with
   `turn_ended` on a checkpoint that arrived after them; a failed or stopped
-  turn, or a snapshot without the set, sends them again.
+  turn, or a snapshot without the set, sends them again. Arrival is when the
+  transport received the frame (`frameArrival`), not when a pump read it: the
+  checkpoint after a tool step holds none of that tool result's images.
 - Retention uses persisted application metadata, not filesystem timestamps.
   Hydrate on demand, expire after 24 h, avoid blocking startup/full-cache decode,
   preserve concurrent replacement files, and keep soft-evicted state reusable.

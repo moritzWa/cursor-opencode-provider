@@ -21,6 +21,8 @@ import {
 import {
   bidiRunStream,
   CursorRunInterruptedError,
+  frameArrival,
+  lastFrameArrival,
   normalizeAgentRunOrigin,
   type BidiStream,
 } from "./transport/connect.js"
@@ -755,9 +757,15 @@ export function promptIdentityWouldRemint(
   return false
 }
 
-function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array): void {
+function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {
   if (!session.historyImages || !session.openCodeSessionId) return
-  noteHistoryImageCheckpoint(session.historyImages, session.openCodeSessionId, session.conversationId, checkpoint)
+  noteHistoryImageCheckpoint(
+    session.historyImages,
+    session.openCodeSessionId,
+    session.conversationId,
+    checkpoint,
+    frameArrival(frame),
+  )
 }
 
 /** `resumeCheckpoint` is set only by a checkpoint this Run received. */
@@ -1961,7 +1969,7 @@ async function startSession(
   })
   userTurnHostNotes.sent()
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
-  if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes)
+  if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes, lastFrameArrival())
 
   const hostToolDialect = hostToolDialectFromTools(tools, options.defaultDialect)
   trace(
@@ -2810,7 +2818,7 @@ export async function drainSessionUntilTurnEnded(
           noteCheckpoint(session.openCodeSessionId, bytes)
           session.resumeCheckpoint = Uint8Array.from(bytes)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
-          noteRunImageCheckpoint(session, bytes)
+          noteRunImageCheckpoint(session, bytes, frame)
           const tokenDetails = decodeConversationTokenDetails(bytes)
           if (tokenDetails) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
@@ -3319,7 +3327,7 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
-    if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes)
+    if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
       const normalized = deliveredSwitchMode.target.toLowerCase()
       setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
@@ -4829,7 +4837,7 @@ export async function pump(
         noteCheckpoint(session.openCodeSessionId, bytes)
         session.resumeCheckpoint = Uint8Array.from(bytes)
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
-        noteRunImageCheckpoint(session, bytes)
+        noteRunImageCheckpoint(session, bytes, frame)
         const tokenDetails = decodeConversationTokenDetails(bytes)
         if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
