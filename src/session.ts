@@ -277,6 +277,12 @@ export type CursorSession = {
    */
   pushbackFrame?: Frame
   /**
+   * Frames the held-Run reader took while the host ran tools and the next pump
+   * must see, in arrival order. They follow `pushbackFrame` and precede any
+   * unread frame.
+   */
+  heldFrames?: Frame[]
+  /**
    * In-progress parallel tool-call step (field 27 hold). Cleared when the step
    * finishes; added to priorParallelStepCallIds for late-completion filtering.
    */
@@ -831,6 +837,7 @@ export class SessionManager {
     session.frames = next.frames()[Symbol.asyncIterator]()
     session.pendingFrameRead = undefined
     session.pushbackFrame = undefined
+    session.heldFrames = undefined
     session.parallelStep = undefined
     session.priorParallelStepCallIds = undefined
     this.subscribeTerminal(session)
@@ -883,6 +890,7 @@ export class SessionManager {
     session.pending.clear()
     session.pendingFrameRead = undefined
     session.pushbackFrame = undefined
+    session.heldFrames = undefined
     session.parallelStep = undefined
     session.priorParallelStepCallIds = undefined
     session.pumpOwner = null
@@ -1078,6 +1086,8 @@ export async function readSessionFrame(
     session.pushbackFrame = undefined
     return { done: false, value }
   }
+  const held = session.heldFrames?.shift()
+  if (held) return { done: false, value: held }
   const pending = session.pendingFrameRead ??= session.frames.next()
   // A timed-out read can reject while no pump is consuming it. Preserve the
   // rejection for the next reader without an unhandled detached promise.

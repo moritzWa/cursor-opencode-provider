@@ -2366,24 +2366,37 @@ function heldControlFrame(frame: Frame): HeldControlFrame | undefined {
 }
 
 const heldRunReaders = new WeakSet<CursorSession>()
+/** Unread frames then wait for the pump, under HTTP/2 flow control, as before the reader. */
+const MAX_HELD_FRAMES = 1_000
 
 function isHeldRunIdle(session: CursorSession, frames: CursorSession["frames"]): boolean {
   return !session.closed
     && !session.hostInterrupted
     && !sessionManager.isActivelyPumping(session)
     && session.pending.size > 0
-    && !session.pushbackFrame
     && session.frames === frames
+    && (session.heldFrames?.length ?? 0) < MAX_HELD_FRAMES
+}
+
+/** An abort the reader may apply now: its exec is registered and still waits on the host. */
+function abortsPendingExec(session: CursorSession, control: Record<string, unknown>): boolean {
+  const id = (control.abort as Record<string, unknown> | undefined)?.id
+  const pending = typeof id === "number" ? session.pending.get(id) : undefined
+  return !!pending && isOwedCursorExec(pending) && pending.state === "pending" && !pending.aborted
 }
 
 /**
- * While the host runs a step's tools nothing pumps the Run, but Cursor can
- * still write a KV blob or abort an exec. Cursor CLI's single reader handles
- * those at once, and an unanswered KV write can hold Cursor's side of the
- * stream until the tool finishes. Take only those (and server heartbeats) from
- * the shared read. The first other frame stays in `pendingFrameRead`, so the
- * next pump reads it first; a pump that starts meanwhile awaits the same read
- * and this reader leaves it alone.
+ * While the host runs a step's tools nothing pumps the Run, but Cursor keeps
+ * writing: right after a step it sends `tool_requests_listed` or a checkpoint,
+ * then KV blob writes, and it may abort an exec. Cursor CLI's single reader
+ * handles KV and exec control on their own channels at once; an unanswered KV
+ * write left Cursor waiting until the tool finished (seen live). Answer KV,
+ * apply an abort for an exec still waiting on the host, and skip heartbeats;
+ * queue every other frame in `heldFrames`, in arrival order, for the next pump.
+ * An abort whose exec request is still queued stays queued behind it.
+ *
+ * The reader peeks the shared `pendingFrameRead`: a pump that starts meanwhile
+ * awaits the same read, and the reader leaves that frame to it.
  */
 export function readHeldRun(session: CursorSession): void {
   const frames = session.frames
@@ -2400,24 +2413,17 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
     try {
       result = await read
     } catch {
-      return // the next pump reads the same rejection
+      return // the next pump reads the same rejection, after the queued frames
     }
+    // A pump started meanwhile reads this frame itself; an ended stream stays for it too.
     if (!isHeldRunIdle(session, frames) || session.pendingFrameRead !== read || result.done) return
-    const held = heldControlFrame(result.value)
-    const kvReply = held?.kind === "kv" ? handleKvServerMessage(held.kv, session) : undefined
-    // A KV request this client cannot answer fails the Run in the pump, which reads it next.
-    if (!held || (held.kind === "kv" && !kvReply)) {
-      trace(`held Run: leaving a frame for the next pump sessionId=${session.sessionId}`)
-      return
-    }
     session.pendingFrameRead = undefined
     sessionManager.recordSemanticProgress(session)
-    if (held.kind === "exec-control") {
-      applyExecControl(session, held.control, "held")
-      if (![...session.pending.values()].some((pending) => isOwedCursorExec(pending) && !pending.aborted)) {
-        trace(`held Run: Cursor aborted every exec it was waiting on sessionId=${session.sessionId}`)
-      }
-    } else if (kvReply) {
+    const frame = result.value
+    const held = heldControlFrame(frame)
+    const kvReply = held?.kind === "kv" ? handleKvServerMessage(held.kv, session) : undefined
+    if (held?.kind === "heartbeat") continue
+    if (kvReply) {
       try {
         await writeWithBackpressure(session.stream, kvReply.reply, `held KV ${kvReply.kind}_blob reply id=${kvReply.id}`)
         trace(`held Run: answered KV ${kvReply.kind} id=${kvReply.id} sessionId=${session.sessionId}`)
@@ -2429,7 +2435,20 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
         }))
         return
       }
+      continue
     }
+    if (held?.kind === "exec-control" && abortsPendingExec(session, held.control)) {
+      applyExecControl(session, held.control, "held")
+      if (![...session.pending.values()].some((pending) => isOwedCursorExec(pending) && !pending.aborted)) {
+        trace(`held Run: Cursor aborted every exec it was waiting on sessionId=${session.sessionId}`)
+      }
+      continue
+    }
+    // Everything else, a KV request this client cannot answer included (the
+    // pump fails the Run on it), waits for the next pump in order.
+    ;(session.heldFrames ??= []).push(frame)
+    trace(`held Run: queued a frame for the next pump queued=${session.heldFrames.length} sessionId=${session.sessionId}`)
+    if (frame.flags & 0x02) return
   }
 }
 

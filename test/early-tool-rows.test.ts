@@ -168,7 +168,13 @@ describe("early edit rows", () => {
       call_id: "task-1",
       tool_call: { task_tool_call: { args: { description: "look" } } },
     })).toBeUndefined()
-    expect(earlyRowToolCallId("sess", "call")).toBe("cursor-early_sess_call")
+    // Cursor call ids can hold a newline (seen live with grok-4.7); the row id stays opaque and bounded.
+    const liveCallId = "call-4e1f2d3b-b444-4c6f-8ee9-02b61bd2da60-0\nfc_05d8d1a5-117d-961c-95f3-ed00349cd3e3_0"
+    const id = earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", liveCallId)
+    expect(id).toMatch(/^cursor-early_2e64e80f-746e-413e-a3f2-27a0b7645ad8_[0-9a-f]{12}$/)
+    expect(id.length).toBeLessThanOrEqual(64)
+    expect(earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", liveCallId)).toBe(id)
+    expect(earlyRowToolCallId("2e64e80f-746e-413e-a3f2-27a0b7645ad8", "other")).not.toBe(id)
     expect(parseEarlyRowToolCallId(earlyRowToolCallId("sess", "toolu_01_x")))
       .toEqual({ sessionId: "sess", execId: UNBOUND_EXEC_ID })
     expect(parseEarlyRowToolCallId("cursor_sess_4")).toBeUndefined()
@@ -274,6 +280,34 @@ describe("early edit rows", () => {
     expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: "write" })
     expect(calls[0].providerExecuted).toBeUndefined()
     sessionManager.resolve(session.sessionId, 5)
+  })
+
+  it("closes the row when the announced call's exec becomes another tool", async () => {
+    const workspace = tempDir()
+    const outside = path.join(tempDir(), "outside.txt")
+    fs.writeFileSync(outside, "one\n")
+    const callId = "edit-outside"
+    const { session, parts } = pumpSession([
+      partial(callId, outside),
+      // Outside the workspace, the edit's private read goes through the host's permission-aware read.
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 3, read_args: { path: outside, tool_call_id: callId } },
+      }),
+    ], [
+      { name: "read", description: "Read" },
+      { name: "edit", description: "Edit" },
+    ])
+    session.requestContext.env = { workspace_paths: [workspace] }
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
+    const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(start?.toolName).toBe("edit")
+    expect(closed?.toolCallId).toBe(start?.id)
+    expect(read?.toolName).toBe("read")
+    expect(read?.toolCallId.startsWith("cursor_")).toBe(true)
+    sessionManager.resolve(session.sessionId, 3)
   })
 
   it("closes the row when the exec is a different tool", async () => {

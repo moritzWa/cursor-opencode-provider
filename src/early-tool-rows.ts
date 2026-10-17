@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 /** Shown when an announced edit never becomes a host tool call. */
 export const EARLY_ROW_CLOSED = "Cursor did not finish this tool call."
 
@@ -13,9 +15,12 @@ const EARLY_ROW_PREFIX = "cursor-early_"
 /**
  * Does not match `cursor_<session>_<execId>`. Continuation finds a bound row
  * through the session route table; a row that was closed never gets a route.
+ * Cursor's call id is digested, not embedded: it can hold a newline and run to
+ * ~90 characters, and the host keeps this id in history for every provider.
  */
 export function earlyRowToolCallId(sessionId: string, cursorCallId: string): string {
-  return `${EARLY_ROW_PREFIX}${sessionId}_${cursorCallId}`
+  const digest = createHash("sha256").update(cursorCallId).digest("hex").slice(0, 12)
+  return `${EARLY_ROW_PREFIX}${sessionId}_${digest}`
 }
 
 /** No exec has this id: the result is this provider's, but its exec is unknown. */

@@ -123,7 +123,10 @@ describe("a Run held on a host tool", () => {
       const call = first.find((part) => part.type === "tool-call")!
       expect(call.toolName).toBe("bash")
 
-      // The host is still running the tool; Cursor writes a blob meanwhile.
+      // The host is still running the tool. As seen live, Cursor first lists the call
+      // and checkpoints, then writes blobs.
+      send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+      send({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x00]) })
       send({ interaction_update: { heartbeat: {} } })
       send({ kv_server_message: { id: 5, set_blob_args: { blob_id: new Uint8Array(32).fill(5), blob_data: Uint8Array.from([9]) } } })
       await wait(100)

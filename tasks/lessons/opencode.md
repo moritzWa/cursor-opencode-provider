@@ -84,8 +84,10 @@ These are failure lessons shared by both hosts, not a replacement for
   (`test/parallel-pump.test.ts`).
 - **A held Run is still a live stream.** Nothing read it while host tools ran,
   so a KV write waited for the tool and an abort arrived after the late result.
-  Read only control frames from the shared read and leave the first other frame
-  there for the pump (`readHeldRun`, `test/held-run-run.test.ts`).
+  Stopping at the first other frame was not enough: Cursor sends
+  `tool_requests_listed` or a checkpoint right after a step, ahead of its KV
+  writes. Handle KV and aborts at once and queue the rest in order
+  (`readHeldRun`, `test/held-run-reader.test.ts`).
 - **Backpressure belongs to every response-required write.** KV replies filled
   the stream before an awaited heartbeat exposed it. Serialize writes, label the
   failing operation, and do not replay ambiguous buffered delivery

@@ -1,20 +1,28 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { readHeldRun } from "../src/language-model.js"
+import { attachSessionHeartbeat, readHeldRun } from "../src/language-model.js"
 import { readSessionFrame, SessionManager, sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { sessionFixture } from "./session-fixture.js"
 
 afterEach(() => sessionManager.dispose())
 
 /** A Run whose inbound frames arrive only when the test sends them. */
-function heldRun(register = true): { session: CursorSession; send: (message: Record<string, unknown>) => void; written: Array<Record<string, any>> } {
+type HeldRun = {
+  session: CursorSession
+  send: (message: Record<string, unknown>) => void
+  sendRaw: (frame: Frame) => void
+  fail: (error: Error) => void
+  written: Array<Record<string, any>>
+}
+
+function heldRun(register = true, options: { failWrites?: boolean } = {}): HeldRun {
   const queued: Frame[] = []
-  const waiting: Array<(result: IteratorResult<Frame>) => void> = []
+  const waiting: Array<{ resolve: (result: IteratorResult<Frame>) => void; reject: (error: Error) => void }> = []
   const frames: AsyncIterator<Frame> = {
     next: () => {
       const frame = queued.shift()
       if (frame) return Promise.resolve({ done: false, value: frame })
-      return new Promise((resolve) => waiting.push(resolve))
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }))
     },
   }
   const written: Array<Record<string, any>> = []
@@ -23,6 +31,7 @@ function heldRun(register = true): { session: CursorSession; send: (message: Rec
     conversationId: `conv-held-${Math.random().toString(16).slice(2)}`,
     stream: {
       write(bytes: Uint8Array) {
+        if (options.failWrites) throw new Error("stream reset")
         written.push(decodeMessage<Record<string, any>>("AgentClientMessage", bytes))
         return true
       },
@@ -46,13 +55,14 @@ function heldRun(register = true): { session: CursorSession; send: (message: Rec
     closed: false,
   })
   if (register) sessionManager.registerSession(session)
-  const send = (message: Record<string, unknown>) => {
-    const frame = { flags: 0, payload: encodeMessage("AgentServerMessage", message) }
-    const resolve = waiting.shift()
-    if (resolve) resolve({ done: false, value: frame })
+  const sendRaw = (frame: Frame) => {
+    const waiter = waiting.shift()
+    if (waiter) waiter.resolve({ done: false, value: frame })
     else queued.push(frame)
   }
-  return { session, send, written }
+  const send = (message: Record<string, unknown>) => sendRaw({ flags: 0, payload: encodeMessage("AgentServerMessage", message) })
+  const fail = (error: Error) => waiting.shift()?.reject(error)
+  return { session, send, sendRaw, fail, written }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
@@ -62,11 +72,14 @@ const kvSet = (id: number) => ({
 const heartbeat = { interaction_update: { heartbeat: {} } }
 
 describe("held Run reader", () => {
-  it("answers KV and applies an abort while the host runs the tool, then leaves the next frame for the pump", async () => {
+  it("answers KV and applies an abort while the host runs the tool, queuing other frames in order", async () => {
     const { session, send, written } = heldRun()
     sessionManager.registerPending(0, session, "shell_result", "bash", false)
     readHeldRun(session)
 
+    // What Cursor sent live right after a step: the call count and a checkpoint, then KV writes.
+    send({ interaction_update: { tool_requests_listed: { call_count: 1 } } })
+    send({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x00]) })
     send(heartbeat)
     send(kvSet(7))
     await settle()
@@ -75,20 +88,37 @@ describe("held Run reader", () => {
 
     // Exec 0 is the first exec of a Run; its id is absent on the wire.
     send({ exec_server_control_message: { abort: { id: 0 } } })
-    await settle()
-    expect(session.pending.get(0)?.aborted).toBe(true)
-
     send({ interaction_update: { text_delta: { text: "after the abort" } } })
     send(kvSet(8))
     await settle()
-    // The reader stopped at the text: the KV request behind it waits for the pump, in order.
-    expect(written).toHaveLength(1)
-    const next = await readSessionFrame(session)
-    expect(next.done).toBe(false)
-    const text = decodeMessage<Record<string, any>>("AgentServerMessage", (next.value as Frame).payload)
-    expect(text.interaction_update.text_delta.text).toBe("after the abort")
-    const after = await readSessionFrame(session)
-    expect(decodeMessage<Record<string, any>>("AgentServerMessage", (after.value as Frame).payload).kv_server_message.id).toBe(8)
+    expect(session.pending.get(0)?.aborted).toBe(true)
+    expect(written.map((message) => message.kv_client_message?.id)).toEqual([7, 8])
+
+    // The pump then reads exactly the frames the reader did not handle, in arrival order.
+    const order: string[] = []
+    for (let index = 0; index < 3; index++) {
+      const next = await readSessionFrame(session)
+      const asm = decodeMessage<Record<string, any>>("AgentServerMessage", (next.value as Frame).payload)
+      order.push(asm.interaction_update?.tool_requests_listed ? "listed"
+        : asm.conversation_checkpoint_update?.length ? "checkpoint"
+        : asm.interaction_update?.text_delta?.text ?? "?")
+    }
+    expect(order).toEqual(["listed", "checkpoint", "after the abort"])
+    expect(session.heldFrames).toEqual([])
+  })
+
+  it("keeps an abort behind the exec request it refers to", async () => {
+    const { session, send } = heldRun()
+    sessionManager.registerPending(0, session, "shell_result", "bash", false)
+    readHeldRun(session)
+    send({ exec_server_message: { id: 1, read_args: { path: "/tmp/x", tool_call_id: "call-read" } } })
+    send({ exec_server_control_message: { abort: { id: 1 } } })
+    await settle()
+    expect(session.pending.has(1)).toBe(false)
+    const first = decodeMessage<Record<string, any>>("AgentServerMessage", ((await readSessionFrame(session)).value as Frame).payload)
+    const second = decodeMessage<Record<string, any>>("AgentServerMessage", ((await readSessionFrame(session)).value as Frame).payload)
+    expect(first.exec_server_message?.id).toBe(1)
+    expect(second.exec_server_control_message?.abort?.id).toBe(1)
   })
 
   it("leaves a frame to a pump that started while the reader waited", async () => {
@@ -107,7 +137,7 @@ describe("held Run reader", () => {
     sessionManager.endPump(session, owner)
   })
 
-  it("does not read a Run that owes nothing, is pumping, or has a frame pushed back", async () => {
+  it("does not read a Run that owes nothing, and keeps a pushed-back frame first", async () => {
     const idle = heldRun()
     readHeldRun(idle.session)
     idle.send(kvSet(1))
@@ -116,12 +146,82 @@ describe("held Run reader", () => {
 
     const pushed = heldRun()
     sessionManager.registerPending(2, pushed.session, "read_result", "read", false)
-    pushed.session.pushbackFrame = { flags: 0, payload: encodeMessage("AgentServerMessage", heartbeat) }
+    pushed.session.pushbackFrame = {
+      flags: 0,
+      payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+    }
     readHeldRun(pushed.session)
-    pushed.send(kvSet(2))
+    pushed.send({ interaction_update: { text_delta: { text: "later" } } })
     await settle()
-    expect(pushed.written).toHaveLength(0)
+    const first = decodeMessage<Record<string, any>>("AgentServerMessage", ((await readSessionFrame(pushed.session)).value as Frame).payload)
+    const second = decodeMessage<Record<string, any>>("AgentServerMessage", ((await readSessionFrame(pushed.session)).value as Frame).payload)
+    expect(first.interaction_update?.turn_ended).toBeDefined()
+    expect(second.interaction_update?.text_delta?.text).toBe("later")
   })
+
+  it("closes the Run when a KV reply cannot be written", async () => {
+    const { session, send } = heldRun(true, { failWrites: true })
+    sessionManager.registerPending(0, session, "read_result", "read", false)
+    readHeldRun(session)
+    send(kvSet(3))
+    await settle()
+    expect(session.closed).toBe(true)
+    expect(session.closeError?.message).toBe("Cursor held KV set_blob reply id=3 write failed")
+  })
+
+  it("queues frames it cannot decode and stops at the end of the stream", async () => {
+    const { session, send, sendRaw, written } = heldRun()
+    sessionManager.registerPending(0, session, "read_result", "read", false)
+    readHeldRun(session)
+    const corruptGzip = { flags: 0x01, payload: Uint8Array.from([1, 2, 3]) }
+    // One top-level KV field whose body is not a KvServerMessage.
+    const undecodableKv = { flags: 0, payload: Uint8Array.from([0x22, 0x02, 0x08, 0xff]) }
+    const end = { flags: 0x02, payload: new TextEncoder().encode(JSON.stringify({ error: { code: "canceled" } })) }
+    sendRaw(corruptGzip)
+    sendRaw(undecodableKv)
+    sendRaw(end)
+    send(kvSet(4))
+    await settle()
+    expect(session.heldFrames).toEqual([corruptGzip, undecodableKv, end])
+    // Nothing past the end of the stream is read.
+    expect(written).toHaveLength(0)
+  })
+
+  it("stops reading once 1,000 frames wait for the pump", async () => {
+    const { session, send, written } = heldRun()
+    sessionManager.registerPending(0, session, "read_result", "read", false)
+    readHeldRun(session)
+    for (let index = 0; index < 1_000; index++) send({ interaction_update: { text_delta: { text: `${index}` } } })
+    send(kvSet(6))
+    await settle()
+    expect(session.heldFrames).toHaveLength(1_000)
+    // Beyond the bound, unread frames wait under HTTP/2 flow control as before.
+    expect(written).toHaveLength(0)
+  })
+
+  it("leaves a failed read to the next pump", async () => {
+    const { session, fail } = heldRun()
+    sessionManager.registerPending(0, session, "read_result", "read", false)
+    readHeldRun(session)
+    await settle()
+    fail(new Error("stream broke"))
+    await settle()
+    await expect(readSessionFrame(session)).rejects.toThrow("stream broke")
+  })
+
+  it("keeps the Run when an exec heartbeat cannot be written", async () => {
+    const { session } = heldRun(true, { failWrites: true })
+    session.policy = { ...session.policy, heartbeatMs: 60_000, semanticIdleMs: 120_000 }
+    sessionManager.registerPending(0, session, "shell_result", "bash", false)
+    attachSessionHeartbeat(session)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 3_300))
+      // The session heartbeat owns closing a broken stream, as in Cursor CLI.
+      expect(session.closed).toBe(false)
+    } finally {
+      session.heartbeatCancel?.()
+    }
+  }, 10_000)
 
   it("does not let an exec Cursor aborted keep its Run from the open-session cap", () => {
     const manager = new SessionManager({ maxOpenSessions: 1 })
