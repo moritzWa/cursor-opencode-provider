@@ -25,6 +25,8 @@
 - A large request, such as the first one after a restart in a session with screenshots, no longer fails with "backpressure drain failed" when it takes more than 5 s to upload; stopping a turn also cancels initial, tool-result, and replacement uploads at once ([#75](https://github.com/oakimov/cursor-opencode-provider/issues/75), based on [#77](https://github.com/oakimov/cursor-opencode-provider/pull/77) by [@nkoynov](https://github.com/nkoynov))
 - A headless process now exits after its last Cursor Run instead of hanging on the idle cached HTTP/2 connection ([#88](https://github.com/oakimov/cursor-opencode-provider/pull/88) by [@willowite](https://github.com/willowite), [#87](https://github.com/oakimov/cursor-opencode-provider/issues/87))
 - A new Run no longer fails at its start with `NGHTTP2_ENHANCE_YOUR_CALM` while other Runs on the same connection are still uploading large requests, and on Node a single large request no longer fails the same way on a slow uplink ([#76](https://github.com/oakimov/cursor-opencode-provider/issues/76), based on [#79](https://github.com/oakimov/cursor-opencode-provider/pull/79) by [@nkoynov](https://github.com/nkoynov))
+- Unsupported effort hints keep an advertised default tuple, and model discovery and explicit selections reject duplicate parameter ids
+- A configured reasoning effort now reaches models whose Cursor parameter is `reasoning_effort` (Grok 4.7, Gemini 3.8 Flash, Gemini 4 Argon); before, only models with an `effort` or `reasoning` parameter honored it and the others always ran Cursor's default variant ([#84](https://github.com/oakimov/cursor-opencode-provider/pull/84) by [@willowite](https://github.com/willowite))
 
 ## [0.8.2] - 2026-10-15
 

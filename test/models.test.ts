@@ -865,6 +865,35 @@ describe("cacheFilePath", () => {
   })
 })
 
+describe("resolveVariantParameters (reasoning_effort models)", () => {
+  const argon: Parameters<typeof resolveVariantParameters>[0] = {
+    id: "gemini-4-argon",
+    maxContext: 1_000_000,
+    maxContextForMaxMode: 1_000_000,
+    variants: [
+      { key: "argon", displayName: "Argon Low", isDefaultNonMax: false, isDefaultMax: false,
+        parameterValues: [{ id: "reasoning_effort", value: "low" }] },
+      { key: "argon", displayName: "Argon Medium", isDefaultNonMax: true, isDefaultMax: true,
+        parameterValues: [{ id: "reasoning_effort", value: "medium" }] },
+      { key: "argon", displayName: "Argon High", isDefaultNonMax: false, isDefaultMax: false,
+        parameterValues: [{ id: "reasoning_effort", value: "high" }] },
+    ],
+  }
+
+  it("honors a reasoning effort hint when the parameter id is reasoning_effort", () => {
+    expect(resolveVariantParameters(argon, { reasoningEffort: "high" })).toEqual([
+      { id: "reasoning_effort", value: "high" },
+    ])
+    expect(resolveVariantParameters(argon, { reasoningEffort: "low" })).toEqual([
+      { id: "reasoning_effort", value: "low" },
+    ])
+  })
+
+  it("keeps the default variant when no effort hint is given", () => {
+    expect(resolveVariantParameters(argon)).toEqual([{ id: "reasoning_effort", value: "medium" }])
+  })
+})
+
 describe("resolveVariantParameters (picked variant + max mode)", () => {
   // Mirrors the real Cursor shape: one model, 4 effort × 2 fast × 2 context
   // = 8 variants, with one isDefaultNonMax and one isDefaultMax.
