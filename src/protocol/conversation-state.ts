@@ -1,4 +1,6 @@
 import { trace } from "../debug.js"
+import { restoreEarlySteers, serializeEarlySteers } from "../host-steer.js"
+import { restoreLostRequest, serializeLostRequest } from "../lost-request.js"
 import {
   getFrozenRequestContext,
   setFrozenRequestContext,
@@ -20,6 +22,7 @@ import {
   restoreTurnProvenance,
   serializeTurnProvenance,
 } from "./turn-provenance.js"
+import { heldHistoryImagesSnapshot, restoreHeldHistoryImages } from "./sent-history-images.js"
 import {
   deletePersistedConversation,
   getPersistedTurnProvenance,
@@ -51,15 +54,21 @@ export async function hydrateConversationState(
   }
 
   restoreConversationBinding(sessionKey, persisted.conversationId)
+  restoreEarlySteers(sessionKey, persisted.earlySteers)
+  restoreLostRequest(sessionKey, persisted.lostRequest)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
   const provenance = persisted.turnProvenance ? parseTurnProvenance(persisted.turnProvenance) : undefined
   if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
+  restoreHeldHistoryImages(sessionKey, persisted.conversationId, {
+    checkpoint: persisted.sentImagesCheckpoint,
+    hashes: persisted.sentImageHashes,
+  })
   trace(
     `conversation persistence: restored sessionKey=${sessionKey} ` +
       `conversationId=${persisted.conversationId} checkpoint=${persisted.checkpoint?.length ?? 0}B ` +
-      `blobs=${persisted.blobs.length}`,
+      `blobs=${persisted.blobs.length} heldImages=${persisted.sentImageHashes?.length ?? 0}`,
   )
   return {
     conversationId: persisted.conversationId,
@@ -115,6 +124,7 @@ export async function persistConversationState(
   const blobs = blobCompaction.blobs
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
   const provenance = getTurnProvenance(input.sessionKey)
+  const heldImages = heldHistoryImagesSnapshot(input.sessionKey, input.conversationId, checkpoint)
   await persistConversation(cacheDir, {
     sessionKey: input.sessionKey,
     conversationId: input.conversationId,
@@ -126,6 +136,9 @@ export async function persistConversationState(
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
     hostNote: input.hostNote,
+    earlySteers: serializeEarlySteers(input.sessionKey),
+    lostRequest: serializeLostRequest(input.sessionKey),
+    ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),
