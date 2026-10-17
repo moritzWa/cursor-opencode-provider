@@ -364,6 +364,15 @@ const CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_SESSION_PING_TIMEOUT_MS = 5_000
 const DEFAULT_READ_IDLE_MS = 120_000
 export const HTTP2_SESSION_MAX_AGE_MS = 15 * 60_000
+// Every Run shares one session per origin. Node and Bun count its unsent bytes
+// against maxSessionMemory (10 MB by default) and, once over it, fail every new
+// stream with ENHANCE_YOUR_CALM (Bun before sending it, Node by refusing its
+// response headers); Node also fails a single write over it while the uplink
+// holds the bytes back. Run requests and KV replies run to many megabytes, and
+// the provider holds those bytes anyway, so the limit only adds a failure.
+// 256 MB clears the 100 MiB checkpoint transfer budget with room to spare.
+// Cursor CLI's transport sets no maxSessionMemory, so it keeps the default (#76).
+const RUN_SESSION_OPTIONS = { maxSessionMemory: 256 } satisfies http2.ClientSessionOptions
 
 export function shouldReuseHttp2Session(
   state: { destroyed: boolean; closed: boolean },
@@ -655,10 +664,11 @@ function connectSession(origin: string): Promise<http2.ClientHttp2Session> {
           }
           tunnelSocket = tlsSocket
           session = http2.connect(origin, {
+            ...RUN_SESSION_OPTIONS,
             createConnection: () => tlsSocket,
           })
         } else {
-          session = http2.connect(origin)
+          session = http2.connect(origin, RUN_SESSION_OPTIONS)
         }
         if (settled) {
           try { session.destroy() } catch { /* ignore */ }
