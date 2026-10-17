@@ -233,11 +233,14 @@ export function slugifyWorkspacePath(workspaceRoot: string): string {
 export function opencodeProjectDir(workspaceRoot: string): string {
   const projectsRoot = path.join(opencodeGlobalCacheDir(), "projects")
   const slug = slugifyWorkspacePath(workspaceRoot)
-  let dir = path.join(projectsRoot, slug)
-  // Mirror Cursor's long-path guard so nested agent-tools paths stay usable.
+  const dir = path.join(projectsRoot, slug)
+  // Keep nested agent-tools paths short. Only the slug is cut, so the folder
+  // stays inside the cache root even when that root is long; below 83
+  // characters this is the same name the whole-path cut produced.
   if (dir.length > 92) {
     const hash = createHash("sha256").update(dir).digest("hex").slice(0, 7)
-    dir = `${dir.slice(0, Math.min(84, dir.length))}-${hash}`
+    const head = slug.slice(0, Math.max(0, 84 - projectsRoot.length - 1))
+    return path.join(projectsRoot, head ? `${head}-${hash}` : hash)
   }
   return dir
 }

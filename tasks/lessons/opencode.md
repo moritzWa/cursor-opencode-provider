@@ -371,6 +371,12 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
+- **A removed temp dir can come back.** Tests left about 200 TMPDIR entries per
+  run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
+  cutting the whole project-folder path put it outside a long cache root;
+  background spawns kept their logs and children; a stop's save and terminal
+  supervisors wrote after the `finally`/`afterEach` removal. Wait for the
+  writers, then remove; `test/preload.ts` fails any run that leaves an entry.
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
   tests need an init reaper. Strip temporary module copies from coverage and
   include Bun editor types (`scripts/strip-copied-coverage.ts`).

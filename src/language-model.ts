@@ -2726,6 +2726,11 @@ const hostInterrupts = new Map<string, { at: number; reason: string }>()
 /** Cancels still draining; a shutdown or the next turn waits for them so their final save is not cut off. */
 const cancelsInFlight = new Map<CursorSession, Promise<void>>()
 
+/** Test helper: wait for host-interrupt cancels, including their final saves. */
+export async function settleHostInterruptsForTests(): Promise<void> {
+  await Promise.all([...cancelsInFlight.values()])
+}
+
 function cancelForHostInterrupt(session: CursorSession, reason: string): void {
   void cancelRunForHostInterrupt(session, reason)
 }

@@ -17,6 +17,7 @@ import { resetConversationPersistenceForTests } from "../src/protocol/conversati
 import { sessionFixture } from "./session-fixture.js"
 import { sessionManager, type Frame } from "../src/session.js"
 import { prepareCursorShellArgs, cursorShellEnvForCall, captureCursorShellResult, captureCursorShellFailure, resetCursorShellCalls, setCursorShellPath } from "../src/shell-timeout.js"
+import { stopProcessesUsing } from "./process-cleanup.js"
 
 let root: string
 let workspace: string
@@ -29,7 +30,7 @@ beforeEach(() => {
   setHostCacheDirOverride(path.join(root, "cache"))
   resetToolRequestsListedSeenForTests()
 })
-afterEach(() => {
+afterEach(async () => {
   sessionManager.dispose()
   resetTurnStateForTests()
   resetFrozenRequestContextsForTests()
@@ -38,6 +39,8 @@ afterEach(() => {
   resetCursorShellCalls()
   resetToolRequestsListedSeenForTests()
   setHostCacheDirOverride(oldCache)
+  // A managed terminal's supervisor can still write its job files.
+  await stopProcessesUsing(root)
   fs.rmSync(root, { recursive: true, force: true })
 })
 const frame = (message: Record<string, unknown>): Frame => ({ flags: 0, payload: encodeMessage("AgentServerMessage", message) })

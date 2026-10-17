@@ -26,6 +26,7 @@ import {
   setCursorShellPath,
   shellPolicyFromMetadata,
 } from "../src/shell-timeout.js"
+import { reapBackgroundSpawn } from "./background-spawn.js"
 
 afterEach(() => resetCursorShellCalls())
 
@@ -367,6 +368,7 @@ describe("Cursor shell timeout translation", () => {
     const stdout = result.stdout.toString()
     expect(stdout.includes("SHOULD_NOT_RUN")).toBe(false)
     expect(stdout).toContain("__CURSOR_BACKGROUND_SHELL__")
+    reapBackgroundSpawn(stdout)
     releaseCursorShellEnv(id)
   })
 
@@ -492,6 +494,7 @@ describe("Cursor shell timeout translation", () => {
       stderr: "pipe",
     })
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
+    reapBackgroundSpawn(result.stdout.toString())
     releaseCursorShellEnv(id)
   })
 })

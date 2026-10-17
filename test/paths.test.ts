@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
 import { existsSync, rmSync } from "node:fs"
 import path from "node:path"
 import {
@@ -229,6 +230,32 @@ describe("opencodeProjectDir", () => {
     expect(dir.length).toBeLessThanOrEqual(92)
     expect(dir).toMatch(/-[0-9a-f]{7}$/)
     expect(dir.startsWith(path.join("/tmp/fake-home", ".cache", "opencode", "projects"))).toBe(true)
+  })
+
+  it("keeps a shortened project dir inside a long cache root", () => {
+    const cacheRoot = `/tmp/${"c".repeat(90)}`
+    process.env.XDG_CACHE_HOME = cacheRoot
+    process.env.XDG_CONFIG_HOME = "/tmp/xdg-config-empty"
+    const projectsRoot = path.join(cacheRoot, "opencode", "projects")
+    const dir = opencodeProjectDir("/Users/a/b")
+    expect(path.dirname(dir)).toBe(projectsRoot)
+    expect(path.basename(dir)).toMatch(/^[0-9a-f]{7}$/)
+    const medium = `/tmp/${"m".repeat(40)}`
+    process.env.XDG_CACHE_HOME = medium
+    const shortened = opencodeProjectDir(`/Users/${"x".repeat(60)}/project`)
+    expect(path.dirname(shortened)).toBe(path.join(medium, "opencode", "projects"))
+    expect(shortened).toMatch(/^.{1,84}-[0-9a-f]{7}$/)
+  })
+
+  it("keeps the shortened name an existing project folder already has", () => {
+    process.env.HOME = "/tmp/fake-home"
+    delete process.env.XDG_CACHE_HOME
+    delete process.env.XDG_CONFIG_HOME
+    const longRoot = `/Users/${"x".repeat(120)}/project`
+    const full = path.join("/tmp/fake-home", ".cache", "opencode", "projects", slugifyWorkspacePath(longRoot))
+    const hash = createHash("sha256").update(full).digest("hex").slice(0, 7)
+    // The name the whole-path cut gave before; existing folders must not move.
+    expect(opencodeProjectDir(longRoot)).toBe(`${full.slice(0, 84)}-${hash}`)
   })
 
   it("ensureOpencodeProjectDir creates the metadata root", () => {
