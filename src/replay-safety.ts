@@ -11,12 +11,17 @@ export type ReplayBarrierReason =
   | "stateful-interaction"
   | "unknown-or-malformed-frame"
 
+/** Barriers that only showed the host text or reasoning: sending the turn again repeats no side effect. */
+const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set(["visible-text", "visible-reasoning"])
+
 export class AttemptReplaySafety {
   private barrierReason: ReplayBarrierReason | undefined
+  private stateful = false
 
   constructor(private readonly sessionId: string) {}
 
   markBarrier(reason: ReplayBarrierReason): void {
+    if (!OUTPUT_ONLY_BARRIERS.has(reason)) this.stateful = true
     if (this.barrierReason) return
     this.barrierReason = reason
     trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
@@ -25,7 +30,11 @@ export class AttemptReplaySafety {
   applyTo(failure: CursorProviderError): CursorProviderError {
     failure.replaySafe = this.barrierReason === undefined && failure.replaySafe
     if (this.barrierReason) {
-      trace(`replay suppressed: reason=${this.barrierReason} sessionId=${this.sessionId}`)
+      failure.replayBarrier = this.stateful ? "stateful" : "output-only"
+      trace(
+        `replay suppressed: reason=${this.barrierReason} barrier=${failure.replayBarrier} ` +
+          `sessionId=${this.sessionId}`,
+      )
     }
     return failure
   }

@@ -205,6 +205,11 @@ export type CursorSession = {
   cacheDir?: string
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
+  /**
+   * This Run sent a user message after its last checkpoint: recovery must not
+   * resume an earlier checkpoint of the turn, which lacks that message.
+   */
+  checkpointRevoked?: boolean
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */

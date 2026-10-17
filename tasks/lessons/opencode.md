@@ -131,6 +131,15 @@ These are failure lessons shared by both hosts, not a replacement for
   eligible checkpoint only behind the replay barrier; a late tool result needs
   history recovery because `resume_action` re-requests that tool
   (`pumpWithRecovery`, `test/parallel-pump.test.ts`).
+- **A replay the provider must refuse can still be the host's to retry.**
+  Making every suppressed replay final ended a turn whose Run dropped after
+  only reasoning; its request reached Cursor only with the next message
+  ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
+  Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
+  after two resumes without a new one. Record every barrier, not the first:
+  text before a stateful frame must not read as output-only
+  (`AttemptReplaySafety`, `test/run-interruption.test.ts`,
+  `test/run-error-host.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
   first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty

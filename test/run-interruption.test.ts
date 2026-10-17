@@ -8,6 +8,7 @@ import {
   pump,
   pumpWithRecovery,
   rememberMirroredTodos,
+  type CursorRunRecovery,
   snapshotMirroredTodosBySession,
 } from "../src/language-model.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -494,23 +495,132 @@ describe("interrupted Cursor Run handling", () => {
     expect(recoveries).toBe(2)
   })
 
-  it("does not recover after visible output because replay could duplicate text", async () => {
+  it("leaves the retry to the host after output only, before any checkpoint", async () => {
     let recoveries = 0
     const parts: any[] = []
-    await expect(
-      pumpWithRecovery({
-        initialSession: fakeSession("partial", [
-          serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
-        ]),
-        controller: controller(parts),
-        recover: async () => {
-          recoveries++
-          return fakeSession("unused", [])
-        },
-      }),
-    ).rejects.toThrow("automatic retry unsafe")
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("partial", [
+        serverFrame({ interaction_update: { thinking_delta: { text: "thinking" } } }),
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+      ]),
+      controller: controller(parts),
+      recover: async () => {
+        recoveries++
+        return fakeSession("unused", [])
+      },
+    }).catch((error: unknown) => error)
+
+    // Replaying here would show the text twice; Cursor CLI sends the action again.
+    expect(failure).toMatchObject({ hostRetryable: true, transient: false, replaySafe: false })
+    expect((failure as Error).message).not.toContain("automatic retry unsafe")
     expect(recoveries).toBe(0)
     expect(parts.some((part) => part.type === "text-delta" && part.delta === "partial")).toBe(true)
+  })
+
+  it("keeps a failure final when the attempt did more than show output", async () => {
+    const getBlob = lengthDelimitedField(1, new TextEncoder().encode("inline blob"))
+    const getWithUnknownField = Uint8Array.from([
+      ...varintField(1, 15),
+      ...lengthDelimitedField(2, getBlob),
+      ...fixed32Field(20),
+    ])
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("output-then-state", [
+        // Text first: the later stateful frame must still decide the verdict.
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+        { flags: 0, payload: lengthDelimitedField(4, getWithUnknownField) },
+      ]),
+      controller: controller([]),
+      recover: async () => {
+        recoveries++
+        return fakeSession("unused", [])
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false, replaySafe: false })
+    expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+    expect((failure as Error).message).toContain("automatic retry unsafe")
+    expect(recoveries).toBe(0)
+  })
+
+  it("resumes the turn's latest checkpoint when a resumed attempt saved none, like Cursor CLI", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x05])
+    const sessions = [
+      fakeSession("resume-no-output", []),
+      fakeSession("resume-output", [serverFrame({ interaction_update: { text_delta: { text: " more" } } })]),
+      fakeSession("resume-done", [
+        serverFrame({ interaction_update: { text_delta: { text: " done" } } }),
+        serverFrame({ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } }),
+      ]),
+    ]
+    const recoveries: CursorRunRecovery[] = []
+    const parts: any[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-first", [
+        serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+      ]),
+      controller: controller(parts),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return sessions[recoveries.length - 1]!
+      },
+    })
+
+    expect(finalSession).toBe(sessions[2])
+    expect(recoveries.map((recovery) => recovery.kind)).toEqual(["resume", "resume", "resume"])
+    for (const recovery of recoveries) {
+      expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
+    }
+    expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("stops after two resumed attempts stream without saving a checkpoint, like Cursor CLI", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x06])
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-then-stuck", [
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 6, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        return fakeSession(`stuck-${recoveries}`, [
+          serverFrame({ interaction_update: { thinking_delta: { text: "again" } } }),
+        ])
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false, transient: false })
+    expect((failure as Error).message).toContain("2 resume attempts made no progress")
+    expect(recoveries).toBe(2)
+  })
+
+  it("does not resume an earlier checkpoint once the Run sent a newer user message", async () => {
+    let recoveries = 0
+    const revoked = fakeSession("revoked", [
+      serverFrame({ interaction_update: { text_delta: { text: "after steer" } } }),
+    ])
+    revoked.checkpointRevoked = true
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("checkpointed-before-steer", [
+        serverFrame({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x01, 0x07]) }),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        if (recoveries > 1) throw new Error("A revoked checkpoint must not be resumed")
+        return revoked
+      },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ retryable: false })
+    expect((failure as { hostRetryable?: boolean }).hostRetryable).toBeUndefined()
+    expect(recoveries).toBe(1)
   })
 
   it("replies to decoded KV requests with unknown fields, then suppresses replay", async () => {

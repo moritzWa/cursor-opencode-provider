@@ -188,23 +188,38 @@ describe("Run errors as the host sees them", () => {
     expect(runs).toBe(1)
   }, 30_000)
 
-  for (const unsafeReplay of [false, true]) {
-    it(`stops host retries after ${unsafeReplay ? "visible output makes replay unsafe" : "the Run retry budget is spent"}`, async () => {
-      trailer = { error: { code: "unavailable" } }
-      partialOutput = unsafeReplay
-      const error = await streamError(`ses_terminal_${unsafeReplay}`)
+  it("stops host retries after the Run retry budget is spent", async () => {
+    trailer = { error: { code: "unavailable" } }
+    const error = await streamError("ses_terminal_budget")
 
-      expect(APICallError.isInstance(error)).toBe(true)
-      expect(error).toMatchObject({
-        statusCode: 400,
-        isRetryable: false,
-        responseHeaders: { "x-should-retry": "false" },
-      })
-      const cause = (error as APICallError).cause
-      expect(cause).toMatchObject({ transient: false, replaySafe: false, code: "unavailable" })
-      if (unsafeReplay) expect((error as Error).message).toContain("automatic retry unsafe")
-      else expect(cause).toBeInstanceOf(CursorRetryExhaustedError)
-      expect(runs).toBe(unsafeReplay ? 1 : 2)
-    }, 30_000)
-  }
+    expect(APICallError.isInstance(error)).toBe(true)
+    expect(error).toMatchObject({
+      statusCode: 400,
+      isRetryable: false,
+      responseHeaders: { "x-should-retry": "false" },
+    })
+    const cause = (error as APICallError).cause
+    expect(cause).toBeInstanceOf(CursorRetryExhaustedError)
+    expect(cause).toMatchObject({ transient: false, replaySafe: false, code: "unavailable" })
+    expect(runs).toBe(2)
+  }, 30_000)
+
+  // Cursor CLI sends the same action again. The provider cannot, because the
+  // host already shows the reasoning, so the host retries the turn.
+  it("leaves the retry to the host after output only, before any checkpoint", async () => {
+    trailer = { error: { code: "unavailable" } }
+    partialOutput = true
+    const error = await streamError("ses_host_retry")
+
+    expect(APICallError.isInstance(error)).toBe(true)
+    expect(error).toMatchObject({
+      statusCode: undefined,
+      isRetryable: true,
+      responseHeaders: { "x-should-retry": "true" },
+    })
+    expect((error as Error).message).not.toContain("automatic retry unsafe")
+    const cause = (error as APICallError).cause
+    expect(cause).toMatchObject({ hostRetryable: true, transient: false, replaySafe: false, code: "unavailable" })
+    expect(runs).toBe(1)
+  }, 30_000)
 })

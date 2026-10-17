@@ -140,7 +140,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   actions, final error codes, `isRetryable: false` and bare `permission_denied`
   end the turn. Final and auth failures reach both hosts as `APICallError` with
   `x-should-retry: false`, a status below 500 and a message without OpenCode 1.x
-  retry triggers (`src/errors.ts`); the Connect code stays on `cause`.
+  retry triggers (`src/errors.ts`); the Connect code stays on `cause`. A
+  `hostRetryable` failure is the exception: an `APICallError` with
+  `isRetryable: true`, `x-should-retry: true` and no status, so both hosts retry.
 
 ## Context, identity and persistence
 
@@ -200,6 +202,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Drain a held Run before a fresh user turn. Rebuild late tool results from
   host history; checkpoint resume would request the tool again. Never replay
   side effects after the replay barrier or treat EOF as successful `stop`.
+- Retry like Cursor CLI's Run loop: an attempt without its own checkpoint
+  resumes the turn's latest one (unless a later user message revoked it), and
+  two resumed attempts that stream without a new checkpoint end the turn. With
+  no checkpoint in the turn, a transient failure after only text or reasoning
+  is `hostRetryable` (the CLI resends the action); any other barrier stays final.
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it

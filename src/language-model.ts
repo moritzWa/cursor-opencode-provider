@@ -251,8 +251,10 @@ import {
   CursorServerError,
   CursorTransportError,
   hostFacingError,
+  hostRetryError,
   isRejectedCredentialError,
   isTransientGrpcStatus,
+  noProgressResumeError,
   retrySuppressedError,
   toCursorProviderError,
 } from "./errors.js"
@@ -1208,10 +1210,19 @@ export async function pumpWithRecovery(input: {
   }
   const maxRecoveries = retryPolicy.maxAttempts - 1
   let credentialRenewed = false
+  // As in Cursor CLI's Run retry loop: an attempt without a checkpoint of its
+  // own resumes the latest one this turn received, and two resumed attempts
+  // that streamed without saving a new checkpoint stop the automatic retries.
+  let turnCheckpoint: Uint8Array | undefined
+  let resumedAttempt = false
+  let noProgressResumes = 0
   input.onSession?.(session)
 
-  const reopen = async (pumpedSession: CursorSession, failure: CursorProviderError) => {
-    const checkpoint = pumpedSession.resumeCheckpoint
+  const reopen = async (
+    pumpedSession: CursorSession,
+    failure: CursorProviderError,
+    checkpoint: Uint8Array | undefined,
+  ) => {
     const recovery: CursorRunRecovery = failure.checkpointUnusable
       ? { kind: "rebase", reason: "checkpoint-unusable" }
       : checkpoint
@@ -1221,6 +1232,9 @@ export async function pumpWithRecovery(input: {
             checkpoint: Uint8Array.from(checkpoint),
           }
         : { kind: "rebase" }
+    resumedAttempt = recovery.kind === "resume"
+    // A rebase opens another conversation; its checkpoints start over.
+    if (!resumedAttempt) turnCheckpoint = undefined
     // Host notes the failed Run never acknowledged belong to this turn.
     const unackedNotes = takeHostNoteInjections(pumpedSession)
     const unackedNoteCount = unackedNotes.reduce((count, batch) => count + batch.notes.length, 0)
@@ -1332,13 +1346,38 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
-        session = await reopen(pumpedSession, failure)
+        session = await reopen(
+          pumpedSession,
+          failure,
+          pumpedSession.resumeCheckpoint ?? (pumpedSession.checkpointRevoked ? undefined : turnCheckpoint),
+        )
         attempt--
         continue
       }
       if (!failure.transient) throw failure
-      const checkpoint = pumpedSession.resumeCheckpoint
+      if (pumpedSession.resumeCheckpoint) {
+        turnCheckpoint = pumpedSession.resumeCheckpoint
+        noProgressResumes = 0
+      } else if (pumpedSession.checkpointRevoked) {
+        turnCheckpoint = undefined
+      } else if (resumedAttempt && failure.replayBarrier) {
+        noProgressResumes++
+        if (noProgressResumes >= 2) {
+          trace(
+            `Run resume made no progress: sessionId=${pumpedSession.sessionId} resumes=${noProgressResumes} ` +
+              `err=${failure.message} — stopping automatic resume`,
+          )
+          throw noProgressResumeError(failure, noProgressResumes)
+        }
+      }
+      const checkpoint = turnCheckpoint
       if (!failure.replaySafe && !checkpoint) {
+        // Cursor CLI sends the same action again. Shown output keeps the
+        // provider from doing so; the host can, unless a side effect would repeat.
+        if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
+          trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
+          throw hostRetryError(failure)
+        }
         throw retrySuppressedError(
           failure,
           "after visible output or stateful server activity",
@@ -1357,7 +1396,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      session = await reopen(pumpedSession, failure)
+      session = await reopen(pumpedSession, failure, checkpoint)
     } finally {
       input.abortSignal?.removeEventListener("abort", stopPumpedRun)
       stopSteers?.()
@@ -5026,6 +5065,7 @@ export async function pump(
           await session.reopenWithUserMessage(steers.undelivered.map((steer) => steer.text).join("\n\n"), abortSignal)
           // Resuming the checkpoint from before the follow-up would send the steer again.
           session.resumeCheckpoint = undefined
+          session.checkpointRevoked = true
           endingTurns.delete(session)
           textBreakPending = true
           continue
