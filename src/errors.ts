@@ -77,25 +77,33 @@ const CONNECT_CODE_HTTP_STATUS: Readonly<Record<string, number>> = {
   unauthenticated: 401,
 }
 
+/** Status for a final failure whose Connect code maps to 5xx (internal, unknown, …). */
+const NON_RETRYABLE_SERVER_STATUS = 400
+
 /**
- * The error the host receives. A request Cursor declared not retryable becomes
- * an AI SDK `APICallError` with the Connect code's HTTP status (an unrecognized
- * code is Connect `unknown`): OpenCode 2 retries any failure that has no status
- * or recognized code. A host may classify by status alone, and 408/409/429/5xx
- * read as retryable, so the verdict also travels as the conventional
- * `x-should-retry: false` response header, which overrides the status.
+ * The error the host receives. Like Cursor CLI, a request Cursor declared not
+ * retryable (see `cursorCliRetryable`) or an authentication failure ends the
+ * turn: it becomes an AI SDK `APICallError` with `isRetryable: false` and the
+ * conventional `x-should-retry: false` header, which OpenCode 2 checks first
+ * (it retries a failure with no status or recognized code). OpenCode 1.x
+ * ignores both and retries any status >= 500 or a message matching its retry
+ * patterns, so the status is the Connect code's HTTP status capped below 500
+ * (Cursor CLI decides from the verdict, never the code) and the message is
+ * sanitized. The original code stays on `cause`.
  */
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
-  if (!(error instanceof CursorServerError) || error.retryable !== false) return error
+  const auth = error instanceof CursorAuthError
+  if (!auth && (!(error instanceof CursorServerError) || error.retryable !== false)) return error
+  const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
+    ? CONNECT_CODE_HTTP_STATUS[error.code]!
+    : CONNECT_CODE_HTTP_STATUS.unknown!
+  const status = auth ? (error.statusCode === 403 ? 403 : 401) : connectStatus
   return new APICallError({
+    message: sanitizeHostTerminalMessage(error.message),
     url: "cursor://agent.v1.AgentService/Run",
     requestBodyValues: {},
-    // OpenCode 1.x retries on message text even when isRetryable is false.
-    message: sanitizeHostTerminalMessage(error.message),
-    statusCode: error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
-      ? CONNECT_CODE_HTTP_STATUS[error.code]
-      : CONNECT_CODE_HTTP_STATUS.unknown,
+    statusCode: status >= 500 ? NON_RETRYABLE_SERVER_STATUS : status,
     responseHeaders: { "x-should-retry": "false" },
     isRetryable: false,
     cause: error,

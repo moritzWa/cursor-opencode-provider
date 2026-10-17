@@ -13,7 +13,7 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -435,9 +435,10 @@ describe("interrupted Cursor Run handling", () => {
         ]),
         renew: true,
       },
-      { session: fakeSession("denied", [endStreamError("permission_denied")]), renew: true },
+      // Cursor CLI treats a bare permission_denied as a final error, not a login prompt.
+      { session: fakeSession("denied", [endStreamError("permission_denied")]), renew: true, error: CursorServerError },
     ]
-    for (const { session, renew } of cases) {
+    for (const { session, renew, error = CursorAuthError } of cases) {
       let renewals = 0
       let recoveries = 0
       const failure = await pumpWithRecovery({
@@ -449,7 +450,7 @@ describe("interrupted Cursor Run handling", () => {
         },
         ...(renew ? { renewRejectedCredential: () => { renewals++ } } : {}),
       }).catch((e: unknown) => e)
-      expect(failure).toBeInstanceOf(CursorAuthError)
+      expect(failure).toBeInstanceOf(error)
       expect(renewals).toBe(0)
       expect(recoveries).toBe(0)
     }

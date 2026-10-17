@@ -22,8 +22,9 @@ Operator setup: [OpenCode 1.x](../../docs/opencode-1.md).
   with `isRetryable: false` and `x-should-retry: false` was still sent six
   times because its message said `resource_exhausted`; bare `429`/`500` digits
   (`$1500`, `500k`) match too. Terminal host messages pass through
-  `sanitizeHostTerminalMessage`. Statuses >= 500 are still retried by 1.x
-  (`test/errors.test.ts`).
+  `sanitizeHostTerminalMessage`. 1.x also retries every status >= 500, so a
+  final `internal`/`unknown` error is reported below 500; Cursor CLI decides
+  from the verdict, never the code (`test/errors.test.ts`).
 
 ## File tools and planning
 

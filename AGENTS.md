@@ -127,9 +127,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   must work after `end()`. Retiring a cached connection must let siblings drain,
   never destroy them. Direct and proxy connections use `maxSessionMemory: 256`.
   Idle sessions are unref'd; live streams and health-check pings hold a ref.
-- Decode Cursor's error title/detail and retry verdict. A non-retryable server
-  error reaches the host as `APICallError` with its status and
-  `x-should-retry: false` (`src/errors.ts`), including on OpenCode 2.
+- Decode Cursor's error title/detail and retry verdict like Cursor CLI: required
+  actions, final error codes, `isRetryable: false` and bare `permission_denied`
+  end the turn. Final and auth failures reach both hosts as `APICallError` with
+  `x-should-retry: false`, a status below 500 and a message without OpenCode 1.x
+  retry triggers (`src/errors.ts`); the Connect code stays on `cause`.
 
 ## Context, identity and persistence
 

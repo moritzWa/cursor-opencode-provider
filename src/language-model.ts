@@ -566,32 +566,82 @@ function retryInfoProtobufDelayMs(encoded: string): number | undefined {
   return Math.ceil(Number(seconds) * 1_000 + Number(nanos) / 1_000_000)
 }
 
-type CursorErrorDetails = { title?: string; detail?: string; isRetryable?: boolean }
+type CursorErrorDetails = {
+  /** `ErrorDetails.error` enum (#1); 0 when omitted, as protobuf decodes it. */
+  error: number
+  title?: string
+  detail?: string
+  isRetryable?: boolean
+  /** `details.analytics_metadata.action_required` (#10 → #1). */
+  actionRequired?: string
+}
 
-/** Decode `aiserver.v1.ErrorDetails.details` (#2): title #1, detail #2, is_retryable #4. */
+/**
+ * Decode `aiserver.v1.ErrorDetails`: error #1 and details #2 (title #1,
+ * detail #2, is_retryable #4, analytics_metadata #10 { action_required #1 }).
+ */
 function decodeCursorErrorDetails(encoded: string): CursorErrorDetails | undefined {
   try {
     const outer = protobuf.Reader.create(Buffer.from(encoded, "base64"))
+    const details: CursorErrorDetails = { error: 0 }
     while (outer.pos < outer.len) {
       const tag = outer.uint32()
+      if (tag === 0x08) {
+        details.error = outer.int32()
+        continue
+      }
       if (tag !== 0x12) {
         outer.skipType(tag & 7)
         continue
       }
       const inner = protobuf.Reader.create(outer.bytes())
-      const details: CursorErrorDetails = {}
       while (inner.pos < inner.len) {
         const innerTag = inner.uint32()
         if (innerTag === 0x0a) details.title = inner.string().trim() || undefined
         else if (innerTag === 0x12) details.detail = inner.string().trim() || undefined
         else if (innerTag === 0x20) details.isRetryable = inner.bool()
-        else inner.skipType(innerTag & 7)
+        else if (innerTag === 0x52) {
+          const analytics = protobuf.Reader.create(inner.bytes())
+          while (analytics.pos < analytics.len) {
+            const analyticsTag = analytics.uint32()
+            if (analyticsTag === 0x0a) details.actionRequired = analytics.string() || undefined
+            else analytics.skipType(analyticsTag & 7)
+          }
+        } else inner.skipType(innerTag & 7)
       }
-      return details
     }
+    return details
   } catch {
     return undefined
   }
+}
+
+// `ErrorDetails.Error` values Cursor CLI never retries: cancellation
+// (USER_ABORTED_REQUEST, DEBOUNCED) and login, usage/rate limit, usage pricing
+// and API-key/outdated-client actions.
+const CURSOR_FINAL_ERRORS = new Set([
+  21, 35,
+  2, 18, 11, 12, 3, 38, 46, 47,
+  9, 7, 23, 10, 8, 50, 51, 22,
+  44, 45,
+  1, 42, 30,
+])
+const CURSOR_ERROR_CUSTOM_MESSAGE = 29
+
+/**
+ * Cursor CLI's retry verdict for a Connect error (its `ErrorDetails`
+ * classifier): cancellation, a required user action, an explicit
+ * `isRetryable: false`, an unflagged custom message, or a bare
+ * `permission_denied` end the request; anything else may be retried.
+ */
+function cursorCliRetryable(code: string, details: CursorErrorDetails | undefined): boolean | undefined {
+  if (code === "canceled" || code === "aborted") return false
+  if (details) {
+    if (CURSOR_FINAL_ERRORS.has(details.error) || details.actionRequired) return false
+    if (details.error === CURSOR_ERROR_CUSTOM_MESSAGE && details.isRetryable !== true) return false
+    if (details.isRetryable !== undefined) return details.isRetryable
+  }
+  if (code === "permission_denied") return false
   return undefined
 }
 
@@ -606,10 +656,10 @@ export function connectFrameError(payload: string): CursorProviderError {
     if (envelope.error?.message !== undefined || envelope.error?.details !== undefined) {
       trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
     }
-    if (code === "unauthenticated" || code === "permission_denied") {
+    if (code === "unauthenticated") {
       return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
         code,
-        replaySafe: code === "unauthenticated",
+        replaySafe: true,
       })
     }
     let retryAfterMs = retryDelayFromValue(
@@ -633,11 +683,12 @@ export function connectFrameError(payload: string): CursorProviderError {
         }
       }
     }
-    // Cursor CLI shows `${title} ${detail}` and obeys an explicit isRetryable.
+    // Cursor CLI shows `${title} ${detail}` and follows its own retry verdict.
     const explanation = [cursorDetails?.title, cursorDetails?.detail].filter(Boolean).join(" ")
+    const retryable = cursorCliRetryable(code, cursorDetails)
     return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
-      transient: cursorDetails?.isRetryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
-      retryable: cursorDetails?.isRetryable,
+      transient: retryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
+      retryable,
       replaySafe: true,
       code,
       retryAfterMs: retryAfterMs === undefined
