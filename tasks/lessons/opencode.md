@@ -137,9 +137,15 @@ These are failure lessons shared by both hosts, not a replacement for
   ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
   Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
   after two resumes without a new one. Record every barrier, not the first:
-  text before a stateful frame must not read as output-only
-  (`AttemptReplaySafety`, `test/run-interruption.test.ts`,
-  `test/run-error-host.test.ts`).
+  text before a stateful frame must not read as output-only. Keep stateful
+  barriers on the Run across tool-step pumps, and retain checkpoints before
+  credential renewal as well as transient recovery; otherwise a completed
+  command becomes host-retryable or a renewed attempt forgets its saved state.
+  Result delivery and follow-up user actions invalidate older checkpoints;
+  compare frame arrival order so a queued pre-result checkpoint cannot become
+  eligible just because the pump reads it after delivery
+  (`AttemptReplaySafety`, `test/parallel-pump.test.ts`,
+  `test/run-interruption.test.ts`, `test/run-error-host.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
   first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty

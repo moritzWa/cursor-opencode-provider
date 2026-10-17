@@ -16,6 +16,7 @@ import type { RunHistoryImages } from "./protocol/sent-history-images.js"
 import type { ParallelStepState } from "./parallel-step.js"
 import type { OpenCodeModelCost } from "./pricing.js"
 import type { RunCostEstimate } from "./billing.js"
+import type { ReplaySafetyState } from "./replay-safety.js"
 
 export type Frame = { flags: number; payload: Uint8Array }
 
@@ -206,10 +207,14 @@ export type CursorSession = {
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
   /**
-   * This Run sent a user message after its last checkpoint: recovery must not
-   * resume an earlier checkpoint of the turn, which lacks that message.
+   * This Run sent a user message or tool result after its last checkpoint:
+   * recovery must not resume earlier state that lacks the delivered input.
    */
   checkpointRevoked?: boolean
+  /** Ignore queued checkpoints received before the latest message/result delivery. */
+  resumeCheckpointAfterFrame?: number
+  /** Stateful replay barriers survive host tool-step boundaries on this Run. */
+  replaySafety?: ReplaySafetyState
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */

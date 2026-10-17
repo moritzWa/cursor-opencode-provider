@@ -4,7 +4,7 @@ import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-import { APICallError, type LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -26,6 +26,7 @@ let client: http2.ClientHttp2Session
 let trailer: Record<string, unknown> = {}
 let runs = 0
 let partialOutput = false
+let scripted: ((stream: http2.ServerHttp2Stream, message: Record<string, unknown>) => void) | undefined
 const savedProxy: Record<string, string | undefined> = {}
 
 function frame(payload: Uint8Array, flags = 0): Buffer {
@@ -52,6 +53,7 @@ beforeAll(async () => {
         if (pending.length < 5 + length) break
         const message = decodeMessage<Record<string, unknown>>("AgentClientMessage", pending.subarray(5, 5 + length))
         pending = pending.subarray(5 + length)
+        if (scripted) { scripted(stream, message); continue }
         if (!message.run_request) continue
         runs++
         if (partialOutput) {
@@ -95,6 +97,7 @@ afterEach(() => {
   resetCheckpointsForTests()
   runs = 0
   partialOutput = false
+  scripted = undefined
 })
 
 async function streamError(sessionKey: string): Promise<unknown> {
@@ -121,6 +124,78 @@ async function streamError(sessionKey: string): Promise<unknown> {
     fs.rmSync(root, { recursive: true, force: true })
   }
 }
+
+describe("checkpoint eligibility across host results", () => {
+  for (const afterResult of [false, true]) {
+    it(`only resumes a checkpoint received after the result (after: ${afterResult})`, async () => {
+      const checkpoint = Uint8Array.of(10, 1, 7)
+      let resumed = false
+      scripted = (stream, message) => {
+        const send = (message: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", message)))
+        if (message.run_request) {
+          runs++
+          resumed = !!(message.run_request as { action?: { resume_action?: unknown } }).action?.resume_action
+          if (resumed) {
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+          } else {
+            send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo done", tool_call_id: "command" } } })
+            // This frame arrives while the host tool is outstanding. The held
+            // reader may queue it until after the host has delivered its result.
+            if (!afterResult) send({ conversation_checkpoint_update: checkpoint })
+          }
+        } else if (message.exec_client_message) {
+          if (afterResult) send({ conversation_checkpoint_update: checkpoint })
+          send({ interaction_update: { thinking_delta: { text: "after the command" } } })
+          stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
+        }
+      }
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-checkpoint-"))
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const model = createCursor({
+          name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+        }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run echo done" }] }]
+        const options = {
+          prompt,
+          tools: [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }],
+          headers: { "x-opencode-session-id": `ses_result_checkpoint_${afterResult}` },
+        }
+        const read = async (options: LanguageModelV3CallOptions) => {
+          const parts: LanguageModelV3StreamPart[] = []
+          const { stream } = await model.doStream(options)
+          const reader = stream.getReader()
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) return parts
+            parts.push(value)
+          }
+        }
+        const first = await read(options)
+        const call = first.find(part => part.type === "tool-call")
+        if (!call || call.type !== "tool-call") throw new Error("Expected the shell call")
+        await new Promise<void>(resolve => setImmediate(resolve))
+        prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+        prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: "done" } }] })
+        if (afterResult) {
+          const parts = await read(options)
+          expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(resumed).toBe(true)
+          expect(runs).toBe(2)
+        } else {
+          const error = await read(options).catch((error: unknown) => error)
+          expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+          expect(resumed).toBe(false)
+          expect(runs).toBe(1)
+        }
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+})
 
 describe("Run errors as the host sees them", () => {
   for (const method of ["doStream", "doGenerate"] as const) {

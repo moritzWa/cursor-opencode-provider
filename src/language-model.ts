@@ -831,6 +831,23 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
   )
 }
 
+/** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
+function invalidateResumeCheckpoint(session: CursorSession): void {
+  session.resumeCheckpoint = undefined
+  session.checkpointRevoked = true
+  session.resumeCheckpointAfterFrame = lastFrameArrival()
+}
+
+/** A queued checkpoint predating a delivered result still describes the old step. */
+function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame: Frame): void {
+  const arrived = frameArrival(frame)
+  if (session.resumeCheckpointAfterFrame !== undefined && arrived !== undefined
+    && arrived <= session.resumeCheckpointAfterFrame) return
+  session.resumeCheckpoint = Uint8Array.from(bytes)
+  session.checkpointRevoked = false
+  session.resumeCheckpointAfterFrame = undefined
+}
+
 /** `resumeCheckpoint` is set only by a checkpoint this Run received. */
 function confirmRunImagesAtTurnEnd(session: CursorSession): void {
   if (!session.historyImages || !session.openCodeSessionId) return
@@ -1262,6 +1279,7 @@ export async function pumpWithRecovery(input: {
       recovery.kind === "resume" ? next.sessionId : undefined,
     )
     if (recovery.kind === "resume") {
+      next.replaySafety = { ...pumpedSession.replaySafety }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -1333,6 +1351,14 @@ export async function pumpWithRecovery(input: {
         replaySafe: error instanceof CursorProviderError ? error.replaySafe : false,
         fallback: "Cursor Run interrupted",
       })
+      // A renewable credential error may follow a checkpoint too. Retain it
+      // before either recovery path so a later attempt can still resume it.
+      if (pumpedSession.resumeCheckpoint) {
+        turnCheckpoint = pumpedSession.resumeCheckpoint
+        noProgressResumes = 0
+      } else if (pumpedSession.checkpointRevoked) {
+        turnCheckpoint = undefined
+      }
       if (
         input.renewRejectedCredential
         && !credentialRenewed
@@ -1355,12 +1381,8 @@ export async function pumpWithRecovery(input: {
         continue
       }
       if (!failure.transient) throw failure
-      if (pumpedSession.resumeCheckpoint) {
-        turnCheckpoint = pumpedSession.resumeCheckpoint
-        noProgressResumes = 0
-      } else if (pumpedSession.checkpointRevoked) {
-        turnCheckpoint = undefined
-      } else if (resumedAttempt && failure.replayBarrier) {
+      if (!pumpedSession.resumeCheckpoint && !pumpedSession.checkpointRevoked
+        && resumedAttempt && failure.replayBarrier) {
         noProgressResumes++
         if (noProgressResumes >= 2) {
           trace(
@@ -2946,7 +2968,7 @@ export async function drainSessionUntilTurnEnded(
           if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
           setCheckpoint(session.conversationId, bytes)
           noteCheckpoint(session.openCodeSessionId, bytes)
-          session.resumeCheckpoint = Uint8Array.from(bytes)
+          acceptResumeCheckpoint(session, bytes, frame)
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
           noteRunImageCheckpoint(session, bytes, frame)
           const tokenDetails = decodeConversationTokenDetails(bytes)
@@ -3462,6 +3484,9 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
+    if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
+      invalidateResumeCheckpoint(session)
+    }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
       const normalized = deliveredSwitchMode.target.toLowerCase()
@@ -4156,7 +4181,7 @@ export async function pump(
   let emittedHostTools = 0
   const earlyRows = new EarlyToolRows()
   let planHandoffCancellationRequested = false
-  const replaySafety = new AttemptReplaySafety(session.sessionId)
+  const replaySafety = new AttemptReplaySafety(session.sessionId, session.replaySafety ??= {})
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
     const error = new CursorProtocolError(message, { code })
@@ -5000,7 +5025,7 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
-        session.resumeCheckpoint = Uint8Array.from(bytes)
+        acceptResumeCheckpoint(session, bytes, frame)
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         noteRunImageCheckpoint(session, bytes, frame)
         const tokenDetails = decodeConversationTokenDetails(bytes)
@@ -5064,8 +5089,7 @@ export async function pump(
         try {
           await session.reopenWithUserMessage(steers.undelivered.map((steer) => steer.text).join("\n\n"), abortSignal)
           // Resuming the checkpoint from before the follow-up would send the steer again.
-          session.resumeCheckpoint = undefined
-          session.checkpointRevoked = true
+          invalidateResumeCheckpoint(session)
           endingTurns.delete(session)
           textBreakPending = true
           continue
@@ -5103,6 +5127,7 @@ export async function pump(
             ),
             abortSignal,
           )
+          invalidateResumeCheckpoint(session)
           endingTurns.delete(session)
           assistantText = ""
           continue

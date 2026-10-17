@@ -137,6 +137,14 @@ output](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/sr
 The plugin adjusts only the request's projection of Cursor-owned results;
 stored messages are preserved.
 
+## Interrupted model requests
+
+OpenCode retries a transient failure after only text or reasoning when the
+turn has no new checkpoint. Stateful activity, including a completed tool from
+an earlier host step, stays a replay barrier. Recovery retains the latest
+eligible checkpoint across token renewal; two resumed attempts that stream
+without saving a checkpoint end the turn.
+
 ## Troubleshooting
 
 | Problem | What to try |

@@ -203,8 +203,10 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   host history; checkpoint resume would request the tool again. Never replay
   side effects after the replay barrier or treat EOF as successful `stop`.
 - Retry like Cursor CLI's Run loop: an attempt without its own checkpoint
-  resumes the turn's latest one (unless a later user message revoked it), and
-  two resumed attempts that stream without a new checkpoint end the turn. With
+  resumes the turn's latest eligible one. Delivered tool results and follow-up
+  user messages revoke earlier checkpoints; queued frames use receipt order.
+  Stateful barriers survive host tool steps. Two resumed attempts that stream
+  without a new checkpoint end the turn. With
   no checkpoint in the turn, a transient failure after only text or reasoning
   is `hostRetryable` (the CLI resends the action); any other barrier stays final.
   Missing-blob recovery is limited to the initial control-only checkpoint path

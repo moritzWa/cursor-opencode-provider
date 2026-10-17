@@ -208,6 +208,14 @@ converts Cursor-native file execs from the current permitted catalog. It refuses
 patch operations that would lose CRLF bytes before changing a file. Native
 `edit` / `write` remain unchanged when permitted; see [shared patch behavior](../README.md#apply_patch--patch-on-gpt-models).
 
+## Interrupted model requests
+
+OpenCode retries a transient failure after only text or reasoning when the
+turn has no new checkpoint. Stateful activity, including a completed tool from
+an earlier host step, stays a replay barrier. Recovery retains the latest
+eligible checkpoint across token renewal; two resumed attempts that stream
+without saving a checkpoint end the turn.
+
 ## Mid-turn steers and Stop
 
 A plain-text steer without files or skills can reach an actively pumping Cursor

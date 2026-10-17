@@ -447,6 +447,33 @@ describe("interrupted Cursor Run handling", () => {
     expect(renewals).toBe(0)
   })
 
+  it("retains a checkpoint across credential renewal and a later output-only failure", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x09])
+    const recoveries: CursorRunRecovery[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("checkpoint-before-renewal", [
+        serverFrame({ conversation_checkpoint_update: checkpoint }),
+        endStreamError("unauthenticated"),
+      ]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => {},
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return recoveries.length === 1
+          ? fakeSession("renewed-without-checkpoint", [
+              serverFrame({ interaction_update: { thinking_delta: { text: "continuing" } } }),
+            ])
+          : fakeSession("renewed-recovered", [turnEnded()])
+      },
+    })
+    expect(finalSession.sessionId).toBe("renewed-recovered")
+    expect(recoveries).toHaveLength(2)
+    for (const recovery of recoveries) {
+      expect(recovery).toMatchObject({ kind: "resume", checkpoint })
+    }
+  })
+
   it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
     const cases = [
       { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },
@@ -575,6 +602,26 @@ describe("interrupted Cursor Run handling", () => {
       expect(Buffer.from((recovery as { checkpoint: Uint8Array }).checkpoint)).toEqual(Buffer.from(checkpoint))
     }
     expect(parts.filter((part) => part.type === "finish")).toHaveLength(1)
+  })
+
+  it("does not count a prior tool-step barrier as streaming from a silent resumed attempt", async () => {
+    const checkpoint = Uint8Array.from([0x0a, 0x01, 0x08])
+    const initial = fakeSession("prior-tool-checkpoint", [
+      serverFrame({ conversation_checkpoint_update: checkpoint }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    let recoveries = 0
+    const finalSession = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 4, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        recoveries++
+        return fakeSession(`silent-resume-${recoveries}`, recoveries === 3 ? [turnEnded()] : [])
+      },
+    })
+    expect(finalSession.sessionId).toBe("silent-resume-3")
+    expect(recoveries).toBe(3)
   })
 
   it("stops after two resumed attempts stream without saving a checkpoint, like Cursor CLI", async () => {
