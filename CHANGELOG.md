@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- After a restart, a turn that resumes a saved conversation no longer attaches every image in the session's history again, and an image you attach is not sent again as history on the next turn ([#78](https://github.com/oakimov/cursor-opencode-provider/pull/78) by [@nkoynov](https://github.com/nkoynov), [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75))
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
 - Patch conversions preserve blank lines and reject paths or file content they cannot preserve exactly
 - On OpenCode 1.x and 2, file writes and edits use the current turn's permitted tools after a model switch; OpenCode 2 GPT models use `patch` instead of first failing on `write` ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov), [#80](https://github.com/oakimov/cursor-opencode-provider/issues/80))
