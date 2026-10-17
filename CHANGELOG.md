@@ -32,6 +32,7 @@
 - Grok 4.7's 500k variants run in max mode instead of failing with `Cursor API error (code=not_found)`; max mode now follows the max-mode flag Cursor sets on each variant, as Cursor CLI does, instead of only a 1m context. A `maxMode` option without a picked variant lands on the model's declared max default even when Cursor declares a Fast variant (Grok 4.7 500k High, GPT-5.2 High). The model list is fetched again once after upgrading ([#67](https://github.com/oakimov/cursor-opencode-provider/issues/67))
 - Grok 4.7's 500k variants have separate `-500k` and `-500k-fast` model entries with matching context limits and pricing ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 - Effort hints stay in the requested context tier and Fast-only max tiers remain selectable
+- Unmarked 1M variants retain their max-mode fallback after model discovery and cache reload; explicit non-max markers remain authoritative ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 
 ## [0.8.2] - 2026-10-15
 

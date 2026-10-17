@@ -322,6 +322,9 @@ These are failure lessons shared by both hosts, not a replacement for
   and unmatched hints must not rewrite an advertised tuple. Exercise marked
   non-1M tiers and duplicate ids (`test/model-selection-review.test.ts`,
   `test/model-effort-review.test.ts`, `test/model-selection-run.test.ts`).
+  Collapsing an absent max marker to false also disabled the 1M fallback;
+  preserve absence through discovery and cache, test explicit false separately,
+  and invalidate caches that already erased the distinction (`test/models.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).

@@ -836,6 +836,10 @@ describe("modelsToConfig (context-tier materialization)", () => {
 })
 
 describe("isCacheFresh", () => {
+  it("refreshes schema-4 caches that collapsed absent max markers to false", () => {
+    expect(isCacheFresh({ models: [], fetchedAt: Date.now(), schemaVersion: 4 })).toBe(false)
+  })
+
   it("returns true for recently fetched cache with current schema", () => {
     const cache = { models: [], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
     expect(isCacheFresh(cache)).toBe(true)
@@ -1407,6 +1411,32 @@ describe("resolveVariantParameters (declared default is a Fast variant)", () => 
 })
 
 describe("max mode from Cursor's isMaxMode marker", () => {
+  it.each(["isMaxMode", "is_max_mode"])("preserves absent, false and true %s markers through the cache", (key) => {
+    const [model] = mapAvailableModelsResponse({ models: [{ name: "optional-marker", variants: [
+      { parameterValues: [{ id: "context", value: "1m" }] },
+      { [key]: false, parameterValues: [{ id: "context", value: "1000k" }] },
+      { [key]: true, parameterValues: [{ id: "context", value: "500k" }] },
+    ] }] })
+    expect(model!.variants[0]).not.toHaveProperty("isMaxMode")
+    expect(model!.variants.map((v) => v.isMaxMode)).toEqual([undefined, false, true])
+    const restored = normalizeModelCache(JSON.parse(JSON.stringify({
+      models: [model], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
+    })))!
+    const cached = restored.models[0]!
+    expect(cached.variants).toEqual(model!.variants)
+    for (const [index, maxMode] of [true, false, true].entries()) {
+      const picked = cached.variants[index]!.parameterValues
+      expect(resolveVariantMaxMode(picked, { model: cached, picked })).toBe(maxMode)
+    }
+    expect(resolveVariantParameters(cached, { maxMode: true })).toEqual(cached.variants[0]!.parameterValues)
+    expect(resolveVariantParameters(cached, { maxMode: false })).toEqual(cached.variants[1]!.parameterValues)
+    for (const invalid of [null, "false", 0]) {
+      expect(() => mapAvailableModelsResponse({ models: [{ name: "invalid-marker", variants: [
+        { [key]: invalid, parameterValues: [] },
+      ] }] })).toThrow(/non-boolean/)
+    }
+  })
+
   // AvailableModels JSON shaped like Grok 4.7 (#67): a 500k max tier over a 256k
   // base, `reasoning_effort` ids, Fast variants as both declared defaults, and
   // proto3 JSON omitting false booleans.
@@ -1453,7 +1483,7 @@ describe("max mode from Cursor's isMaxMode marker", () => {
   it("records the marker from AvailableModels and keeps it through the cache", () => {
     expect(grok!.variants.filter((v) => v.isMaxMode).map((v) => v.parameterValues[0]!.value))
       .toEqual(Array(6).fill("500k"))
-    expect(grok!.variants.filter((v) => v.isMaxMode === false)).toHaveLength(6)
+    expect(grok!.variants.filter((v) => v.isMaxMode === undefined)).toHaveLength(6)
     const restored = normalizeModelCache(JSON.parse(JSON.stringify({
       models: [grok], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
     })))

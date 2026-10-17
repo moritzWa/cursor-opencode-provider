@@ -91,12 +91,20 @@ afterAll(async () => {
   }
 })
 
-it.each([
+const scenarios: Array<{
+  context: string; fast: string; max: boolean
+  options: { maxMode?: boolean; picked?: string }
+  marker?: boolean | "absent"
+}> = [
   { context: "256k", fast: "false", max: false, options: {} },
   { context: "500k", fast: "false", max: true, options: { maxMode: true } },
   { context: "500k", fast: "true", max: true, options: { maxMode: false, picked: "500k" } },
   { context: "256k", fast: "true", max: false, options: { maxMode: true, picked: "256k" } },
-])("sends cached selection $context fast=$fast max=$max through startSession", async (scenario) => {
+  { context: "1m", fast: "true", max: true, options: { maxMode: false, picked: "1m" }, marker: "absent" },
+  { context: "1m", fast: "true", max: false, options: { maxMode: true, picked: "1m" }, marker: false },
+]
+
+it.each(scenarios)("sends cached selection $context fast=$fast max=$max through startSession", async (scenario) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-model-run-"))
   try {
     const parameters = (context: string, fast: boolean) => [
@@ -104,12 +112,13 @@ it.each([
       { id: "reasoning_effort", value: "high" },
       { id: "fast", value: String(fast) },
     ]
+    const maxContext = scenario.context === "1m" ? "1m" : "500k"
     const models = mapAvailableModelsResponse({ models: [{ name: "grok-4.7", variants:
-      ["256k", "500k"].flatMap((context) => [false, true].map((fast) => ({
+      ["256k", maxContext].flatMap((context) => [false, true].map((fast) => ({
         parameterValues: parameters(context, fast),
-        isMaxMode: context === "500k",
+        ...(scenario.marker === "absent" ? {} : { isMaxMode: scenario.marker ?? context === maxContext }),
         isDefaultNonMaxConfig: context === "256k" && fast,
-        isDefaultMaxConfig: context === "500k" && fast,
+        isDefaultMaxConfig: context === maxContext && fast,
       }))),
     }] })
     await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })

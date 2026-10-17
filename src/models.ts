@@ -21,7 +21,7 @@ export type ModelVariant = {
   isDefaultMax: boolean
   /**
    * Cursor's `AvailableModelVariant.is_max_mode`: this tuple runs only with
-   * request-level max mode. Absent in caches written before it was recorded.
+   * request-level max mode. Absent when discovery omits the marker.
    */
   isMaxMode?: boolean
 }
@@ -425,13 +425,17 @@ export function mapAvailableModelsResponse(
       if (!parameterValues) {
         throw new Error(`AvailableModels returned invalid parameter values for ${name}`)
       }
+      const isMaxMode = optionalBoolean(v, ["isMaxMode", "is_max_mode"])
+      if (isMaxMode === null) {
+        throw new Error("AvailableModels returned a non-boolean isMaxMode")
+      }
       variants.push({
         key: name,
         parameterValues,
         displayName: (v.displayName ?? v.display_name ?? name) as string,
         isDefaultNonMax: apiBoolean(v, ["isDefaultNonMaxConfig", "is_default_non_max_config"]),
         isDefaultMax: apiBoolean(v, ["isDefaultMaxConfig", "is_default_max_config"]),
-        isMaxMode: apiBoolean(v, ["isMaxMode", "is_max_mode"]),
+        ...(isMaxMode === undefined ? {} : { isMaxMode }),
       })
     }
 
