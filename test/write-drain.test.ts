@@ -24,7 +24,7 @@ const ORIGIN = "https://agentn.drain-test.cursor.sh"
  * `bytesPerSecond`, or nothing once stalled. The server answers each Run with
  * one frame and then stays silent.
  */
-async function startSlowCursor(bytesPerSecond: number) {
+async function startSlowCursor(bytesPerSecond: number, options: { endWithoutReading?: boolean } = {}) {
   const received: number[] = []
   const bodies: Buffer[][] = []
   let stalled = false
@@ -37,6 +37,7 @@ async function startSlowCursor(bytesPerSecond: number) {
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
     stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
     stream.on("error", () => {})
+    if (options.endWithoutReading) return void setTimeout(() => stream.end(), 100)
     stream.on("data", (chunk: Buffer) => {
       received[index]! += chunk.length
       bodies[index]!.push(chunk)
@@ -203,6 +204,18 @@ describe("Run write drain", () => {
       fake = undefined
     }
   }, 15_000)
+
+  it("settles a pending drain when Cursor ends its response without reading the request", async () => {
+    fake = await startSlowCursor(200_000, { endWithoutReading: true })
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+
+    expect(run.write(new Uint8Array(3_000_000).fill(5))).toBe(false)
+    const error = await failureOf(run.waitForDrain!())
+
+    expect(error).toBeInstanceOf(CursorProviderError)
+    expect(error).not.toBeInstanceOf(CursorLocalCancellationError)
+    expect(await failureOf(run.waitForDrain!())).toBeInstanceOf(CursorProviderError)
+  }, 5_000)
 
   it("leaves a stalled write to the read-idle watchdog", async () => {
     fake = await startSlowCursor(200_000)

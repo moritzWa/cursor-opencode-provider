@@ -734,14 +734,6 @@ export async function bidiRunStream(
   let locallyClosed = false
   let remotelyClosed = false
   let backpressured = false
-  // Node holds back a stream's `close` while a write is still buffered, so a
-  // local close settles pending drains itself.
-  const localCloseListeners = new Set<() => void>()
-  const notifyLocalClose = () => {
-    const listeners = [...localCloseListeners]
-    localCloseListeners.clear()
-    for (const listener of listeners) listener()
-  }
   let responseStatus = 0
   let responseHeaders: Record<string, unknown> = {}
   let responseTrailers: Record<string, unknown> = {}
@@ -782,6 +774,13 @@ export async function bidiRunStream(
       return streamFailure
     }
     return undefined
+  }
+  const drainTerminalError = (event: BidiTerminalEvent): CursorProviderError => {
+    if (event.kind === "local-close") {
+      return new CursorLocalCancellationError("Cursor Run stream closed locally during drain")
+    }
+    if (event.kind === "remote-error") return event.error
+    return observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream ended before drain")
   }
   const settleTerminal = (event: BidiTerminalEvent) => {
     if (terminalEvent) return
@@ -959,7 +958,6 @@ export async function bidiRunStream(
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
         stream.close()
-        notifyLocalClose()
       }
     }
     abortSignal.addEventListener("abort", abortHandler, { once: true })
@@ -992,9 +990,7 @@ export async function bidiRunStream(
     },
     waitForDrain() {
       if (!backpressured) return Promise.resolve()
-      if (locallyClosed) {
-        return Promise.reject(new CursorLocalCancellationError("Cursor Run stream closed locally during drain"))
-      }
+      if (terminalEvent) return Promise.reject(drainTerminalError(terminalEvent))
       return new Promise<void>((resolve, reject) => {
         let settled = false
         const finish = (error?: CursorProviderError) => {
@@ -1003,7 +999,7 @@ export async function bidiRunStream(
           stream.removeListener("drain", onDrain)
           stream.removeListener("error", onError)
           stream.removeListener("close", onClose)
-          localCloseListeners.delete(onClose)
+          terminalListeners.delete(onTerminal)
           if (error) reject(error)
           else resolve()
         }
@@ -1023,10 +1019,14 @@ export async function bidiRunStream(
               : observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream closed before drain"),
           )
         }
+        // The Run's end settles it too: Node holds back `close` while a write
+        // is buffered, and a response can end while the request is still
+        // blocked, after which the read-idle watchdog no longer runs.
+        const onTerminal = (event: BidiTerminalEvent) => finish(drainTerminalError(event))
         stream.once("drain", onDrain)
         stream.once("error", onError)
         stream.once("close", onClose)
-        localCloseListeners.add(onClose)
+        terminalListeners.add(onTerminal)
       })
     },
     end() {
@@ -1038,7 +1038,6 @@ export async function bidiRunStream(
       stopInboundReader()
       settleTerminal({ kind: "local-close" })
       stream.end()
-      notifyLocalClose()
     },
     async *frames() {
       try {
@@ -1080,7 +1079,6 @@ export async function bidiRunStream(
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
         stream.close()
-        notifyLocalClose()
       }
     },
     isClosed() {

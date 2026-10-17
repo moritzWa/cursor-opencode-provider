@@ -20,7 +20,7 @@ const waitUntil = async (condition, ms = 5_000) => {
   for (const end = Date.now() + ms; !condition() && Date.now() < end;) await sleep(10)
 }
 
-async function startSlowCursor(bytesPerSecond) {
+async function startSlowCursor(bytesPerSecond, { endWithoutReading = false } = {}) {
   const received = []
   let stalled = false
   const sessions = new Set()
@@ -31,6 +31,7 @@ async function startSlowCursor(bytesPerSecond) {
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
     stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
     stream.on("error", () => {})
+    if (endWithoutReading) return void setTimeout(() => stream.end(), 100)
     stream.on("data", (chunk) => { received[index] += chunk.length })
   })
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
@@ -79,8 +80,8 @@ async function startSlowCursor(bytesPerSecond) {
   }
 }
 
-async function scenario(name, rate, run) {
-  const fake = await startSlowCursor(rate)
+async function scenario(name, rate, run, options) {
+  const fake = await startSlowCursor(rate, options)
   try {
     await run(fake)
   } finally {
@@ -128,6 +129,15 @@ for (const close of ["destroy", "end"]) {
     assert.ok(Date.now() - startedAt < 1_000)
   })
 }
+
+await scenario("response-end", 200_000, async () => {
+  const run = await bidiRunStream("token", { baseURL: ORIGIN })
+  assert.equal(run.write(new Uint8Array(3_000_000).fill(5)), false)
+  const error = await Promise.race([failureOf(run.waitForDrain()), sleep(3_000).then(() => "pending")])
+  assert.notEqual(error, "pending")
+  assert.ok(error instanceof Error)
+  assert.notEqual(error.name, "CursorLocalCancellationError")
+}, { endWithoutReading: true })
 
 await scenario("read-idle", 200_000, async (fake) => {
   const run = await bidiRunStream("token", { baseURL: ORIGIN, readIdleMs: 500 })
