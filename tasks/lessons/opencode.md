@@ -143,7 +143,11 @@ These are failure lessons shared by both hosts, not a replacement for
   command becomes host-retryable or a renewed attempt forgets its saved state.
   Result delivery and follow-up user actions invalidate older checkpoints;
   compare frame arrival order so a queued pre-result checkpoint cannot become
-  eligible just because the pump reads it after delivery
+  eligible just because the pump reads it after delivery. Capture a follow-up's
+  arrival cutoff before opening its replacement Run: its checkpoint can arrive
+  before the old stream finishes draining. An inherited tool barrier still
+  permits one credential renewal on an untouched resume with an eligible
+  checkpoint; new output or stateful activity must prevent it
   (`AttemptReplaySafety`, `test/parallel-pump.test.ts`,
   `test/run-interruption.test.ts`, `test/run-error-host.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for

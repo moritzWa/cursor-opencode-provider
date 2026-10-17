@@ -474,6 +474,85 @@ describe("interrupted Cursor Run handling", () => {
     }
   })
 
+  it.each([false, true])("renews an untouched checkpoint resume after an earlier tool barrier (new checkpoint: %s)", async newCheckpoint => {
+    const checkpoint = Uint8Array.of(10, 1, 11)
+    const replacementCheckpoint = Uint8Array.of(10, 1, 12)
+    const initial = fakeSession("tool-before-renewal", [
+      serverFrame({ conversation_checkpoint_update: checkpoint }),
+      endStreamError("unavailable"),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    const rejected = fakeSession("untouched-resume", [
+      ...(newCheckpoint ? [serverFrame({ conversation_checkpoint_update: replacementCheckpoint })] : []),
+      endStreamError("unauthenticated"),
+    ])
+    const renewed = fakeSession("renewed-resume", [turnEnded()])
+    rejected.conversationId = renewed.conversationId = initial.conversationId
+    const recoveries: CursorRunRecovery[] = []
+    let renewals = 0
+    const final = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async recovery => {
+        recoveries.push(recovery)
+        return recoveries.length === 1 ? rejected : renewed
+      },
+    })
+    expect(final).toBe(renewed)
+    expect(renewals).toBe(1)
+    expect(recoveries).toEqual([
+      { kind: "resume", conversationId: initial.conversationId, checkpoint },
+      { kind: "resume", conversationId: initial.conversationId, checkpoint: newCheckpoint ? replacementCheckpoint : checkpoint },
+    ])
+    expect(renewed.replaySafety).toEqual(initial.replaySafety)
+  })
+
+  it.each(["output", "tool display", "revoked checkpoint"])("does not renew a resumed credential after %s", async activity => {
+    const initial = fakeSession("before-resume-activity", [
+      serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 13) }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    const rejected = fakeSession("resume-activity", [
+      ...(activity === "output" ? [serverFrame({ interaction_update: { text_delta: { text: "Visible progress" } } })] : []),
+      ...(activity === "tool display" ? [serverFrame({ interaction_update: { tool_call_started: { call_id: "new-tool" } } })] : []),
+      endStreamError("unauthenticated"),
+    ])
+    rejected.checkpointRevoked = activity === "revoked checkpoint"
+    let renewals = 0
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async () => { recoveries++; return rejected },
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorAuthError)
+    expect(recoveries).toBe(1)
+    expect(renewals).toBe(0)
+  })
+
+  it("never renews twice after a checkpointed tool result", async () => {
+    const initial = fakeSession("tool-before-two-rejections", [
+      serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, 14) }),
+    ])
+    initial.replaySafety = { statefulBarrier: "non-control-exec" }
+    let renewals = 0
+    let recoveries = 0
+    const failure = await pumpWithRecovery({
+      initialSession: initial,
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      renewRejectedCredential: () => { renewals++ },
+      recover: async () => { recoveries++; return fakeSession(`rejection-${recoveries}`, [endStreamError("unauthenticated")]) },
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(CursorAuthError)
+    expect(recoveries).toBe(2)
+    expect(renewals).toBe(1)
+  })
+
   it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
     const cases = [
       { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },

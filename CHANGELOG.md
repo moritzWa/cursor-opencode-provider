@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Interrupted Runs retain their checkpoint across credential renewal. Completed tools remain replay barriers across host steps, and checkpoints received before a tool result or follow-up message are not used to resume it ([#103](https://github.com/oakimov/cursor-opencode-provider/pull/103))
+- Interrupted Runs retain their checkpoint across credential renewal, including a rejected login on an untouched resumed attempt. Completed tools remain replay barriers across host steps. Follow-ups accept checkpoints received while opening the new Run, and older checkpoints stay ineligible after a tool result or follow-up message ([#103](https://github.com/oakimov/cursor-opencode-provider/pull/103))
 
 ## [0.8.3] - 2026-10-17
 

@@ -832,10 +832,10 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
 }
 
 /** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
-function invalidateResumeCheckpoint(session: CursorSession): void {
+function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival()): void {
   session.resumeCheckpoint = undefined
   session.checkpointRevoked = true
-  session.resumeCheckpointAfterFrame = lastFrameArrival()
+  session.resumeCheckpointAfterFrame = afterFrame
 }
 
 /** A queued checkpoint predating a delivered result still describes the old step. */
@@ -1359,11 +1359,16 @@ export async function pumpWithRecovery(input: {
       } else if (pumpedSession.checkpointRevoked) {
         turnCheckpoint = undefined
       }
+      const checkpoint = turnCheckpoint
+      // The inherited tool barrier forbids replaying the action, but an untouched
+      // replacement may renew and resume its checkpoint without replaying tools.
+      const untouchedCheckpointResume = resumedAttempt && checkpoint !== undefined
+        && failure.replayBarrier === undefined && !failure.checkpointUnusable
       if (
         input.renewRejectedCredential
         && !credentialRenewed
         && isRejectedCredentialError(failure)
-        && failure.replaySafe
+        && (failure.replaySafe || untouchedCheckpointResume)
       ) {
         credentialRenewed = true
         trace(
@@ -1375,7 +1380,7 @@ export async function pumpWithRecovery(input: {
         session = await reopen(
           pumpedSession,
           failure,
-          pumpedSession.resumeCheckpoint ?? (pumpedSession.checkpointRevoked ? undefined : turnCheckpoint),
+          checkpoint,
         )
         attempt--
         continue
@@ -1392,7 +1397,6 @@ export async function pumpWithRecovery(input: {
           throw noProgressResumeError(failure, noProgressResumes)
         }
       }
-      const checkpoint = turnCheckpoint
       if (!failure.replaySafe && !checkpoint) {
         // Cursor CLI sends the same action again. Shown output keeps the
         // provider from doing so; the host can, unless a side effect would repeat.
@@ -5087,9 +5091,10 @@ export async function pump(
         trace(`steer: Cursor did not take ${steers.undelivered.length} early steer(s); sending them as a follow-up Run`)
         if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         try {
+          const beforeFollowup = lastFrameArrival()
           await session.reopenWithUserMessage(steers.undelivered.map((steer) => steer.text).join("\n\n"), abortSignal)
-          // Resuming the checkpoint from before the follow-up would send the steer again.
-          invalidateResumeCheckpoint(session)
+          // Revoke the old state, admitting checkpoints received while reopening.
+          invalidateResumeCheckpoint(session, beforeFollowup)
           endingTurns.delete(session)
           textBreakPending = true
           continue
@@ -5121,13 +5126,14 @@ export async function pump(
         trace("progress-only: continuing attempt=1")
         if (session.openCodeSessionId) resumeEmittedStep(session.openCodeSessionId, session.conversationId)
         try {
+          const beforeFollowup = lastFrameArrival()
           await session.reopenWithUserMessage(
             progressOnlyContinuationPrompt(
               workspaceRootFromRequestContext(session.requestContext),
             ),
             abortSignal,
           )
-          invalidateResumeCheckpoint(session)
+          invalidateResumeCheckpoint(session, beforeFollowup)
           endingTurns.delete(session)
           assistantText = ""
           continue

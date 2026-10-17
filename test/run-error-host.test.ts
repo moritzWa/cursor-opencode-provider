@@ -8,7 +8,7 @@ import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3Stre
 import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
+import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
@@ -126,16 +126,21 @@ async function streamError(sessionKey: string): Promise<unknown> {
 }
 
 describe("checkpoint eligibility across host results", () => {
-  for (const afterResult of [false, true]) {
-    it(`only resumes a checkpoint received after the result (after: ${afterResult})`, async () => {
+  for (const [afterResult, rejectReplacement] of [[false, false], [true, false], [true, true]] as const) {
+    it(`only resumes a checkpoint received after the result (after: ${afterResult}, expired replacement: ${rejectReplacement})`, async () => {
       const checkpoint = Uint8Array.of(10, 1, 7)
       let resumed = false
+      let renewals = 0
       scripted = (stream, message) => {
         const send = (message: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", message)))
         if (message.run_request) {
           runs++
           resumed = !!(message.run_request as { action?: { resume_action?: unknown } }).action?.resume_action
           if (resumed) {
+            if (rejectReplacement && runs === 2) {
+              stream.end(frame(Buffer.from('{"error":{"code":"unauthenticated"}}'), 2))
+              return
+            }
             send({ interaction_update: { turn_ended: {} } })
             stream.end()
           } else {
@@ -154,7 +159,11 @@ describe("checkpoint eligibility across host results", () => {
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
         const model = createCursor({
-          name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
+          getAccessToken: async request => {
+            if (request?.forceRefresh) renewals++
+            return renewals ? "renewed-test-token" : "test-token"
+          },
           retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run echo done" }] }]
@@ -183,7 +192,8 @@ describe("checkpoint eligibility across host results", () => {
           const parts = await read(options)
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(resumed).toBe(true)
-          expect(runs).toBe(2)
+          expect(runs).toBe(rejectReplacement ? 3 : 2)
+          expect(renewals).toBe(rejectReplacement ? 1 : 0)
         } else {
           const error = await read(options).catch((error: unknown) => error)
           expect(error).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
@@ -195,6 +205,77 @@ describe("checkpoint eligibility across host results", () => {
       }
     }, 30_000)
   }
+})
+
+describe("follow-up checkpoint arrival", () => {
+  it("resumes a progress follow-up checkpoint received before reopen returns", async () => {
+    const checkpoint = Uint8Array.of(10, 1, 8)
+    let firstRun: http2.ServerHttp2Stream | undefined
+    const requests: Record<string, unknown>[] = []
+    scripted = (run, message) => {
+      if (!message.run_request) return
+      const request = message.run_request as Record<string, unknown>
+      requests.push(request)
+      const send = (message: Record<string, unknown>) => run.write(frame(encodeMessage("AgentServerMessage", message)))
+      if (requests.length === 1) {
+        firstRun = run
+        send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+        send({ interaction_update: { text_delta: { text: "Checking the workspace" } } })
+      } else if (requests.length === 2) {
+        send({ conversation_checkpoint_update: checkpoint })
+        send({ interaction_update: { thinking_delta: { text: "Continuing the follow-up" } } })
+        run.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
+      } else {
+        send({ interaction_update: { text_delta: { text: "Finished." } } })
+        send({ interaction_update: { turn_ended: {} } })
+        run.end()
+      }
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-followup-checkpoint-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const key = "ses_progress_early_checkpoint"
+      const model = createCursor({
+        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
+        retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      }).languageModel("composer-2.5")
+      const { stream } = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Check the workspace" }] }],
+        tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }],
+        headers: { "x-opencode-session-id": key },
+      })
+      let wrapped = false
+      let arrivedBeforeReopenReturned = false
+      const parts: LanguageModelV3StreamPart[] = []
+      const reader = stream.getReader()
+      for (;;) {
+        const { done, value: part } = await reader.read()
+        if (done) break
+        parts.push(part)
+        if (part.type !== "text-delta" || wrapped) continue
+        wrapped = true
+        const session = sessionManager.findOpenByOpenCodeSessionId(key)!
+        const reopen = session.reopenWithUserMessage!
+        session.reopenWithUserMessage = async (text, signal) => {
+          const before = lastFrameArrival()
+          await reopen(text, signal)
+          // Force the replacement's frames into the transport queue while the
+          // caller still awaits reopen (as while draining the previous stream).
+          for (let i = 0; i < 100 && lastFrameArrival() === before; i++) await Bun.sleep(1)
+          arrivedBeforeReopenReturned = lastFrameArrival() > before
+          expect(arrivedBeforeReopenReturned).toBe(true)
+        }
+        firstRun!.write(frame(encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } })))
+      }
+      expect(arrivedBeforeReopenReturned).toBe(true)
+      expect(requests).toHaveLength(3)
+      expect(requests[2]).toMatchObject({ action: { resume_action: {} }, conversation_state: checkpoint,
+        conversation_id: requests[0]!.conversation_id })
+      expect(parts.some(part => part.type === "text-delta" && part.delta === "Finished.")).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 })
 
 describe("Run errors as the host sees them", () => {
