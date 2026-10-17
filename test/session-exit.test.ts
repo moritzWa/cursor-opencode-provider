@@ -1,8 +1,10 @@
-import { describe, expect, it } from "bun:test"
+import { describe, expect, it, spyOn } from "bun:test"
 import fs from "node:fs/promises"
+import http2 from "node:http2"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { bidiRunStream, closeCachedHttp2SessionsForTests, getSession } from "../src/transport/connect.js"
 
 // Each case runs in a child process against a local HTTP/2 server whose own
 // handles are unref'd, so only the client session can keep the process alive.
@@ -139,4 +141,70 @@ describe("cached HTTP/2 session and process exit", () => {
     const result = await runUntilExit(OVERLAPPING_RUNS, 8_000)
     expect(result).toMatchObject({ exited: true, code: 0, stdout: "second answered: 42\ndone\n" })
   }, 15_000)
+})
+
+describe("cached HTTP/2 session ref", () => {
+  it("unrefs a new session and refs it only while a ping or a Run holds it", async () => {
+    const server = http2.createServer()
+    const serverClosed: Array<Promise<void>> = []
+    server.on("stream", (stream) => {
+      stream.respond({ ":status": 200 })
+      stream.on("error", () => {})
+      stream.on("data", () => {})
+      stream.on("end", () => stream.end())
+      serverClosed.push(new Promise((resolve) => stream.once("close", () => resolve())))
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const address = server.address()
+    if (!address || typeof address === "string") throw new Error("expected TCP address")
+
+    // The real connect path, pointed at the local plaintext server.
+    const calls: string[] = []
+    let callRecorded = () => {}
+    const record = (call: string) => {
+      calls.push(call)
+      callRecorded()
+    }
+    const untilCalls = (count: number) => new Promise<void>((resolve) => {
+      callRecorded = () => { if (calls.length >= count) resolve() }
+      callRecorded()
+    })
+    const connected: http2.ClientHttp2Session[] = []
+    const connect = http2.connect.bind(http2)
+    const connectSpy = spyOn(http2, "connect").mockImplementation(((origin: string | URL) => {
+      record(`connect ${String(origin)}`)
+      const session = connect(`http://127.0.0.1:${address.port}`)
+      const ref = session.ref.bind(session)
+      const unref = session.unref.bind(session)
+      session.ref = () => { record("ref"); ref() }
+      session.unref = () => { record("unref"); unref() }
+      connected.push(session)
+      return session
+    }) as typeof http2.connect)
+    const keys = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
+    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+    for (const key of keys) delete process.env[key]
+    const origin = "https://agentn.session-ref-test.cursor.sh"
+    try {
+      const session = await getSession(origin)
+      expect(calls).toEqual([`connect ${origin}`, "unref"])
+      expect(session).toBe(connected[0]!)
+
+      const run = await bidiRunStream("token", { baseURL: origin })
+      // Reuse ping: ref, then unref with no Run live. The Run then refs it.
+      expect(calls.slice(2)).toEqual(["ref", "unref", "ref"])
+      run.end()
+      await Promise.all([serverClosed[0], untilCalls(6)])
+      expect(calls.slice(5)).toEqual(["unref"])
+      expect(connectSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      connectSpy.mockRestore()
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key]
+        else process.env[key] = saved[key]
+      }
+      closeCachedHttp2SessionsForTests()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })
