@@ -377,7 +377,7 @@ export type CursorSession = {
   closed: boolean
   /** The host stopped the turn (OpenCode 2 interrupt); the Run is being cancelled and must not be continued. */
   hostInterrupted?: string
-  reopenWithUserMessage?: (text: string) => Promise<void>
+  reopenWithUserMessage?: (text: string, signal?: AbortSignal) => Promise<void>
 }
 
 export function stoppedWith(session: CursorSession): string | undefined {

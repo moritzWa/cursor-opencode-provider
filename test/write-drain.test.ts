@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import http2 from "node:http2"
 import net from "node:net"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
+import { createCursor } from "../src/index.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 import { CursorLocalCancellationError, CursorProviderError } from "../src/errors.js"
 import { pump, resetTurnStateForTests } from "../src/language-model.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -27,15 +34,17 @@ const ORIGIN = "https://agentn.drain-test.cursor.sh"
 async function startSlowCursor(bytesPerSecond: number, options: { endWithoutReading?: boolean } = {}) {
   const received: number[] = []
   const bodies: Buffer[][] = []
+  const serverStreams: http2.ServerHttp2Stream[] = []
   let stalled = false
   const sessions = new Set<http2.Http2Session>()
   const server = http2.createServer()
   server.on("session", (session) => sessions.add(session))
   server.on("stream", (stream) => {
     const index = received.push(0) - 1
+    serverStreams.push(stream)
     bodies.push([])
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
-    stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
+    stream.write(encodeFrame(0x00, encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })))
     stream.on("error", () => {})
     if (options.endWithoutReading) return void setTimeout(() => stream.end(), 100)
     stream.on("data", (chunk: Buffer) => {
@@ -85,6 +94,9 @@ async function startSlowCursor(bytesPerSecond: number, options: { endWithoutRead
   return {
     received,
     body: (index: number) => Buffer.concat(bodies[index] ?? []),
+    send(index: number, message: Record<string, unknown>) {
+      serverStreams[index]!.write(encodeFrame(0, encodeMessage("AgentServerMessage", message)))
+    },
     stall() { stalled = true },
     async close() {
       for (const timer of timers) clearInterval(timer)
@@ -230,5 +242,209 @@ describe("Run write drain", () => {
     expect(error).toBeInstanceOf(CursorProviderError)
     expect((error as CursorProviderError).code).toBe("CURSOR_READ_IDLE_TIMEOUT")
     expect(run.isClosed()).toBe(true)
+  }, 15_000)
+})
+
+describe("provider upload cancellation", () => {
+  it("cancels a blocked KV reply while the current provider step is pumping", async () => {
+    fake = await startSlowCursor(200_000)
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-kv-cancel-"))
+    const previousCache = getHostCacheDirOverride()
+    const abort = new AbortController()
+    let consumed: Promise<unknown> | undefined
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const result = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+        tools: [{ type: "function", name: "read", description: "Read", inputSchema: { type: "object", properties: {} } }],
+        headers: { "x-opencode-session-id": "ses_kv_upload" }, abortSignal: abort.signal,
+      } as LanguageModelV3CallOptions)
+      const session = sessionManager.findOpenByOpenCodeSessionId("ses_kv_upload")!
+      session.blobs.set("b10b", new Uint8Array(3_000_000))
+      const reader = result.stream.getReader()
+      consumed = (async () => { while (!(await reader.read()).done) { /* consume */ } })()
+      const outcome = failureOf(consumed)
+      await waitUntil(() => fake!.received.length === 1)
+      fake.send(0, { kv_server_message: { id: 4, get_blob_args: { blob_id: Uint8Array.of(0xb1, 0x0b) } } })
+      await waitUntil(() => fake!.received[0]! > 50_000)
+      expect(fake.received[0]).toBeGreaterThan(50_000)
+      fake.stall()
+      abort.abort()
+      expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])).toBeInstanceOf(CursorLocalCancellationError)
+      expect(fake.received).toHaveLength(1)
+    } finally {
+      sessionManager.dispose()
+      closeCachedHttp2SessionsForTests()
+      if (consumed) await failureOf(consumed)
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it("keeps a successfully uploaded Run alive after the host aborts a completed tool step", async () => {
+    fake = await startSlowCursor(2_000_000)
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-tool-step-abort-"))
+    const previousCache = getHostCacheDirOverride()
+    const controller = new AbortController()
+    const sessionKey = "ses_uploaded_tool_step"
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const result = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Read the file" }] }],
+        tools: [{ type: "function", name: "read", description: "Read a file", inputSchema: {
+          type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"],
+        } }],
+        headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
+      } as LanguageModelV3CallOptions)
+      await fs.writeFile(path.join(cacheDir, "example.txt"), "example content")
+      await waitUntil(() => fake!.received.length === 1)
+      fake.send(0, { exec_server_message: { id: 4, read_args: { path: path.join(cacheDir, "example.txt") } } })
+      const reader = result.stream.getReader()
+      const parts = []
+      for (;;) {
+        const next = await reader.read()
+        if (next.done) break
+        parts.push(next.value)
+      }
+      expect(parts.some((part) => part.type === "tool-call")).toBe(true)
+      const session = sessionManager.findOpenByOpenCodeSessionId(sessionKey)!
+      controller.abort()
+      expect(session.pending.size).toBe(1)
+      expect(session.closed).toBe(false)
+      expect(session.stream.isClosed()).toBe(false)
+      const nextStep = new AbortController()
+      const reopened = session.reopenWithUserMessage!("x".repeat(3_000_000), nextStep.signal)
+      const outcome = failureOf(reopened)
+      await waitUntil(() => fake!.received[1]! > 50_000)
+      expect(fake.received[1]).toBeGreaterThan(50_000)
+      fake.stall()
+      nextStep.abort()
+      expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])).toBeInstanceOf(CursorLocalCancellationError)
+    } finally {
+      sessionManager.dispose()
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it.each(["abort", "host-stop"] as const)("cancels an unregistered replacement upload on %s", async (stop) => {
+    fake = await startSlowCursor(200_000)
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-reopen-cancel-"))
+    const previousCache = getHostCacheDirOverride()
+    const controller = new AbortController()
+    const sessionKey = `ses_reopen_upload_${stop}`
+    let reopened: Promise<unknown> | undefined
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const result = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+        tools: [{ type: "function", name: "read", description: "Read", inputSchema: { type: "object", properties: {} } }],
+        headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
+      } as LanguageModelV3CallOptions)
+      // The replacement has not been assigned to the registered session yet.
+      const session = sessionManager.findOpenByOpenCodeSessionId(sessionKey)!
+      reopened = session.reopenWithUserMessage!("x".repeat(3_000_000), controller.signal)
+      const outcome = failureOf(reopened)
+      await waitUntil(() => fake!.received[1]! > 50_000)
+      expect(fake.received[1]).toBeGreaterThan(50_000)
+      fake.stall()
+      if (stop === "abort") controller.abort()
+      else await notifyHostInterrupt(sessionKey, "user", Date.now())
+      expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])).toBeInstanceOf(CursorLocalCancellationError)
+      sessionManager.dispose()
+      await failureOf(result.stream.cancel())
+    } finally {
+      sessionManager.dispose()
+      closeCachedHttp2SessionsForTests()
+      if (reopened) await failureOf(reopened)
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it("cancels a blocked tool-result upload on the continuation call's signal", async () => {
+    fake = await startSlowCursor(200_000)
+    const stream = await bidiRunStream("token", { baseURL: ORIGIN })
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-continuation-cancel-"))
+    const previousCache = getHostCacheDirOverride()
+    const controller = new AbortController()
+    const sessionKey = "ses_upload_continuation"
+    const session = sessionFixture({
+      sessionId: "upload-continuation", conversationId: "upload-continuation-conversation", openCodeSessionId: sessionKey,
+      cacheDir, pending: new Map(), blobs: new Map(), displayToolCalls: new Map(), editToolCalls: new Map(),
+      nextBridgedExecId: 900_000, pumpActive: false, heartbeat: null,
+      usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+      stream, frames: stream.frames()[Symbol.asyncIterator](), allowTools: true, toolCatalog: [], toolDescriptors: [], requestContext: {},
+    })
+    sessionManager.registerPending(4, session, "read_result", "read")
+    let opening: Promise<unknown> | undefined
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const toolCallId = `cursor_${session.sessionId}_4`
+      opening = Promise.resolve(model.doStream({
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "Read the file" }] },
+          { role: "assistant", content: [{ type: "tool-call", toolCallId, toolName: "read", input: { filePath: "example.txt" } }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId, toolName: "read", output: { type: "text", value: "x".repeat(3_000_000) } }] },
+        ],
+        headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
+      } as LanguageModelV3CallOptions))
+      const outcome = failureOf(opening)
+      await waitUntil(() => fake!.received[0]! > 50_000)
+      expect(fake.received[0]).toBeGreaterThan(50_000)
+      fake.stall()
+      controller.abort()
+      const error = await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])
+      expect(error).toBeInstanceOf(CursorLocalCancellationError)
+      expect(session.closed).toBe(true)
+    } finally {
+      closeCachedHttp2SessionsForTests()
+      if (opening) await failureOf(opening)
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it.each(["abort", "host-stop", "other-session", "shutdown", "title-host-stop"] as const)("handles %s during the initial upload before a session is registered", async (stop) => {
+    fake = await startSlowCursor(200_000)
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-upload-cancel-"))
+    const previousCache = getHostCacheDirOverride()
+    const controller = new AbortController()
+    const sessionKey = `ses_upload_${stop}`
+    let opening: Promise<unknown> | undefined
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      opening = Promise.resolve(model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x".repeat(3_000_000) }] }],
+        tools: stop === "title-host-stop" ? [] : [{ type: "function", name: "read", description: "Read a file", inputSchema: {
+          type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"],
+        } }],
+        headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
+      } as LanguageModelV3CallOptions))
+      const outcome = failureOf(opening)
+      await waitUntil(() => fake!.received[0]! > 50_000)
+      expect(fake.received[0]).toBeGreaterThan(50_000)
+      fake.stall()
+      if (stop === "abort") controller.abort()
+      else if (stop === "host-stop") await notifyHostInterrupt(sessionKey, "user", Date.now())
+      else {
+        await notifyHostInterrupt(stop === "other-session" ? "ses_other" : sessionKey,
+          stop === "shutdown" ? "shutdown" : "user", Date.now())
+        expect(await Promise.race([outcome, Bun.sleep(50).then(() => "still uploading")])).toBe("still uploading")
+        controller.abort()
+      }
+      const error = await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])
+      expect(error).toBeInstanceOf(CursorLocalCancellationError)
+    } finally {
+      closeCachedHttp2SessionsForTests()
+      if (opening) await failureOf(opening)
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
   }, 15_000)
 })

@@ -1079,7 +1079,10 @@ export async function bidiRunStream(
       finishInbound()
       stopInboundReader()
       settleTerminal({ kind: "local-close" })
-      stream.end()
+      // A blocked write cannot finish gracefully; discard it rather than leave
+      // its stream and session referenced after the drain has been rejected.
+      if (backpressured) closeLocally()
+      else stream.end()
     },
     async *frames() {
       try {
@@ -1120,8 +1123,10 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
-        closeLocally()
       }
+      // end() may already have half-closed the request. destroy() must still
+      // reset the stream if the peer has left its response open.
+      closeLocally()
     },
     isClosed() {
       return remotelyClosed || locallyClosed || stream.closed || stream.destroyed

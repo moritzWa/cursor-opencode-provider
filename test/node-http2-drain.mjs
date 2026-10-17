@@ -13,6 +13,12 @@ import {
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
 import { writeStreamMessage } from "../dist/stream-write.js"
+import { createCursor } from "../dist/index.js"
+import { notifyHostInterrupt } from "../dist/host-interrupt.js"
+import { sessionManager } from "../dist/session.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../dist/context/paths.js"
+import { encodeMessage } from "../dist/protocol/messages.js"
+
 
 // Node keeps a large write's full size buffered until it is out and holds back
 // a stream's `close` while it is, so the drain is checked on Node as well as
@@ -27,14 +33,16 @@ const waitUntil = async (condition, ms = 5_000) => {
 
 async function startSlowCursor(bytesPerSecond, { endWithoutReading = false } = {}) {
   const received = []
+  const serverStreams = []
   let stalled = false
   const sessions = new Set()
   const server = http2.createServer()
   server.on("session", (session) => sessions.add(session))
   server.on("stream", (stream) => {
     const index = received.push(0) - 1
+    serverStreams.push(stream)
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
-    stream.write(encodeFrame(0x00, new Uint8Array([1, 2, 3])))
+    stream.write(encodeFrame(0x00, encodeMessage("AgentServerMessage", { interaction_update: { heartbeat: {} } })))
     stream.on("error", () => {})
     if (endWithoutReading) return void setTimeout(() => stream.end(), 100)
     stream.on("data", (chunk) => { received[index] += chunk.length })
@@ -74,6 +82,7 @@ async function startSlowCursor(bytesPerSecond, { endWithoutReading = false } = {
   cacheHttp2SessionForTests(ORIGIN, client)
   return {
     received,
+    send(index, message) { serverStreams[index].write(encodeFrame(0, encodeMessage("AgentServerMessage", message))) },
     stall() { stalled = true },
     async close() {
       for (const timer of timers) clearInterval(timer)
@@ -155,10 +164,84 @@ await scenario("read-idle", 200_000, async (fake) => {
   assert.equal(run.isClosed(), true)
 })
 
+// Cancellation must work through the provider callers, which deliberately do
+// not bind a completed tool step's signal to the held HTTP/2 stream.
+for (const [kind, stop] of [["initial", "abort"], ["initial", "host-stop"], ["replacement", "abort"], ["replacement", "host-stop"], ["continuation", "abort"], ["kv", "abort"]]) {
+  await scenario(`provider-${kind}-${stop}`, 200_000, async (fake) => {
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-node-upload-cancel-"))
+    const previousCache = getHostCacheDirOverride()
+    const controller = new AbortController()
+    const sessionKey = `ses_node_upload_${kind}_${stop}`
+    let opening
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
+        workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
+      const call = {
+        prompt: [{ role: "user", content: [{ type: "text", text: kind === "initial" ? "x".repeat(3_000_000) : "Read" }] }],
+        tools: [{ type: "function", name: "read", description: "Read", inputSchema: {
+          type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"],
+        } }],
+        headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
+      }
+      if (kind === "kv") {
+        const result = await model.doStream(call)
+        const session = sessionManager.findOpenByOpenCodeSessionId(sessionKey)
+        session.blobs.set("b10b", new Uint8Array(3_000_000))
+        const reader = result.stream.getReader()
+        opening = (async () => { while (!(await reader.read()).done) { /* consume */ } })()
+        void opening.catch(() => {})
+        await waitUntil(() => fake.received.length === 1)
+        fake.send(0, { kv_server_message: { id: 4, get_blob_args: { blob_id: Uint8Array.of(0xb1, 0x0b) } } })
+      } else if (kind === "replacement") {
+        await model.doStream(call)
+        opening = sessionManager.findOpenByOpenCodeSessionId(sessionKey).reopenWithUserMessage("x".repeat(3_000_000), controller.signal)
+      } else if (kind === "continuation") {
+        const stream = await bidiRunStream("token", { baseURL: ORIGIN })
+        const session = {
+          sessionId: "node-upload-continuation", conversationId: "node-upload-conversation", openCodeSessionId: sessionKey,
+          cacheDir, pending: new Map(), blobs: new Map(), displayToolCalls: new Map(), editToolCalls: new Map(),
+          nextBridgedExecId: 900_000, pumpActive: false, heartbeat: null,
+          usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+          billing: { key: sessionKey, prefixTokens: 0 },
+          stream, frames: stream.frames()[Symbol.asyncIterator](), allowTools: true, toolCatalog: [], toolDescriptors: [], requestContext: {},
+        }
+        sessionManager.registerPending(4, session, "read_result", "read")
+        const toolCallId = `cursor_${session.sessionId}_4`
+        call.prompt.push(
+          { role: "assistant", content: [{ type: "tool-call", toolCallId, toolName: "read", input: { filePath: "example.txt" } }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId, toolName: "read", output: { type: "text", value: "x".repeat(3_000_000) } }] },
+        )
+        opening = Promise.resolve(model.doStream(call))
+      } else opening = Promise.resolve(model.doStream(call))
+      const outcome = failureOf(opening)
+      const index = kind === "replacement" ? 1 : 0
+      await waitUntil(() => fake.received[index] > 50_000)
+      assert.ok(fake.received[index] > 50_000)
+      fake.stall()
+      if (stop === "abort") controller.abort()
+      else await notifyHostInterrupt(sessionKey, "user", Date.now())
+      const error = await Promise.race([outcome, sleep(1_000).then(() => "still uploading")])
+      assert.equal(error?.name, "CursorLocalCancellationError")
+    } finally {
+      sessionManager.dispose()
+      closeCachedHttp2SessionsForTests()
+      if (opening) await failureOf(opening)
+      setHostCacheDirOverride(previousCache)
+      await fs.rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+}
+
 // A destroyed Run must close its stream so the cached session is released and
 // the process can exit, with an idle stream and with a blocked request write.
 const CONNECT_MODULE = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/transport/connect.js")).href
-for (const [name, bytes] of [["exit-after-destroy-idle", 10], ["exit-after-destroy-blocked", 3_000_000]]) {
+for (const [name, bytes, close] of [
+  ["exit-after-destroy-idle", 10, "destroy"],
+  ["exit-after-destroy-blocked", 3_000_000, "destroy"],
+  ["exit-after-end-blocked", 3_000_000, "end"],
+  ["exit-after-end-destroy-idle", 10, "end-then-destroy"],
+  ["exit-after-end-destroy-blocked", 3_000_000, "end-then-destroy"],
+]) {
   const script = `
 import http2 from "node:http2"
 import { bidiRunStream, cacheHttp2SessionForTests } from ${JSON.stringify(CONNECT_MODULE)}
@@ -179,7 +262,8 @@ void (async () => {
   run.write(new Uint8Array(${bytes}).fill(5))
   await arrived
   await new Promise((resolve) => setTimeout(resolve, 200))
-  run.destroy()
+  ${close !== "destroy" ? "run.end()" : ""}
+  ${close !== "end" ? "run.destroy()" : ""}
   console.log("destroyed")
 })()
 `
@@ -193,11 +277,16 @@ void (async () => {
     })
     let stdout = ""
     child.stdout.on("data", (chunk) => { stdout += chunk })
+    let timer
+    const exited = new Promise((resolve, reject) => {
+      child.once("close", resolve)
+      child.once("error", reject)
+    })
     const code = await Promise.race([
-      new Promise((resolve) => child.once("exit", resolve)),
-      sleep(8_000).then(() => "timeout"),
-    ])
-    if (code === "timeout") child.kill()
+      exited,
+      new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), 8_000) }),
+    ]).finally(() => clearTimeout(timer))
+    if (code === "timeout") { child.kill(); await exited }
     assert.equal(code, 0)
     assert.equal(stdout, "destroyed\n")
   } finally {
