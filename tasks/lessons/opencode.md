@@ -238,6 +238,12 @@ These are failure lessons shared by both hosts, not a replacement for
   structured path results: rewriting shell stdout prefixed branch names,
   shebangs and assignments and misplaced paths printed after a `cd`
   ([#96](https://github.com/oakimov/cursor-opencode-provider/issues/96)).
+  Check the host projections before the encoder too: secondary display cleanup
+  must respect the captured native exit, and failed shell streams must retain
+  partial stdout (`test/plugin.test.ts`, `test/plugin-opencode2.test.ts`,
+  `test/continuation-session.test.ts`). Private wrapper cleanup removes exactly
+  the launcher's separator, preserving spaces, CRLF, blank lines and literal
+  placeholders (`test/shell-timeout.test.ts`).
 - **Keep occupancy, work and money separate.** Hosts replace message tokens but
   add step costs; Run-wide generation inflated tok/s. Use checkpoint occupancy,
   retain stale markers, and keep raw counters distinct from synthetic billing

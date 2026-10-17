@@ -2011,16 +2011,16 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
   } else if (resultField === "shell_stream") {
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
+    // Retain progress even when the host also reports a failure or interruption.
+    // A command may change directories; stdout must reach Cursor unchanged.
+    if (input.output) {
+      frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
+    }
     if (input.error) {
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: input.interrupted || input.shellOutcome?.kind === "aborted"
         ? { code: 0, aborted: true, abort_reason: 1 } : { code: 1, aborted: false } }))
     } else {
-      // Cursor CLI forwards stdout bytes unchanged; a `cd` in the command
-      // makes any path rewrite here guess the wrong directory.
-      if (input.output) {
-        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
-      }
       if (input.shellOutcome?.kind === "backgrounded") {
         frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
           backgrounded: {
