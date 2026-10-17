@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-10-17
+
+### Added
+
+- Muse Wonder pricing, context, and capability metadata from Cursor's model docs
+
 ### Fixed
 
 - A Cursor Task with attached files hands the subagent exact file paths to open itself, keeps Cursor's description, and avoids extra parent reads, including runtime metadata attachments; unstatable attachments report failure ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82), based on a fix by [@nkoynov](https://github.com/nkoynov))
