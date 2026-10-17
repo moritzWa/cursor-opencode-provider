@@ -7,7 +7,7 @@ import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isC
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
-import { applyHostPromptEvent, sessionActivity } from "./activity.js"
+import { applyHostPromptEvent, applyHostToolEvent, sessionActivity } from "./activity.js"
 import { notifyHostInterrupt } from "./host-interrupt.js"
 import {
   announceHostSteer,
@@ -700,6 +700,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
   const payload = eventPayload(event)
   const info = payload?.info
   applyHostPromptEvent(sessionActivity, event?.type, payload)
+  applyHostToolEvent(sessionActivity, event?.type, payload)
   switch (event?.type) {
     case "credential.switched":
     case "credential.updated": {

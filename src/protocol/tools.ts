@@ -940,6 +940,36 @@ function planWholeFileEdit(source: string, target: string): WholeFileEditReplace
 }
 
 /**
+ * Host tool a Cursor edit announcement will become, using the same file facts
+ * as `remapCorrelatedEditWriteForCatalog` and `remapEditToolsForCatalog`. An
+ * existing file becomes `edit`, else the patch tool. A missing file is a
+ * creation, which stays `write`, else becomes the patch tool's Add File. A name
+ * is withheld when those remaps would refuse the file or not produce that
+ * tool: no workspace for a relative path, not a regular file, too large,
+ * unreadable, or `patch` with carriage returns.
+ */
+export function hostToolForCursorEdit(
+  filePath: string,
+  catalog: ReadonlySet<string>,
+  workspaceRoot?: string,
+): string | undefined {
+  const patchTool = hostPatchTool(catalog)
+  if (!path.isAbsolute(filePath) && !workspaceRoot) return undefined
+  const absolute = path.resolve(workspaceRoot ?? process.cwd(), filePath)
+  try {
+    const stat = fs.statSync(absolute)
+    if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
+    if (catalog.has("edit")) return "edit"
+    if (!patchTool) return undefined
+    if (patchTool === "patch" && /\r(?:\n|$)/.test(fs.readFileSync(absolute, "utf8"))) return undefined
+    return patchTool
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined
+    return catalog.has("write") ? "write" : patchTool
+  }
+}
+
+/**
  * Preserve a legacy Cursor edit's intent when its internal executor follows
  * `edit_tool_call` with a whole-file `write_args` request.
  *

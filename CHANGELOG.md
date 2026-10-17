@@ -12,6 +12,15 @@
 - A turn stopped mid-step keeps its Cursor conversation and prompt cache at the next message, also after a restart ([#58](https://github.com/oakimov/cursor-opencode-provider/pull/58) by [@nkoynov](https://github.com/nkoynov), [#74](https://github.com/oakimov/cursor-opencode-provider/issues/74))
 - On OpenCode 2, plain-text steers without files or skills can reach Cursor during a background-shell wait; queued messages are preserved after Stop and mixed tool continuations, and answered copies are deduplicated across restarts and retries while preserving later identical requests and neighboring attachments ([#57](https://github.com/oakimov/cursor-opencode-provider/pull/57) by [@nkoynov](https://github.com/nkoynov))
 - On OpenCode 2, a steer that Cursor took after tool results is no longer sent twice when its Run drops and cannot be recovered; the retried step rebuilds from host history ([#92](https://github.com/oakimov/cursor-opencode-provider/pull/92) by [@nkoynov](https://github.com/nkoynov))
+- Large file writes no longer fail after 120 s while the model is still composing them; a Run now fails only when Cursor sends nothing at all for that long ([#66](https://github.com/oakimov/cursor-opencode-provider/issues/66))
+- Long-running tools keep their Cursor Run alive with the same exec heartbeats Cursor CLI sends
+- Errors show Cursor's own explanation (for example "Request blocked by Anthropic …"), and a request Cursor marks as not retryable is no longer retried by OpenCode (OpenCode 2 sent it 11 times in testing)
+- On macOS, a shell command that printed nothing before being moved to the background no longer reports `head: illegal byte count -- 0`
+- A tool that is still running no longer lets its Cursor Run expire at the inactivity limit. The Run stays open until the tool finishes, for up to four hours from when that tool started
+- An edit Cursor starts announcing shows its tool row while the arguments are still streaming. If that call never runs, the row closes instead of being left for the host to execute ([#73](https://github.com/oakimov/cursor-opencode-provider/issues/73))
+- A message Cursor never checkpointed is sent again ahead of the next message on the same conversation. Stopping the turn, or a rebuild from the host's history, drops it. It also survives an OpenCode restart after the failed turn, and repeated failed retries no longer add the same interruption note again each time ([#66](https://github.com/oakimov/cursor-opencode-provider/issues/66))
+- On OpenCode 2, a title or summary request sent while a tool is still running no longer cancels the Cursor Run waiting on that tool
+- While a tool runs, the provider answers Cursor's blob requests and stop requests at once, as Cursor CLI does, instead of after the tool finishes
 
 ## [0.8.2] - 2026-10-15
 
