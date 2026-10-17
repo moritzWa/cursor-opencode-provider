@@ -97,6 +97,18 @@ await (await serverStream(2)).closed
 console.log("done")
 `)
 
+// A Run destroyed while its response is still open, once idle and once with a
+// request write Cursor is not reading. The stream must close at once so the
+// session is released; a plain close() never closes it.
+const destroyedRun = (bytes: number) => childScript(`function onServerStream(stream) { stream.pause() }`, `
+const run = await bidiRunStream("token", { baseURL: ORIGIN })
+run.write(new Uint8Array(${bytes}).fill(5))
+await serverStream(1)
+await new Promise((resolve) => setTimeout(resolve, 200))
+run.destroy()
+console.log("destroyed")
+`)
+
 async function runUntilExit(
   script: string,
   timeoutMs: number,
@@ -141,6 +153,15 @@ describe("cached HTTP/2 session and process exit", () => {
     const result = await runUntilExit(OVERLAPPING_RUNS, 8_000)
     expect(result).toMatchObject({ exited: true, code: 0, stdout: "second answered: 42\ndone\n" })
   }, 15_000)
+})
+
+describe("destroyed Run and process exit", () => {
+  for (const [name, bytes] of [["idle", 10], ["with a blocked write", 3_000_000]] as const) {
+    it(`lets a process end after a Run ${name} is destroyed`, async () => {
+      const result = await runUntilExit(destroyedRun(bytes), 8_000)
+      expect(result).toMatchObject({ exited: true, code: 0, stdout: "destroyed\n" })
+    }, 15_000)
+  }
 })
 
 describe("cached HTTP/2 session ref", () => {

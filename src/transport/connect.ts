@@ -981,6 +981,14 @@ export async function bidiRunStream(
     scheduleTerminalSettlement()
   })
 
+  // Reset with CANCEL, as Cursor CLI's transport does for an aborted call
+  // (@connectrpc/connect-node 1.6.1). A plain close() leaves a stream whose
+  // request write is still buffered open for good, which also keeps its
+  // session held and the process alive.
+  const closeLocally = () => {
+    try { stream.close(http2.constants.NGHTTP2_CANCEL) } catch { /* already closing */ }
+  }
+
   if (abortSignal) {
     abortHandler = () => {
       if (!locallyClosed) {
@@ -991,7 +999,7 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
-        stream.close()
+        closeLocally()
       }
     }
     abortSignal.addEventListener("abort", abortHandler, { once: true })
@@ -1112,7 +1120,7 @@ export async function bidiRunStream(
         finishInbound()
         stopInboundReader()
         settleTerminal({ kind: "local-close" })
-        stream.close()
+        closeLocally()
       }
     },
     isClosed() {

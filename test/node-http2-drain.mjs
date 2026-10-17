@@ -1,6 +1,11 @@
 import assert from "node:assert/strict"
 import http2 from "node:http2"
 import net from "node:net"
+import { spawn } from "node:child_process"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   bidiRunStream,
   cacheHttp2SessionForTests,
@@ -149,3 +154,54 @@ await scenario("read-idle", 200_000, async (fake) => {
   assert.equal(error?.code, "CURSOR_READ_IDLE_TIMEOUT")
   assert.equal(run.isClosed(), true)
 })
+
+// A destroyed Run must close its stream so the cached session is released and
+// the process can exit, with an idle stream and with a blocked request write.
+const CONNECT_MODULE = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/transport/connect.js")).href
+for (const [name, bytes] of [["exit-after-destroy-idle", 10], ["exit-after-destroy-blocked", 3_000_000]]) {
+  const script = `
+import http2 from "node:http2"
+import { bidiRunStream, cacheHttp2SessionForTests } from ${JSON.stringify(CONNECT_MODULE)}
+const server = http2.createServer()
+server.on("session", (session) => session.unref())
+const arrived = new Promise((resolve) => server.on("stream", (stream) => {
+  stream.respond({ ":status": 200 })
+  stream.on("error", () => {})
+  resolve()
+}))
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+server.unref()
+const client = http2.connect("http://127.0.0.1:" + server.address().port)
+await new Promise((resolve) => client.once("connect", resolve))
+cacheHttp2SessionForTests("https://agentn.node-exit-test.cursor.sh", client)
+void (async () => {
+  const run = await bidiRunStream("token", { baseURL: "https://agentn.node-exit-test.cursor.sh" })
+  run.write(new Uint8Array(${bytes}).fill(5))
+  await arrived
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  run.destroy()
+  console.log("destroyed")
+})()
+`
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-provider-node-exit-"))
+  try {
+    const file = path.join(directory, "run.mjs")
+    await fs.writeFile(file, script)
+    const child = spawn(process.execPath, [file], {
+      env: { ...process.env, CURSOR_CLIENT_VERSION: "cli-node-exit-test" },
+      stdio: ["ignore", "pipe", "inherit"],
+    })
+    let stdout = ""
+    child.stdout.on("data", (chunk) => { stdout += chunk })
+    const code = await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      sleep(8_000).then(() => "timeout"),
+    ])
+    if (code === "timeout") child.kill()
+    assert.equal(code, 0)
+    assert.equal(stdout, "destroyed\n")
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true })
+  }
+  console.log(`node-http2-drain ${name}=ok`)
+}
