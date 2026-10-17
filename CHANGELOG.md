@@ -5,6 +5,7 @@
 ### Fixed
 
 - Unsupported effort hints keep an advertised default tuple, and model discovery and explicit selections reject duplicate parameter ids
+- Synthetic context model entries retain Cursor's declared default effort when the default is a Fast variant
 
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
 - Patch conversions preserve blank lines and reject paths or file content they cannot preserve exactly

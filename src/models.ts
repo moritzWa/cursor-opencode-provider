@@ -327,12 +327,23 @@ function variantContextTokens(v: ModelVariant | undefined): number | undefined {
 function isNonFastTwinOf(v: ModelVariant, target: ModelVariant): boolean {
   return (
     v.parameterValues.length === target.parameterValues.length &&
-    v.parameterValues.every(
-      (p) =>
-        p.id === "fast" ||
-        target.parameterValues.some((d) => d.id === p.id && d.value === p.value),
+    sameParameterTuple(
+      v.parameterValues.filter((p) => p.id !== "fast"),
+      target.parameterValues.filter((p) => p.id !== "fast"),
     )
   )
+}
+
+/** Find Cursor's declared default within a catalog subset, retaining its effort. */
+export function findDefaultVariant(
+  model: ModelInfo,
+  candidates: ModelVariant[],
+  maxMode: boolean,
+): ModelVariant | undefined {
+  const isDeclared = (v: ModelVariant) => maxMode ? v.isDefaultMax : v.isDefaultNonMax
+  const declared = model.variants.find(isDeclared)
+  return candidates.find(isDeclared) ??
+    (declared === undefined ? undefined : candidates.find((v) => isNonFastTwinOf(v, declared)))
 }
 
 function positiveNumber(value: unknown): number | undefined {
@@ -539,20 +550,14 @@ export function resolveVariantParameters(
   // Cursor can declare a Fast variant as a default (Grok, GPT max defaults);
   // `scoped` has no Fast variants, so steps 3 and 4 take the declared default's
   // non-Fast twin (same parameters except `fast`) before any other fallback.
-  const declaredOrTwin = (isDeclared: (v: ModelVariant) => boolean): ModelVariant | undefined => {
-    const declared = model.variants.find(isDeclared)
-    return scoped.find(isDeclared) ??
-      (declared === undefined ? undefined : scoped.find((v) => isNonFastTwinOf(v, declared)))
-  }
-
   // 3. Max-mode hint → prefer the default max variant (the max tier).
   if (wantMax) {
-    const max = declaredOrTwin((v) => v.isDefaultMax) ?? scoped.find(variantIsMaxMode)
+    const max = findDefaultVariant(model, scoped, true) ?? scoped.find(variantIsMaxMode)
     if (max) return buildRequestedModelParams(max.parameterValues, { maxMode: true })
   }
 
   // 4. Default non-max variant, else the first variant, the lowest level.
-  const byDefault = declaredOrTwin((v) => v.isDefaultNonMax) ?? scoped[0]
+  const byDefault = findDefaultVariant(model, scoped, false) ?? scoped[0]
   // An unsupported effort must not synthesize a tuple Cursor never advertised.
   return buildRequestedModelParams(byDefault.parameterValues)
 }
