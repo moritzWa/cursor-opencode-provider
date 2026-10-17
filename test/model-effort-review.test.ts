@@ -40,4 +40,25 @@ describe("effort and tuple validation", () => {
     ] })).toThrow(/exact parameter tuple/)
   })
 
+  it("changes only effort when several variants share the hinted effort", () => {
+    // Mirrors live Claude Opus: thinking=false listed first, default thinking=true;
+    // the Fast variants are marked max mode at the base 300k context.
+    const opus = (thinking: boolean, context: string, effort: string, fast: boolean): ModelVariant => ({
+      key: "opus", displayName: `${thinking} ${context} ${effort} ${fast}`,
+      isDefaultNonMax: thinking && context === "300k" && effort === "high" && !fast,
+      isDefaultMax: thinking && context === "1m" && effort === "high" && !fast,
+      isMaxMode: context === "1m" || fast,
+      parameterValues: [
+        { id: "thinking", value: String(thinking) }, { id: "context", value: context },
+        { id: "effort", value: effort }, { id: "fast", value: String(fast) },
+      ],
+    })
+    const model: ModelInfo = { id: "claude-opus", variants: [false, true].flatMap((thinking) =>
+      ["300k", "1m"].flatMap((context) => ["low", "high"].flatMap((effort) =>
+        [false, true].map((fast) => opus(thinking, context, effort, fast))))) }
+    expect(resolveVariantParameters(model, { reasoningEffort: "low" }))
+      .toEqual(opus(true, "300k", "low", false).parameterValues)
+    expect(resolveVariantParameters(model, { reasoningEffort: "low", maxMode: true }))
+      .toEqual(opus(true, "1m", "low", false).parameterValues)
+  })
 })

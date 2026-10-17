@@ -325,6 +325,10 @@ These are failure lessons shared by both hosts, not a replacement for
   Collapsing an absent max marker to false also disabled the 1M fallback;
   preserve absence through discovery and cache, test explicit false separately,
   and invalidate caches that already erased the distinction (`test/models.test.ts`).
+  A max marker is not a context size: Opus 300k Fast is marked, so budgets come
+  from the resolved `context` parameter (`test/turn-provenance.test.ts`). Effort
+  ties break toward the tier default, as Cursor CLI does, or a hint silently
+  dropped Claude thinking (`test/model-effort-review.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).

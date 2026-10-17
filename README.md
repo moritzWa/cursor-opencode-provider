@@ -150,7 +150,7 @@ Cursor models often expose parameterized variants (effort, thinking, fast, conte
 
 The selected variant’s Cursor parameter map is forwarded on the Run as `requested_model.parameters` (isolated under `providerOptions.cursor.cursorVariantParameters` so unrelated OpenCode options are not leaked onto the wire). The provider validates that explicit selection against the current cached tuple; malformed, duplicate-id, or stale selections fail clearly instead of silently falling back to another variant. Parameter order does not matter.
 
-Without an explicit selection, an effort hint stays within the requested base or max tier. The provider prefers non-Fast variants within that tier and keeps Cursor's declared default effort when the default is Fast. An unavailable effort falls back to an advertised default tuple rather than inventing parameter values.
+Without an explicit selection, an effort hint stays within the requested base or max tier and changes only the effort of that tier's default variant (thinking and other parameters keep the default's values). The provider prefers non-Fast variants within that tier and keeps Cursor's declared default effort when the default is Fast. An unavailable effort falls back to an advertised default tuple rather than inventing parameter values.
 
 #### 1M / long context
 

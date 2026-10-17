@@ -1,6 +1,5 @@
 import { MODEL_CACHE_FILE, MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "./shared.js"
 import { unaryAvailableModels } from "./transport/connect.js"
-import { buildRequestedModelParams } from "./protocol/thinking.js"
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -346,6 +345,11 @@ export function findDefaultVariant(
     (declared === undefined ? undefined : candidates.find((v) => isNonFastTwinOf(v, declared)))
 }
 
+/** Send an advertised tuple verbatim; never rewrite one of its values. */
+function copyParameters(parameters: ModelParameterValue[]): ModelParameterValue[] {
+  return parameters.map((parameter) => ({ ...parameter }))
+}
+
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? value
@@ -427,7 +431,7 @@ export function mapAvailableModelsResponse(
       }
       const isMaxMode = optionalBoolean(v, ["isMaxMode", "is_max_mode"])
       if (isMaxMode === null) {
-        throw new Error("AvailableModels returned a non-boolean isMaxMode")
+        throw new Error(`AvailableModels returned a non-boolean isMaxMode for ${name}`)
       }
       variants.push({
         key: name,
@@ -522,7 +526,7 @@ export function resolveVariantParameters(
   if (picked !== undefined) {
     const exact = model.variants.find((v) => sameParameterTuple(v.parameterValues, picked))
     if (exact) {
-      return buildRequestedModelParams(exact.parameterValues)
+      return copyParameters(exact.parameterValues)
     }
     throw new CursorVariantSelectionError(
       `is stale for model ${JSON.stringify(model.id)}: its exact parameter tuple is unavailable`,
@@ -537,27 +541,31 @@ export function resolveVariantParameters(
   const nonFast = candidates.filter((v) => !isFast(v))
   const scoped = nonFast.length > 0 ? nonFast : candidates
 
-  // 2. Effort hint (e.g. user passed reasoningEffort through the CLI).
+  // Cursor can declare a Fast variant as a default (Grok, GPT max defaults);
+  // the tier default retains the declared default's effort when its speed
+  // twin is needed (same parameters except `fast`).
+  const byDefault = (wantMax
+    ? findDefaultVariant(model, scoped, true) ?? scoped.find(variantIsMaxMode)
+    : undefined) ?? findDefaultVariant(model, scoped, false) ?? scoped[0]
+
+  // 2. Effort hint (e.g. user passed reasoningEffort through the CLI). Like
+  // Cursor CLI, break ties toward the tier default so the hint changes only
+  // effort, not thinking or other parameters (Claude lists thinking=false first).
   if (opts.reasoningEffort) {
-    const match = scoped.find((v) => effortOf(v) === opts.reasoningEffort)
+    const shared = (v: ModelVariant) => v.parameterValues.filter((parameter) =>
+      byDefault.parameterValues.some((d) => d.id === parameter.id && d.value === parameter.value)).length
+    const match = scoped
+      .filter((v) => effortOf(v) === opts.reasoningEffort)
+      .reduce<ModelVariant | undefined>((best, v) => best && shared(best) >= shared(v) ? best : v, undefined)
     if (match) {
-      return buildRequestedModelParams(match.parameterValues)
+      return copyParameters(match.parameterValues)
     }
   }
 
-  // Cursor can declare a Fast variant as a default (Grok, GPT max defaults);
-  // Steps 3 and 4 retain the declared default's effort when its speed twin
-  // is needed (same parameters except `fast`).
-  // 3. Max-mode hint → prefer the default max variant (the max tier).
-  if (wantMax) {
-    const max = findDefaultVariant(model, scoped, true) ?? scoped.find(variantIsMaxMode)
-    if (max) return buildRequestedModelParams(max.parameterValues)
-  }
-
-  // 4. Default non-max variant, else the first candidate.
-  const byDefault = findDefaultVariant(model, scoped, false) ?? scoped[0]
+  // 3. Max-mode hint → the default max variant (the max tier).
+  // 4. Otherwise the default non-max variant, else the first candidate.
   // An unsupported effort must not synthesize a tuple Cursor never advertised.
-  return buildRequestedModelParams(byDefault.parameterValues)
+  return copyParameters(byDefault.parameterValues)
 }
 
 // ── Fetch + cache orchestration ──
