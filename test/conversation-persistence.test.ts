@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from "bun:test"
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { gunzipSync } from "node:zlib"
+import { gunzipSync, gzipSync } from "node:zlib"
 import {
   conversationCacheDirectoryPath,
   conversationCacheFilePath,
@@ -37,6 +37,14 @@ import {
   resetFrozenRequestContextsForTests,
   setFrozenRequestContext,
 } from "../src/context/frozen.js"
+import {
+  confirmHistoryImagesAtTurnEnd,
+  heldHistoryImageHashes,
+  noteHistoryImageCheckpoint,
+  noteHistoryImagesSent,
+  runHistoryImages,
+  snapshotHeldHistoryImagesForTests,
+} from "../src/protocol/sent-history-images.js"
 import { CONVERSATION_CACHE_TTL_MS } from "../src/shared.js"
 import { encodeMessage } from "../src/protocol/messages.js"
 import {
@@ -65,9 +73,9 @@ function clearMemory(): void {
   resetTurnStateForTests()
 }
 
-function turnEndedSession(root: string, checkpoint: Uint8Array): CursorSession {
+function turnEndedSession(root: string, checkpoint: Uint8Array | undefined): CursorSession {
   const payloads = [
-    encodeMessage("AgentServerMessage", { conversation_checkpoint_update: checkpoint }),
+    ...(checkpoint ? [encodeMessage("AgentServerMessage", { conversation_checkpoint_update: checkpoint })] : []),
     encodeMessage("AgentServerMessage", {
       interaction_update: { turn_ended: { input_tokens: 3, output_tokens: 1 } },
     }),
@@ -174,6 +182,145 @@ describe("conversation restart persistence", () => {
     const restoredContext = getFrozenRequestContext(conversationId)
     expect(restoredContext).toMatchObject({ env: requestContext.env, rules_info_complete: true })
     expect(restoredContext?.tools).toBeUndefined()
+  })
+
+  it("keeps across a restart the history images the saved checkpoint holds", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_restart_images"
+    const conversationId = "conversation-with-images"
+    const checkpoint = Uint8Array.from([1])
+    restoreConversationBinding(sessionKey, conversationId)
+    setCheckpoint(conversationId, checkpoint)
+    const run = runHistoryImages()
+    noteHistoryImagesSent(run, ["a", "b"])
+    noteHistoryImageCheckpoint(run, sessionKey, conversationId, checkpoint)
+    confirmHistoryImagesAtTurnEnd(run, sessionKey, conversationId, checkpoint)
+    await persistConversationState(root, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+
+    clearMemory()
+    expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
+    await hydrateConversationState(root, sessionKey)
+    expect([...heldHistoryImageHashes(sessionKey, conversationId, getCheckpoint(conversationId)!) ?? []]).toEqual(["a", "b"])
+  })
+
+  it("saves no history images beside a checkpoint that does not hold them", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_restart_images_mid_turn"
+    const conversationId = "conversation-mid-turn"
+    restoreConversationBinding(sessionKey, conversationId)
+    const run = runHistoryImages()
+    noteHistoryImagesSent(run, ["a"])
+    noteHistoryImageCheckpoint(run, sessionKey, conversationId, Uint8Array.from([1]))
+    confirmHistoryImagesAtTurnEnd(run, sessionKey, conversationId, Uint8Array.from([1]))
+    // A save after Cursor moved on to a checkpoint nothing was confirmed for.
+    setCheckpoint(conversationId, Uint8Array.from([2]))
+    await persistConversationState(root, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+
+    const saved = await getPersistedConversation(root, sessionKey)
+    expect(saved?.sentImageHashes).toBeUndefined()
+    expect(saved?.sentImagesCheckpoint).toBeUndefined()
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
+  })
+
+  it("restores no history images from a snapshot written before they were saved with their checkpoint", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_old_snapshot"
+    const conversationId = "conversation-old-snapshot"
+    await persistConversation(root, {
+      sessionKey,
+      conversationId,
+      checkpoint: Uint8Array.from([1]),
+      blobs: [],
+      requestContext: { rules_info_complete: true },
+      toolCatalog: [],
+      postCompactionRebase: false,
+    })
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
+
+    // A hash list without the checkpoint it belongs to (field 16 alone) counts for nothing.
+    const filePath = conversationCacheFilePath(root, sessionKey)
+    const hash = Buffer.from("a".repeat(64))
+    const field16 = Buffer.concat([Buffer.from([0x82, 0x01, hash.length]), hash])
+    await writeFile(filePath, gzipSync(Buffer.concat([gunzipSync(await readFile(filePath)), field16])))
+    clearMemory()
+    expect((await getPersistedConversation(root, sessionKey))?.sentImageHashes).toBeUndefined()
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect(snapshotHeldHistoryImagesForTests(sessionKey)).toEqual([])
+  })
+
+  it("saves history image hashes on field 16 and their checkpoint on field 17", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_image_fields"
+    const hashes = ["a".repeat(64), "b".repeat(64)]
+    const checkpoint = "c".repeat(64)
+    const text = (value: string) => [value.length, ...Buffer.from(value)]
+    const fields = Buffer.from([
+      0x82, 0x01, ...text(hashes[0]!), // sent_image_hashes #16
+      0x82, 0x01, ...text(hashes[1]!), // sent_image_hashes #16
+      0x8a, 0x01, ...text(checkpoint), // sent_images_checkpoint_sha256 #17
+    ])
+    const earlySteers = "early-steer-receipts"
+    const lostRequest = "lost-request-record"
+    const snapshot = {
+      sessionKey,
+      conversationId: "conversation-image-fields",
+      checkpoint: Uint8Array.from([1]),
+      blobs: [],
+      requestContext: { rules_info_complete: true },
+      toolCatalog: [],
+      postCompactionRebase: false,
+      earlySteers,
+      lostRequest,
+    }
+    const filePath = conversationCacheFilePath(root, sessionKey)
+
+    await persistConversation(root, { ...snapshot, sentImageHashes: hashes, sentImagesCheckpoint: checkpoint })
+    const saved16and17 = gunzipSync(await readFile(filePath))
+    expect(saved16and17.includes(fields)).toBe(true)
+    expect(saved16and17.includes(Buffer.from([0x72, ...text(earlySteers)]))).toBe(true) // early_steers_json #14
+    expect(saved16and17.includes(Buffer.from([0x7a, ...text(lostRequest)]))).toBe(true) // lost_request_json #15
+
+    await persistConversation(root, snapshot)
+    const withoutImages = gunzipSync(await readFile(filePath))
+    expect(withoutImages.includes(fields)).toBe(false)
+    await writeFile(filePath, gzipSync(Buffer.concat([withoutImages, fields])))
+    clearMemory()
+    const saved = await getPersistedConversation(root, sessionKey)
+    expect(saved?.sentImageHashes).toEqual(hashes)
+    expect(saved?.sentImagesCheckpoint).toBe(checkpoint)
+    expect(saved?.earlySteers).toBe(earlySteers)
+    expect(saved?.lostRequest).toBe(lostRequest)
+  })
+
+  it("keeps the older checkpoint's images when a turn ends without a checkpoint of its own", async () => {
+    const root = await cacheRoot()
+    const older = Uint8Array.from([4, 5])
+    const session = turnEndedSession(root, undefined)
+    const sessionKey = session.openCodeSessionId!
+    restoreConversationBinding(sessionKey, session.conversationId)
+    setCheckpoint(session.conversationId, older)
+    const before = runHistoryImages()
+    noteHistoryImagesSent(before, ["a"])
+    noteHistoryImageCheckpoint(before, sessionKey, session.conversationId, older)
+    confirmHistoryImagesAtTurnEnd(before, sessionKey, session.conversationId, older)
+    session.historyImages = runHistoryImages(heldHistoryImageHashes(sessionKey, session.conversationId, older))
+    noteHistoryImagesSent(session.historyImages, ["b"])
+    await pump(session, {
+      enqueue() {},
+      error(error: unknown) { throw error },
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+
+    const saved = await getPersistedConversation(root, sessionKey)
+    expect(saved?.checkpoint).toEqual(older)
+    expect(saved?.sentImageHashes).toEqual(["a"])
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect([...heldHistoryImageHashes(sessionKey, session.conversationId, older) ?? []]).toEqual(["a"])
   })
 
   it("takes the durable snapshot at the successful TurnEnded boundary", async () => {

@@ -120,6 +120,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   continuation delivery and the active pump use their current call's signal.
   Detach temporary listeners after upload so an ordinary tool-step abort keeps
   the held Run alive. Replacement callbacks must not capture the first signal.
+  An abort of the pumping step with nothing owed (OpenCode 1.x Stop aborts
+  before the stream is cancelled) sends `cancel_action` like any Stop; only a
+  write still waiting for drain resets the Run at once.
 - Local cancellation resets buffered streams with `NGHTTP2_CANCEL`; `destroy()`
   must work after `end()`. Retiring a cached connection must let siblings drain,
   never destroy them. Direct and proxy connections use `maxSessionMemory: 256`.
@@ -159,6 +162,13 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   host cache: checkpoint, reachable blobs, baseline, catalogs, provenance, notes,
   lost requests and steer receipts. Keep all blobs if reachability is uncertain.
   A >100 MiB or incomplete transfer graph warns and warm-reuses; it never remints.
+- Skip a history image only when the checkpoint being sent is known to hold it
+  (`sent-history-images.ts`; hashes per conversation id + checkpoint SHA-256,
+  snapshot fields 16/17). A Run's own images count once its turn ends with
+  `turn_ended` on a checkpoint that arrived after them; a failed or stopped
+  turn, or a snapshot without the set, sends them again. Arrival is when the
+  transport received the frame (`frameArrival`), not when a pump read it: the
+  checkpoint after a tool step holds none of that tool result's images.
 - Retention uses persisted application metadata, not filesystem timestamps.
   Hydrate on demand, expire after 24 h, avoid blocking startup/full-cache decode,
   preserve concurrent replacement files, and keep soft-evicted state reusable.
