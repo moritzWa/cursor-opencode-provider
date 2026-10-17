@@ -166,9 +166,15 @@ The Run still uses Cursor’s original model id; OpenCode’s synthetic `-1m` id
 Other advertised max-context tiers also get separate entries. For example,
 Grok 4.7's marked 500k variants appear under `grok-4.7-500k`, with a 500,000-token
 context limit; `grok-4.7-500k-fast` carries the Fast variants and pricing.
-Each entry keeps only its tier's variants and retains the declared default
+Each dedicated context entry keeps only its tier's variants and retains the declared default
 effort, including when the default's non-Fast twin is needed. Non-1M entries
 retain the base output limit of 32,000 tokens.
+
+Existing non-1M variant names also remain on the original base/Fast entries so
+saved selections such as `grok-4.7#Grok 4.7 High 500k` keep working after an
+upgrade. These legacy selections send the selected 500k parameters and max-mode
+flag, but keep the original entry's conservative static context budget. Select
+`grok-4.7-500k` or `grok-4.7-500k-fast` to give OpenCode the full 500k budget.
 
 #### Fast variants with distinct prices
 

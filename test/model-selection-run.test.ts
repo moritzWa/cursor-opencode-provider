@@ -4,6 +4,8 @@ import http2 from "node:http2"
 import os from "node:os"
 import path from "node:path"
 import { createCursor } from "../src/index.js"
+import { modelsToConfig } from "../src/model-config.js"
+import { modelsToCatalogModelMap } from "../src/opencode2/catalog.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { resetTurnStateForTests } from "../src/language-model.js"
 import { CURSOR_VARIANT_PARAMETERS_KEY, mapAvailableModelsResponse, writeCache } from "../src/models.js"
@@ -149,3 +151,55 @@ it.each(scenarios)("sends cached selection $context fast=$fast max=$max through 
     await fs.rm(directory, { recursive: true, force: true })
   }
 })
+
+for (const host of ["classic", "modern"] as const) {
+  it.each([false, true])(`sends a saved 500k selection from the ${host} base/Fast catalog (fast=%s)`, async (fast) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-saved-variant-run-"))
+    const parameters = (context: string, speed: boolean) => [
+      { id: "context", value: context },
+      { id: "reasoning_effort", value: "high" },
+      { id: "fast", value: String(speed) },
+    ]
+    const label = (context: string, speed: boolean) => `Grok 4.7 High ${speed ? "Fast " : ""}${context}`
+    try {
+      const models = mapAvailableModelsResponse({ models: [{ name: "grok-4.7", variants:
+        ["256k", "500k"].flatMap((context) => [false, true].map((speed) => ({
+          displayName: label(context, speed), parameterValues: parameters(context, speed),
+          isMaxMode: context === "500k", isDefaultNonMaxConfig: context === "256k",
+          isDefaultMaxConfig: context === "500k",
+        }))),
+      }] })
+      const id = `grok-4.7${fast ? "-fast" : ""}`
+      const savedLabel = label("500k", fast)
+      const classic = modelsToConfig(models)[id]
+      const modern = modelsToCatalogModelMap(models)[id]!
+      const settings = host === "classic"
+        ? classic.variants[savedLabel]
+        : modern.variants.find((variant) => variant.id === savedLabel)?.settings
+      expect(settings?.[CURSOR_VARIANT_PARAMETERS_KEY]).toEqual(parameters("500k", fast))
+      await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+      cacheHttp2SessionForTests(origin, client)
+      const model = createCursor({ name: "cursor", accessToken: "test-token", cacheDir: directory, agentBaseURL: origin })
+        .languageModel(host === "classic" ? id : modern.modelID)
+      const { stream } = await model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+        providerOptions: { cursor: {
+          ...(host === "classic" ? classic.options : modern.settings), ...settings,
+        } },
+      })
+      const reader = stream.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        expect(value.type).not.toBe("error")
+      }
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.requested_model).toMatchObject({
+        model_id: "grok-4.7", max_mode: true, parameters: parameters("500k", fast),
+      })
+    } finally {
+      sessionManager.dispose()
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+}
