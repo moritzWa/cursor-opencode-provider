@@ -1,6 +1,7 @@
 import {
   CURSOR_VARIANT_PARAMETERS_KEY,
   CURSOR_WIRE_MODEL_ID_KEY,
+  findDefaultVariant,
   parseCursorContextLimit,
   type ModelInfo,
   type ModelVariant,
@@ -232,9 +233,7 @@ export function modelInfoToConfig(
   const variantConfig = modelInfoVariants(mi, variants)
   if (variantConfig) config.variants = variantConfig
   if (contextTier === "long" || options.fast) {
-    const defaultVariant = contextTier === "long"
-      ? (variants.find((v) => v.isDefaultMax) ?? variants[0])
-      : (variants.find((v) => v.isDefaultNonMax) ?? variants[0])
+    const defaultVariant = findDefaultVariant(mi, variants, contextTier === "long") ?? variants[0]
     if (defaultVariant) {
       config.options = {
         [CURSOR_WIRE_MODEL_ID_KEY]: mi.id,
