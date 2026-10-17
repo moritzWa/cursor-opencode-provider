@@ -271,4 +271,23 @@ describe("Cursor provider errors", () => {
     expect(suppressed.message.toLowerCase()).not.toMatch(/unavailable|exhausted/)
     expect(suppressed.message).toContain("automatic retry unsafe")
   })
+
+  it("projects spent and unsafe retries as terminal even when their cause was an HTTP 503", () => {
+    const last = cursorHttpError("Cursor request failed:", 503)
+    for (const failure of [
+      new CursorRetryExhaustedError(3, last),
+      retrySuppressedError(last, "after visible output", 1, 3),
+    ]) {
+      expect(failure).toMatchObject({ statusCode: 503, transient: false, retryable: false })
+      const host = hostFacingError(failure)
+      expect(APICallError.isInstance(host)).toBe(true)
+      expect(host).toMatchObject({
+        statusCode: 400,
+        isRetryable: false,
+        responseHeaders: { "x-should-retry": "false" },
+      })
+      expect((host as APICallError).cause).toBe(failure)
+      expect(host.message).not.toContain("503")
+    }
+  })
 })

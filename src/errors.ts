@@ -39,7 +39,7 @@ export class CursorProviderError extends Error {
   readonly rstCode?: number
   readonly code?: string
   readonly retryAfterMs?: number
-  /** Cursor's own verdict (`ErrorDetails.details.isRetryable`), when it gave one. */
+  /** Cursor's classified verdict, or false once provider retries must stop. */
   readonly retryable?: boolean
 
   constructor(message: string, options: CursorProviderErrorOptions) {
@@ -82,8 +82,9 @@ const NON_RETRYABLE_SERVER_STATUS = 400
 
 /**
  * The error the host receives. Like Cursor CLI, a request Cursor declared not
- * retryable (see `cursorCliRetryable`) or an authentication failure ends the
- * turn: it becomes an AI SDK `APICallError` with `isRetryable: false` and the
+ * retryable (see `cursorCliRetryable`), a spent/unsafe provider retry, or an
+ * authentication failure ends the turn: it becomes an AI SDK `APICallError`
+ * with `isRetryable: false` and the
  * conventional `x-should-retry: false` header, which OpenCode 2 checks first
  * (it retries a failure with no status or recognized code). OpenCode 1.x
  * ignores both and retries any status >= 500 or a message matching its retry
@@ -94,7 +95,7 @@ const NON_RETRYABLE_SERVER_STATUS = 400
 export function hostFacingError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error))
   const auth = error instanceof CursorAuthError
-  if (!auth && (!(error instanceof CursorServerError) || error.retryable !== false)) return error
+  if (!auth && (!(error instanceof CursorProviderError) || error.retryable !== false)) return error
   const connectStatus = error.code !== undefined && Object.hasOwn(CONNECT_CODE_HTTP_STATUS, error.code)
     ? CONNECT_CODE_HTTP_STATUS[error.code]!
     : CONNECT_CODE_HTTP_STATUS.unknown!
@@ -251,6 +252,7 @@ export class CursorRetryExhaustedError extends CursorProviderError {
         origin: last.origin,
         transient: false,
         replaySafe: false,
+        retryable: false,
         statusCode: last.statusCode,
         grpcStatus: last.grpcStatus,
         rstCode: last.rstCode,
@@ -407,6 +409,7 @@ export function retrySuppressedError(
       origin: cause.origin,
       transient: false,
       replaySafe: false,
+      retryable: false,
       statusCode: cause.statusCode,
       grpcStatus: cause.grpcStatus,
       rstCode: cause.rstCode,

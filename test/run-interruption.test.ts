@@ -425,6 +425,27 @@ describe("interrupted Cursor Run handling", () => {
     expect(renewals).toBe(1)
   })
 
+  it("honors a final Cursor verdict before treating unauthenticated as a renewable login", async () => {
+    let renewals = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("final-auth-code", [{
+        flags: 0x02,
+        payload: new TextEncoder().encode(JSON.stringify({ error: {
+          code: "unauthenticated",
+          // aiserver.v1.ErrorDetails{error:RATE_LIMITED_CHANGEABLE (51)}.
+          details: [{ type: "aiserver.v1.ErrorDetails", value: "CDM=" }],
+        } })),
+      }]),
+      controller: controller([]),
+      recover: async () => { throw new Error("A final verdict must not reopen the Run") },
+      renewRejectedCredential: () => { renewals++ },
+    }).catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(CursorServerError)
+    expect(failure).toMatchObject({ code: "unauthenticated", transient: false, retryable: false })
+    expect(renewals).toBe(0)
+  })
+
   it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
     const cases = [
       { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },

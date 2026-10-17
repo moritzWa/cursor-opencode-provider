@@ -656,12 +656,6 @@ export function connectFrameError(payload: string): CursorProviderError {
     if (envelope.error?.message !== undefined || envelope.error?.details !== undefined) {
       trace(`connect error: code=${code} message=${JSON.stringify(envelope.error.message)?.slice(0, 2_000)} details=${JSON.stringify(envelope.error.details)?.slice(0, 4_000)}`)
     }
-    if (code === "unauthenticated") {
-      return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
-        code,
-        replaySafe: true,
-      })
-    }
     let retryAfterMs = retryDelayFromValue(
       envelope.error?.retryAfter ?? envelope.error?.retry_after,
     )
@@ -686,6 +680,14 @@ export function connectFrameError(payload: string): CursorProviderError {
     // Cursor CLI shows `${title} ${detail}` and follows its own retry verdict.
     const explanation = [cursorDetails?.title, cursorDetails?.detail].filter(Boolean).join(" ")
     const retryable = cursorCliRetryable(code, cursorDetails)
+    // Cursor's final details take precedence over the Connect login code.
+    // Only a bare credential rejection is eligible for one forced renewal.
+    if (code === "unauthenticated" && retryable !== false) {
+      return new CursorAuthError(
+        explanation || `Cursor authentication failed (${code}); reauthenticate with Cursor`,
+        { code, replaySafe: true },
+      )
+    }
     return new CursorServerError(`Cursor API error (code=${code})${explanation ? `: ${explanation}` : ""}`, {
       transient: retryable ?? (isTransientGrpcStatus(code) || hasRetryInfo),
       retryable,
@@ -861,18 +863,20 @@ export function createCursorLanguageModel(
   void initializeConversationPersistence(opencodeGlobalCacheDir()).catch((error) => {
     trace(`conversation persistence: startup load failed: ${String(error)}`)
   })
+  // Credential resolution and session setup can fail before a stream exists.
+  // Both public entrypoints must project those failures just like pump errors.
+  const doStream = (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> =>
+    doStreamImpl(modelId, options, callOptions).catch((error) => { throw hostFacingError(error) })
   return {
     specificationVersion: "v3",
     provider: providerId,
     modelId,
     supportedUrls: {},
 
-    async doStream(callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
-      return doStreamImpl(modelId, options, callOptions)
-    },
+    doStream,
 
     async doGenerate(callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
-      const result = await doStreamImpl(modelId, options, callOptions)
+      const result = await doStream(callOptions)
       const parts: V3Part[] = []
       const reader = result.stream.getReader()
       while (true) {
