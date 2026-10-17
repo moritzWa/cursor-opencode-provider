@@ -861,6 +861,71 @@ export function buildCompleteEditReadMessages(
   }
 }
 
+/** 1x1 transparent PNG: satisfies Cursor's binary-attachment check without file bytes. */
+const TASK_ATTACHMENT_PLACEHOLDER = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+  "base64",
+)
+
+/**
+ * Answer Cursor's read of a Task attachment without the file's bytes. Cursor
+ * puts them only in SubagentArgs.selected_context, which OpenCode's subagent
+ * tools cannot take, yet refuses the Task unless the read returns binary data.
+ * The path reaches the subagent prompt instead ({@link appendTaskAttachments})
+ * and the child reads it under its own permissions. A missing or non-regular
+ * target gets the same typed rejection as any native read.
+ */
+export function buildTaskAttachmentReadMessages(
+  execId: number,
+  sourcePath: string,
+  resultPath = sourcePath,
+): Uint8Array[] {
+  // Unlike an ordinary host read, this path has no later executor to surface
+  // stat errors. Never mistake EACCES/ELOOP (or invalid input) for a real file.
+  try {
+    const rejected = classifyReadTargetStat(sourcePath, fs.statSync(sourcePath))
+    if (rejected) return buildReadRejectionMessages(execId, rejected)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    const rejected = code === "ENOENT" || code === "ENOTDIR"
+      ? { file_not_found: { path: sourcePath } }
+      : undefined
+    return buildReadRejectionMessages(execId, rejected ?? {
+      error: { path: resultPath, error: error instanceof Error ? error.message : String(error) },
+    })
+  }
+  return [
+    encodeMessage("AgentClientMessage", {
+      exec_client_message: {
+        id: execId,
+        local_execution_time_ms: 0,
+        read_result: {
+          success: {
+            path: resultPath,
+            data: TASK_ATTACHMENT_PLACEHOLDER,
+            total_lines: 0,
+            file_size: TASK_ATTACHMENT_PLACEHOLDER.length,
+            truncated: false,
+          },
+        },
+      },
+    }),
+    buildExecStreamClose(execId),
+  ]
+}
+
+/** List Cursor's Task attachments at the end of the subagent prompt as absolute paths. */
+export function appendTaskAttachments(
+  parsed: ParsedExecRequest,
+  attachments: readonly string[],
+  workspaceRoot: string,
+): void {
+  if (parsed.resultField !== "subagent_result" || attachments.length === 0) return
+  const prompt = str(parsed.args.prompt) ?? ""
+  const paths = attachments.map((item) => `- ${JSON.stringify(resolveReadTargetPath(item, workspaceRoot))}`)
+  parsed.args.prompt = `${prompt}\n\nAttached files (open them with your file tools):\n${paths.join("\n")}`
+}
+
 type WholeFileEditReplacement = {
   oldString: string
   newString: string
@@ -1908,6 +1973,10 @@ export function classifyMissingReadTarget(
     }
     return undefined
   }
+  return classifyReadTargetStat(absolutePath, stat)
+}
+
+function classifyReadTargetStat(absolutePath: string, stat: fs.Stats): Record<string, unknown> | undefined {
   if (stat.isDirectory()) {
     return { invalid_file: { path: absolutePath, reason: "Path is a directory, not a file" } }
   }

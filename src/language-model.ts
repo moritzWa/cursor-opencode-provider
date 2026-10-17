@@ -85,6 +85,8 @@ import {
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
   preferCorrelatedTaskDescription,
+  appendTaskAttachments,
+  buildTaskAttachmentReadMessages,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   hostToolForCursorEdit,
@@ -118,6 +120,7 @@ import {
   extractProtobufSubmessage,
   listProtobufFieldNumbers,
   parseDisplayToolCall,
+  taskToolCallAttachments,
   resolveBridgedOpenCodeToolCall,
   isNativeDisplayToolCall,
   snapshotMirroredTodos,
@@ -4395,6 +4398,36 @@ export async function pump(
   }
 
   /**
+   * Cursor reads each Task attachment, tagged with the Task's call id, before
+   * its subagent request. A host read would put the file in this session's
+   * context instead of the child's, cost a step, and claim the display call
+   * that carries the Task's title. Answer it here and keep the display call.
+   * Returns undefined when this is not an attachment read, false when the
+   * reply failed and the attempt was closed.
+   */
+  const answerTaskAttachmentRead = async (
+    parsed: ParsedExecRequest,
+    displayCallId: string | undefined,
+  ): Promise<boolean | undefined> => {
+    if (!displayCallId || parsed.resultField !== "read_result" || parsed.toolName !== "read") return undefined
+    const display = parseDisplayToolCall(displayCallId, session.displayToolCalls.get(displayCallId))
+    if (display?.variant !== "task_tool_call") return undefined
+    const requested = opencodePathArg(parsed.args) ?? ""
+    const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+    const target = resolveReadTargetPath(requested, workspaceRoot)
+    if (!taskToolCallAttachments(session.displayToolCalls.get(displayCallId)).some(
+      (attachment) => resolveReadTargetPath(attachment, workspaceRoot) === target,
+    )) return undefined
+    const ok = await writeExecFrames(
+      buildTaskAttachmentReadMessages(parsed.id, target, requested),
+      `reply to task attachment read id=${parsed.id}`,
+    )
+    if (!ok) return false
+    trace(`exec: task attachment read answered id=${parsed.id} callId=${displayCallId} path=${JSON.stringify(requested)}`)
+    return true
+  }
+
+  /**
    * A read of a path that does not exist would otherwise reach OpenCode as a
    * real tool call and raise a permission prompt for a file the user never had.
    * Cursor's own LocalReadExecutor instead resolves the target against the
@@ -5290,6 +5323,16 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        // Task prerequisites take precedence over the runtime-file reader:
+        // even a terminal/catalog attachment must keep its Task's display owner.
+        if (session.allowTools && esm.read_args) {
+          const parsedRead = parseExecServerMessage(esm, session.hostToolDialect)
+          if (parsedRead) {
+            const attachmentRead = await answerTaskAttachmentRead(parsedRead, displayCallId)
+            if (attachmentRead === false) return
+            if (attachmentRead) continue
+          }
+        }
         const runtimeMessages = await runtimeExecMessages(esm, session.requestContext, session.allowTools)
         if (runtimeMessages) {
           for (const message of runtimeMessages) {
@@ -5340,6 +5383,11 @@ export async function pump(
               const description =
                 typeof display.args.description === "string" ? display.args.description : undefined
               preferCorrelatedTaskDescription(parsed, description)
+              appendTaskAttachments(
+                parsed,
+                taskToolCallAttachments(stored),
+                workspaceRootFromRequestContext(session.requestContext),
+              )
               if (description?.trim()) {
                 trace(
                   `exec: preferred TaskToolCall description callId=${displayCallId} ` +
