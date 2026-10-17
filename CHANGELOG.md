@@ -25,6 +25,7 @@
 - A headless process now exits after its last Cursor Run instead of hanging on the idle cached HTTP/2 connection ([#88](https://github.com/oakimov/cursor-opencode-provider/pull/88) by [@willowite](https://github.com/willowite), [#87](https://github.com/oakimov/cursor-opencode-provider/issues/87))
 - A new Run no longer fails at its start with `NGHTTP2_ENHANCE_YOUR_CALM` while other Runs on the same connection are still uploading large requests, and on Node a single large request no longer fails the same way on a slow uplink ([#76](https://github.com/oakimov/cursor-opencode-provider/issues/76), based on [#79](https://github.com/oakimov/cursor-opencode-provider/pull/79) by [@nkoynov](https://github.com/nkoynov))
 - Grok 4.7, 4.6 and 4.5 now run Cursor's declared default level (High) when no reasoning effort is configured; before, they ran at the lowest level because Cursor's default is a Fast variant that the resolver skips ([#86](https://github.com/oakimov/cursor-opencode-provider/pull/86) by [@willowite](https://github.com/willowite))
+- A configured reasoning effort now reaches models whose Cursor parameter is `reasoning_effort` (Grok 4.7, Gemini 3.8 Flash, Gemini 4 Argon); before, only models with an `effort` or `reasoning` parameter honored it and the others always ran Cursor's default variant ([#84](https://github.com/oakimov/cursor-opencode-provider/pull/84) by [@willowite](https://github.com/willowite))
 
 ## [0.8.2] - 2026-10-15
 

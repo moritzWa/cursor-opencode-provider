@@ -455,7 +455,7 @@ export function resolveVariantParameters(
   }
 
   const effortOf = (v: ModelVariant): string | undefined =>
-    v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning")?.value
+    v.parameterValues.find((p) => p.id === "effort" || p.id === "reasoning" || p.id === "reasoning_effort")?.value
   const isFast = (v: ModelVariant): boolean =>
     v.parameterValues.find((p) => p.id === "fast")?.value === "true"
   const isMaxVariant = (v: ModelVariant): boolean =>
