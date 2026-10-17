@@ -4,9 +4,7 @@
 
 ### Fixed
 
-- Unsupported effort hints keep an advertised default tuple, and model discovery and explicit selections reject duplicate parameter ids
-- Synthetic context model entries retain Cursor's declared default effort when the default is a Fast variant
-
+- After a restart, a turn that resumes a saved conversation no longer attaches every image in the session's history again, and an image you attach is not sent again as history on the next turn ([#78](https://github.com/oakimov/cursor-opencode-provider/pull/78) by [@nkoynov](https://github.com/nkoynov), [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75))
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
 - Patch conversions preserve blank lines and reject paths or file content they cannot preserve exactly
 - On OpenCode 1.x and 2, file writes and edits use the current turn's permitted tools after a model switch; OpenCode 2 GPT models use `patch` instead of first failing on `write` ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov), [#80](https://github.com/oakimov/cursor-opencode-provider/issues/80))
@@ -27,6 +25,8 @@
 - A large request, such as the first one after a restart in a session with screenshots, no longer fails with "backpressure drain failed" when it takes more than 5 s to upload; stopping a turn also cancels initial, tool-result, and replacement uploads at once ([#75](https://github.com/oakimov/cursor-opencode-provider/issues/75), based on [#77](https://github.com/oakimov/cursor-opencode-provider/pull/77) by [@nkoynov](https://github.com/nkoynov))
 - A headless process now exits after its last Cursor Run instead of hanging on the idle cached HTTP/2 connection ([#88](https://github.com/oakimov/cursor-opencode-provider/pull/88) by [@willowite](https://github.com/willowite), [#87](https://github.com/oakimov/cursor-opencode-provider/issues/87))
 - A new Run no longer fails at its start with `NGHTTP2_ENHANCE_YOUR_CALM` while other Runs on the same connection are still uploading large requests, and on Node a single large request no longer fails the same way on a slow uplink ([#76](https://github.com/oakimov/cursor-opencode-provider/issues/76), based on [#79](https://github.com/oakimov/cursor-opencode-provider/pull/79) by [@nkoynov](https://github.com/nkoynov))
+- Unsupported effort hints keep an advertised default tuple, and model discovery and explicit selections reject duplicate parameter ids
+- Synthetic context model entries retain Cursor's declared default effort when the default is a Fast variant
 - Grok 4.7, 4.6 and 4.5 now run Cursor's declared default level (High) when no reasoning effort is configured; before, they ran at the lowest level because Cursor's default is a Fast variant that the resolver skips ([#86](https://github.com/oakimov/cursor-opencode-provider/pull/86) by [@willowite](https://github.com/willowite))
 - A configured reasoning effort now reaches models whose Cursor parameter is `reasoning_effort` (Grok 4.7, Gemini 3.8 Flash, Gemini 4 Argon); before, only models with an `effort` or `reasoning` parameter honored it and the others always ran Cursor's default variant ([#84](https://github.com/oakimov/cursor-opencode-provider/pull/84) by [@willowite](https://github.com/willowite))
 - Grok 4.7's 500k variants run in max mode instead of failing with `Cursor API error (code=not_found)`; max mode now follows the max-mode flag Cursor sets on each variant, as Cursor CLI does, instead of only a 1m context. A `maxMode` option without a picked variant lands on the model's declared max default even when Cursor declares a Fast variant (Grok 4.7 500k High, GPT-5.2 High). The model list is fetched again once after upgrading ([#67](https://github.com/oakimov/cursor-opencode-provider/issues/67))
