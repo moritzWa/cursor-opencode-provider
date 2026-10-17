@@ -106,9 +106,12 @@ function optionalPositiveNumber(
 export function normalizeModelParameterValues(value: unknown): ModelParameterValue[] | null {
   if (!Array.isArray(value)) return null
   const parameters: ModelParameterValue[] = []
+  const ids = new Set<string>()
   for (const parameter of value) {
     if (!isPlainRecord(parameter)) return null
     if (!isNonEmptyString(parameter.id) || typeof parameter.value !== "string") return null
+    if (ids.has(parameter.id)) return null
+    ids.add(parameter.id)
     parameters.push({ id: parameter.id, value: parameter.value })
   }
   return parameters
@@ -270,6 +273,7 @@ function sameParameterTuple(a: ModelParameterValue[], b: ModelParameterValue[]):
   const byId = new Map(b.map((parameter) => [parameter.id, parameter.value]))
   return (
     a.length === b.length &&
+    new Set(a.map((parameter) => parameter.id)).size === a.length &&
     byId.size === b.length &&
     a.every((parameter) => byId.get(parameter.id) === parameter.value)
   )
@@ -549,10 +553,8 @@ export function resolveVariantParameters(
 
   // 4. Default non-max variant, else the first variant, the lowest level.
   const byDefault = declaredOrTwin((v) => v.isDefaultNonMax) ?? scoped[0]
-  return buildRequestedModelParams(byDefault.parameterValues, {
-    reasoningEffort: opts.reasoningEffort,
-    maxMode: false,
-  })
+  // An unsupported effort must not synthesize a tuple Cursor never advertised.
+  return buildRequestedModelParams(byDefault.parameterValues)
 }
 
 // ── Fetch + cache orchestration ──
