@@ -217,7 +217,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Strip read envelopes while retaining `[Partial read: …]` meaning. Explicit
   pagination alone is not truncation. Reject whole-file writes/overwriting Add
   File patches that echo incomplete content; allow targeted source edits.
-  Resolve relative result paths against the workspace without rewriting prose.
+  Resolve relative grep/glob/directory paths against the workspace. Shell stdout
+  reaches Cursor verbatim, as Cursor CLI sends it; a `cd` changes its paths.
 - `WriteArgs.file_bytes` and `encoding_hint` are content. Private legacy-edit
   reads need complete correlated content; external/symlink-escaped files require
   the exact host-authorized read first. Final mutation remains a host edit/patch.

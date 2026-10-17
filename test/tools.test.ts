@@ -1475,6 +1475,10 @@ describe("partial-read mutation safety", () => {
   })
 })
 
+// #96: shell stdout as the command printed it, including lines that only look
+// like relative paths (branch, shebang, assignment) and a path after a `cd`.
+const VERBATIM_SHELL_STDOUT = ["feature/cp16", "#!/bin/sh", "PREFIX=/usr/local", "a/b.txt", "src/c.ts:12:3", ""].join("\n")
+
 describe("buildExecClientMessages", () => {
   it("returns canonical SubagentSuccess from OpenCode task output", () => {
     const frames = buildExecClientMessages({
@@ -1715,21 +1719,17 @@ describe("buildExecClientMessages", () => {
     expect(close.exec_client_control_message?.stream_close?.id).toBe(3)
   })
 
-  it("grounds path-only shell_stream stdout without rewriting structured text", () => {
+  it("passes shell_stream stdout through verbatim", () => {
     const frames = buildExecClientMessages({
       execId: 30,
       resultField: "shell_stream",
-      output: ["src/a.ts:2", '{"path":"src/a.ts"}', "@scope/pkg"].join("\n"),
+      output: VERBATIM_SHELL_STDOUT,
       resultMetadata: { working_directory: "pkg" },
       workspaceRoot: "/workspace/project",
     })
     const stdout = decodeMessage<any>("AgentClientMessage", frames[1]).exec_client_message
       .shell_stream.stdout.data
-    expect(stdout).toBe([
-      "/workspace/project/pkg/src/a.ts:2",
-      '{"path":"src/a.ts"}',
-      "@scope/pkg",
-    ].join("\n"))
+    expect(stdout).toBe(VERBATIM_SHELL_STDOUT)
   })
 
   it("encodes shell_result success/timeout/failure for exec #2", () => {
@@ -3029,39 +3029,39 @@ describe("OpenCode 2 path and read edge cases", () => {
     )
   })
 
-  it("rewrites shell path tokens against the working directory and leaves prose", () => {
-    const stdout = [
-      "src/a.ts",
-      "built src/a.ts ok",
-      "https://example.com/a",
-      "/abs/b.ts",
-      "src/c.ts:12:3",
-      "~/secret",
-    ].join("\n")
-    const r = buildTypedExecResult(
+  it("passes shell stdout through verbatim in every shell result shape", () => {
+    const metadata = { command: "cd sub && find a -type f", working_directory: "pkg" }
+    const success = buildTypedExecResult(
+      "shell_result", VERBATIM_SHELL_STDOUT, undefined, "bash", metadata, undefined, root,
+    ) as { success: { stdout: string } }
+    expect(success.success.stdout).toBe(VERBATIM_SHELL_STDOUT)
+
+    const crlf = "a/b.txt\r\n"
+    const raw = buildTypedExecResult(
+      "shell_result", crlf, undefined, "bash", metadata, undefined, root,
+    ) as { success: { stdout: string } }
+    expect(raw.success.stdout).toBe(crlf)
+
+    const failed = buildTypedExecResult(
+      "shell_result", VERBATIM_SHELL_STDOUT, "nope", "bash", metadata, undefined, root,
+    ) as { failure: { stdout: string; stderr: string } }
+    expect(failed.failure).toMatchObject({ stdout: VERBATIM_SHELL_STDOUT, stderr: "nope" })
+
+    const backgrounded = buildTypedExecResult(
       "shell_result",
-      stdout,
+      VERBATIM_SHELL_STDOUT,
       undefined,
       "bash",
-      { command: "ls", working_directory: "pkg" },
-      undefined,
+      metadata,
+      { kind: "backgrounded", shellId: 1, pid: 1, command: "make", workingDirectory: "pkg", msToWait: 0, reason: 1 },
       root,
     ) as { success: { stdout: string } }
-    expect(r.success.stdout).toBe(
-      [
-        `${root}/pkg/src/a.ts`,
-        "built src/a.ts ok",
-        "https://example.com/a",
-        "/abs/b.ts",
-        `${root}/pkg/src/c.ts:12:3`,
-        "~/secret",
-      ].join("\n"),
-    )
+    expect(backgrounded.success.stdout).toBe(VERBATIM_SHELL_STDOUT)
 
-    const pi = buildTypedExecResult("pi_bash_result", "src/a.ts", undefined, "bash", undefined, undefined, root) as {
+    const pi = buildTypedExecResult("pi_bash_result", VERBATIM_SHELL_STDOUT, undefined, "bash", undefined, undefined, root) as {
       success: { output: string }
     }
-    expect(pi.success.output).toBe(`${root}/src/a.ts`)
+    expect(pi.success.output).toBe(VERBATIM_SHELL_STDOUT)
     const edit = buildTypedExecResult("pi_edit_result", "src/a.ts", undefined, "edit", undefined, undefined, root) as {
       success: { output: string }
     }
@@ -3232,37 +3232,7 @@ describe("OpenCode 2 path and read edge cases", () => {
     expect(whole.success.truncation).toBeUndefined()
   })
 
-  it("does not rewrite shell prose, bare names, or foreign absolute paths", () => {
-    const stdout = ["README.md", "ok", "C:/src/a.ts", "C:/src/a.ts:12", "./src/b.ts"].join("\n")
-    const r = buildTypedExecResult(
-      "shell_result",
-      stdout,
-      undefined,
-      "bash",
-      { command: "ls", working_directory: "/tmp/work" },
-      undefined,
-      root,
-    ) as { success: { stdout: string } }
-    expect(r.success.stdout).toBe(
-      ["README.md", "ok", "C:/src/a.ts", "C:/src/a.ts:12", "/tmp/work/src/b.ts"].join("\n"),
-    )
-
-    const failed = buildTypedExecResult(
-      "shell_result",
-      "src/a.ts",
-      "nope",
-      "bash",
-      { command: "ls", working_directory: "/tmp/work" },
-      undefined,
-      root,
-    ) as { failure: { stdout: string; stderr: string } }
-    expect(failed.failure).toMatchObject({ stdout: "/tmp/work/src/a.ts", stderr: "nope" })
-
-    const unrooted = buildTypedExecResult("shell_result", "src/a.ts") as { success: { stdout: string } }
-    expect(unrooted.success.stdout).toBe("src/a.ts")
-  })
-
-  it("joins onto Windows directory headers and working directories without a second prefix", () => {
+  it("joins onto Windows directory headers without a second prefix", () => {
     const listed = buildTypedExecResult(
       "mcp_result",
       ["Read directory C:/proj, entries 1-3", "a.ts", "nested/", "../b.ts"].join("\n"),
@@ -3307,17 +3277,6 @@ describe("OpenCode 2 path and read edge cases", () => {
     expect(tree.abs_path).toBe("C:/proj")
     expect(tree.children_files.map((file: { name: string }) => file.name)).toEqual(["a.ts"])
     expect(tree.children_dirs[0]?.abs_path).toBe("C:/proj/nested")
-
-    const shell = buildTypedExecResult(
-      "shell_result",
-      "./src/b.ts",
-      undefined,
-      "bash",
-      { command: "ls", working_directory: "C:/work" },
-      undefined,
-      root,
-    ) as { success: { stdout: string } }
-    expect(shell.success.stdout).toBe("C:/work/src/b.ts")
   })
 })
 
