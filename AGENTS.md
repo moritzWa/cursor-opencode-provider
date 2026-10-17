@@ -214,6 +214,8 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   available: 1.x `apply_patch`, 2.0 `patch`, `task`/`subagent`, and `shell`/`bash`.
   2.0 `execute` is JavaScript. Refuse lossy patches before mutation, including
   2.0 CRLF. Keep the correlated Task display title over a prompt fragment.
+  Answer a Task's correlated attachment reads with placeholder bytes, never the
+  file or a host read; list the attachment paths in the subagent prompt.
 - Strip read envelopes while retaining `[Partial read: …]` meaning. Explicit
   pagination alone is not truncation. Reject whole-file writes/overwriting Add
   File patches that echo incomplete content; allow targeted source edits.

@@ -436,6 +436,8 @@ OpenCode 2's `patch` parser strips CRLF carriage returns, so both native convers
 
 The provider reads the permission-filtered subagent catalog from the current host `task` or `subagent` definition and advertises those recipients to Cursor as custom subagents. Native Cursor Task exec remaps onto `task` when advertised, otherwise onto OpenCode 2 `subagent` (`agent` / `sessionID` / `background`). Exact configured names are preserved; unknown future Cursor subtype strings fall back to `general`. If a complete catalog omits every compatible recipient, the request fails on Cursor's typed subagent channel instead of selecting an arbitrary specialist.
 
+When Cursor's Task attaches files, Cursor first reads each one and would hand the bytes only to its own subagent context, which OpenCode's subagent tools cannot take. The provider answers those reads itself with placeholder image bytes, without reading the file, and appends the attachments' absolute paths to the subagent prompt; the child opens them with its own permission-checked tools. The parent session gets no extra read step, and the subagent keeps Cursor's task title.
+
 | Host | Executor | Recipients |
 |------|----------|------------|
 | OpenCode 1.x | `task` | Permission-filtered builtins such as `general` / `explore`, plus configured subagents |

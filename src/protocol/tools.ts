@@ -861,6 +861,59 @@ export function buildCompleteEditReadMessages(
   }
 }
 
+/** 1x1 transparent PNG: satisfies Cursor's binary-attachment check without file bytes. */
+const TASK_ATTACHMENT_PLACEHOLDER = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+  "base64",
+)
+
+/**
+ * Answer Cursor's read of a Task attachment without the file's bytes. Cursor
+ * puts them only in SubagentArgs.selected_context, which OpenCode's subagent
+ * tools cannot take, yet refuses the Task unless the read returns binary data.
+ * The path reaches the subagent prompt instead ({@link appendTaskAttachments})
+ * and the child reads it under its own permissions. A missing or non-regular
+ * target gets the same typed rejection as any native read.
+ */
+export function buildTaskAttachmentReadMessages(
+  execId: number,
+  sourcePath: string,
+  resultPath = sourcePath,
+): Uint8Array[] {
+  const rejected = classifyMissingReadTarget(sourcePath)
+  if (rejected) return buildReadRejectionMessages(execId, rejected)
+  return [
+    encodeMessage("AgentClientMessage", {
+      exec_client_message: {
+        id: execId,
+        local_execution_time_ms: 0,
+        read_result: {
+          success: {
+            path: resultPath,
+            data: TASK_ATTACHMENT_PLACEHOLDER,
+            total_lines: 0,
+            file_size: TASK_ATTACHMENT_PLACEHOLDER.length,
+            truncated: false,
+          },
+        },
+      },
+    }),
+    buildExecStreamClose(execId),
+  ]
+}
+
+/** List Cursor's Task attachments at the end of the subagent prompt as absolute paths. */
+export function appendTaskAttachments(
+  parsed: ParsedExecRequest,
+  attachments: readonly string[],
+  workspaceRoot: string,
+): void {
+  if (parsed.resultField !== "subagent_result" || attachments.length === 0) return
+  const prompt = str(parsed.args.prompt) ?? ""
+  const paths = attachments.map((item) => `- ${resolveReadTargetPath(item.trim(), workspaceRoot)}`)
+  parsed.args.prompt = `${prompt}\n\nAttached files (open them with your file tools):\n${paths.join("\n")}`
+}
+
 type WholeFileEditReplacement = {
   oldString: string
   newString: string

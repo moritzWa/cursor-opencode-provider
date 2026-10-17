@@ -46,7 +46,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Display completion is not execution authority.** Replaying a completed UI
   record duplicates effects without returning its result to Cursor. Mirror only
   final todo/plan state; Task executes through #28, using its correlated display
-  title (`test/tool-call-bridge.test.ts`).
+  title (`test/tool-call-bridge.test.ts`). Reads correlated with a Task are its
+  attachments: a host read claimed the title and gave the image to the parent,
+  not the child ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82),
+  `test/task-attachments.test.ts`).
 - **Aliases need execution mappings and capability flags.** Wording alone did
   not prevent native web/resource collisions. Unknown underscore names are not
   MCP server ids (`resolveToolServerIdentity`, `test/tools.test.ts`).
