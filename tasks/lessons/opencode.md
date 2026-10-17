@@ -250,6 +250,9 @@ These are failure lessons shared by both hosts, not a replacement for
   `test/continuation-session.test.ts`). A failed host tool's single text is
   both `output` and `error`; sending both put it in stdout and stderr
   ([#101](https://github.com/oakimov/cursor-opencode-provider/issues/101)).
+  Deduplicate against the effective error, including a shell-hook failure when
+  the SDK retains only text; keep distinct partial output on stdout
+  (`test/continuation-session.test.ts`).
   Like Cursor CLI, stdout is only what the command printed. Private wrapper
   cleanup removes exactly the launcher's separator, preserving spaces, CRLF,
   blank lines and literal placeholders (`test/shell-timeout.test.ts`).

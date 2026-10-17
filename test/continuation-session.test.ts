@@ -13,6 +13,7 @@ import { getActiveCursorMode, setActiveCursorMode } from "../src/protocol/switch
 import { runHistoryImages } from "../src/protocol/sent-history-images.js"
 import {
   captureCursorShellResult,
+  captureCursorShellFailure,
   registerCursorShellCall,
   resetCursorShellCalls,
 } from "../src/shell-timeout.js"
@@ -708,6 +709,40 @@ describe("deliverContinuationResults", () => {
       expect(messages[1]?.exec_client_message?.shell_stream?.stderr?.data).toBe(error)
     } else {
       expect(messages[0]?.exec_client_message?.shell_result?.failure).toMatchObject({ stdout: "", stderr: error, exit_code: 1 })
+    }
+    expect(live.pending.size).toBe(0)
+  })
+
+  it.each([
+    ["shell_stream", false], ["shell_result", false],
+    ["shell_stream", true], ["shell_result", true],
+  ] as const)("keeps hook-captured %s failures separate from partial stdout (%s)", async (resultField, partial) => {
+    const writes: Uint8Array[] = []
+    const live = fakeSession(`captured-${resultField}`)
+    live.stream.write = frame => { writes.push(frame) }
+    const toolCallId = `cursor_${live.sessionId}_14`
+    const error = "Shell startup failed"
+    const output = partial ? "partial command output\r\n" : error
+    const metadata = { shell_stream: true, command: "echo test", working_directory: "/workspace" }
+    registerCursorShellCall(toolCallId, metadata)
+    captureCursorShellFailure(toolCallId, new Error(error))
+    const [result] = extractTrailingToolResults([{ role: "tool", content: [{
+      type: "tool-result", toolCallId, toolName: "shell", output: { type: "text", value: output },
+    }] }])
+    expect(result?.error).toBeUndefined()
+    sessionManager.registerPending(14, live, resultField, "shell", false, metadata)
+    await deliverContinuationResults(live, [{ ...result!, sessionId: live.sessionId, execId: 14 }])
+    const messages = writes.map(frame => decodeMessage<{
+      exec_client_message?: {
+        shell_stream?: { stdout?: { data: string }; stderr?: { data: string } }
+        shell_result?: { failure?: { stdout: string; stderr: string } }
+      }
+    }>("AgentClientMessage", frame))
+    if (resultField === "shell_stream") {
+      expect(messages.flatMap(message => message.exec_client_message?.shell_stream?.stdout?.data ?? [])).toEqual(partial ? [output] : [])
+      expect(messages.flatMap(message => message.exec_client_message?.shell_stream?.stderr?.data ?? [])).toEqual([error])
+    } else {
+      expect(messages[0]?.exec_client_message?.shell_result?.failure).toMatchObject({ stdout: partial ? output : "", stderr: error })
     }
     expect(live.pending.size).toBe(0)
   })
