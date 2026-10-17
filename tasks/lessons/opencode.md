@@ -313,7 +313,11 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Model metadata has separate owners.** Keep wire parameters isolated; make
   metadata-changing variants separate catalog entries. Invalidate cache schema
   before config consumes it; live negative capabilities outrank docs
-  (`test/model-metadata.test.ts`).
+  (`test/model-metadata.test.ts`). PRs #84/#86/#95 showed that tier selection
+  must precede speed preference, defaults must survive catalog partitioning,
+  and unmatched hints must not rewrite an advertised tuple. Exercise marked
+  non-1M tiers and duplicate ids (`test/model-selection-review.test.ts`,
+  `test/model-effort-review.test.ts`, `test/model-selection-run.test.ts`).
 - **Inspect generator inputs before changing mappings.** Pricing and model
   metadata came from distinct markdown endpoints. Run the live pricing gate
   before a bump; the v0.6.4 failure forced a retag ([release gate](../../AGENTS.md#hard-stop--release--version-bump--tag-gate-non-optional)).

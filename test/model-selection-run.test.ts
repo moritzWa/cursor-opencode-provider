@@ -1,0 +1,142 @@
+import { afterAll, afterEach, beforeAll, expect, it } from "bun:test"
+import fs from "node:fs/promises"
+import http2 from "node:http2"
+import os from "node:os"
+import path from "node:path"
+import { createCursor } from "../src/index.js"
+import { setHostCacheDirOverride } from "../src/context/paths.js"
+import { resetTurnStateForTests } from "../src/language-model.js"
+import { CURSOR_VARIANT_PARAMETERS_KEY, mapAvailableModelsResponse, writeCache } from "../src/models.js"
+import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
+import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
+import { sessionManager } from "../src/session.js"
+import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
+import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests } from "../src/transport/connect.js"
+
+const origin = "https://agentn.model-selection-test.cursor.sh"
+const proxyKeys = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
+const savedProxy = new Map<string, string | undefined>()
+let server: http2.Http2Server
+let client: http2.ClientHttp2Session
+const requests: Array<{ requested_model: {
+  model_id: string; max_mode: boolean; parameters: Array<{ id: string; value: string }>
+} }> = []
+
+function frame(payload: Uint8Array): Buffer {
+  const header = Buffer.alloc(5)
+  header.writeUInt32BE(payload.length, 1)
+  return Buffer.concat([header, Buffer.from(payload)])
+}
+
+beforeAll(async () => {
+  for (const key of proxyKeys) {
+    savedProxy.set(key, process.env[key])
+    delete process.env[key]
+  }
+  server = http2.createServer()
+  server.on("stream", (stream) => {
+    stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
+    stream.on("error", () => {})
+    let pending = Buffer.alloc(0)
+    stream.on("data", (chunk: Buffer) => {
+      pending = Buffer.concat([pending, chunk])
+      while (pending.length >= 5) {
+        const length = pending.readUInt32BE(1)
+        if (pending.length < 5 + length) break
+        const message = decodeMessage<{ run_request?: typeof requests[number] }>(
+          "AgentClientMessage", pending.subarray(5, 5 + length),
+        )
+        pending = pending.subarray(5 + length)
+        if (!message.run_request) continue
+        requests.push(message.run_request)
+        stream.write(frame(encodeMessage("AgentServerMessage", {
+          interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 1 } },
+        })))
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("Expected a TCP test server")
+  client = http2.connect(`http://127.0.0.1:${address.port}`)
+  await new Promise<void>((resolve, reject) => {
+    client.once("connect", resolve)
+    client.once("error", reject)
+  })
+})
+
+afterEach(() => {
+  sessionManager.dispose()
+  resetTurnStateForTests()
+  resetConversationBindingsForTests()
+  resetConversationPersistenceForTests()
+  resetCheckpointsForTests()
+  setHostCacheDirOverride(undefined)
+  requests.length = 0
+})
+
+afterAll(async () => {
+  closeCachedHttp2SessionsForTests()
+  client?.destroy()
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  for (const key of proxyKeys) {
+    const value = savedProxy.get(key)
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+})
+
+it.each([
+  { context: "256k", fast: "false", max: false, options: {} },
+  { context: "500k", fast: "false", max: true, options: { maxMode: true } },
+  { context: "500k", fast: "true", max: true, options: { maxMode: false, picked: "500k" } },
+  { context: "256k", fast: "true", max: false, options: { maxMode: true, picked: "256k" } },
+])("sends cached selection $context fast=$fast max=$max through startSession", async (scenario) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-model-run-"))
+  try {
+    const parameters = (context: string, fast: boolean) => [
+      { id: "context", value: context },
+      { id: "reasoning_effort", value: "high" },
+      { id: "fast", value: String(fast) },
+    ]
+    const models = mapAvailableModelsResponse({ models: [{ name: "grok-4.7", variants:
+      ["256k", "500k"].flatMap((context) => [false, true].map((fast) => ({
+        parameterValues: parameters(context, fast),
+        isMaxMode: context === "500k",
+        isDefaultNonMaxConfig: context === "256k" && fast,
+        isDefaultMaxConfig: context === "500k" && fast,
+      }))),
+    }] })
+    await writeCache(directory, { models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
+    cacheHttp2SessionForTests(origin, client)
+    const model = createCursor({ name: "cursor", accessToken: "test-token", cacheDir: directory, agentBaseURL: origin })
+      .languageModel("grok-4.7")
+    const { picked, ...hints } = scenario.options
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+      providerOptions: { cursor: {
+        ...hints,
+        ...(picked ? { [CURSOR_VARIANT_PARAMETERS_KEY]: parameters(picked, true) } : {}),
+      } },
+    })
+    const reader = stream.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      expect(value.type).not.toBe("error")
+    }
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.requested_model).toMatchObject({
+      model_id: "grok-4.7", max_mode: scenario.max,
+      parameters: parameters(scenario.context, scenario.fast === "true"),
+    })
+  } finally {
+    sessionManager.dispose()
+    await fs.rm(directory, { recursive: true, force: true })
+  }
+})
