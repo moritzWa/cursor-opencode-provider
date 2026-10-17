@@ -119,6 +119,10 @@ and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 
 ## Shell failures and interruption
 
+Shell output keeps path-like text, whitespace and successful timeout-shaped
+text unchanged. Internal wrapper markers are removed without trimming command
+output, and failed shell streams retain partial output alongside their error.
+
 The classic plugin releases unstarted shell reservations from persisted tool
 error events as well as the after hook, because rejection can stop the host
 before a continuation. OpenCode 1's shell [returns a null exit after abort or

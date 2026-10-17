@@ -169,6 +169,10 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
+Shell output keeps path-like text, whitespace and successful timeout-shaped
+text unchanged. Internal wrapper markers are removed without trimming command
+output, and failed shell streams retain partial output alongside their error.
+
 The shell integration follows each host's execution order. OpenCode 1.18.31
 [checks permissions before `shell.env`](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/tool/shell.ts#L599-L637).
 OpenCode 2.0.27 [runs `create.before` before its permission callback and then spawns the selected executable](https://github.com/anomalyco/opencode/blob/v2.0.27/packages/core/src/shell.ts#L263-L307),
