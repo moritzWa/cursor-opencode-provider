@@ -1838,10 +1838,12 @@ async function startSession(
     picked,
   })
   // An explicit pick owns the context tier; otherwise honor the maxMode hint.
-  // OpenCode's variant paramMap does not include maxMode when the user selects 1m.
+  // OpenCode's variant paramMap does not include maxMode, so the cataloged
+  // variant's isMaxMode marker decides it (1m tiers, Grok 4.7's 500k).
   const maxMode = resolveVariantMaxMode(parameterValues, {
     picked,
     maxMode: hintMaxMode,
+    model: modelInfo,
   })
 
   if (foreignHistory || checkpointUnusable || unfinishedPriorRun) {
