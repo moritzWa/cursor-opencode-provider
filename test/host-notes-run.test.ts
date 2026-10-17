@@ -368,7 +368,7 @@ describe("history images through a full provider Run", () => {
     for (let i = 0; i < 500 && sessionManager.findOpenByOpenCodeSessionId(sessionKey); i++) await Bun.sleep(10)
     await collect(model(root), [...turn2, assistant("Looking"), user("Try again.")], sessionKey)
 
-    if (host === 2) expect(runs[1]!.received.filter((message) => message.conversation_action?.cancel_action)).toHaveLength(1)
+    expect(runs[1]!.received.filter((message) => message.conversation_action?.cancel_action)).toHaveLength(1)
     expect(sentImages(1)).toEqual([IMAGE_B])
     expect(sentCheckpoint(2)).toEqual(resumed)
     expect(sentImages(2)).toEqual([...resent])
