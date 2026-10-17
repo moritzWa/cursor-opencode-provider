@@ -343,6 +343,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Make tests capable of failing.** Type guards once sat outside tsc's include;
   root ignored permission fixtures. Use real usages, deterministic faults and
   independent host/frame evidence (`test/workspace-facts.test.ts`).
+- **Publication checks must stop publication.** A failed history scan did not
+  stop later pushes in the same shell sequence. Require successful exit before
+  publishing, and scan commit bodies and coauthor trailers as well as author /
+  committer identities. A clean file diff alone does not establish privacy.
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
