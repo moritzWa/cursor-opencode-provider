@@ -314,6 +314,10 @@ describe("provider upload cancellation", () => {
       expect(session.pending.size).toBe(1)
       expect(session.closed).toBe(false)
       expect(session.stream.isClosed()).toBe(false)
+      await expect(session.reopenWithUserMessage!("Do not upload", AbortSignal.abort()))
+        .rejects.toBeInstanceOf(CursorLocalCancellationError)
+      expect(fake.received).toHaveLength(1)
+      expect(session.closed).toBe(false)
       const nextStep = new AbortController()
       const reopened = session.reopenWithUserMessage!("x".repeat(3_000_000), nextStep.signal)
       const outcome = failureOf(reopened)
@@ -365,7 +369,7 @@ describe("provider upload cancellation", () => {
     }
   }, 15_000)
 
-  it("cancels a blocked tool-result upload on the continuation call's signal", async () => {
+  it.each(["before-call", "during-upload"] as const)("cancels a tool-result upload on a %s abort", async (when) => {
     fake = await startSlowCursor(200_000)
     const stream = await bidiRunStream("token", { baseURL: ORIGIN })
     const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-continuation-cancel-"))
@@ -385,6 +389,7 @@ describe("provider upload cancellation", () => {
       const model = createCursor({ name: "cursor", accessToken: "token", agentBaseURL: ORIGIN,
         workspaceRoot: cacheDir, cacheDir }).languageModel("composer-2.5")
       const toolCallId = `cursor_${session.sessionId}_4`
+      if (when === "before-call") controller.abort()
       opening = Promise.resolve(model.doStream({
         prompt: [
           { role: "user", content: [{ type: "text", text: "Read the file" }] },
@@ -394,13 +399,19 @@ describe("provider upload cancellation", () => {
         headers: { "x-opencode-session-id": sessionKey }, abortSignal: controller.signal,
       } as LanguageModelV3CallOptions))
       const outcome = failureOf(opening)
-      await waitUntil(() => fake!.received[0]! > 50_000)
-      expect(fake.received[0]).toBeGreaterThan(50_000)
-      fake.stall()
-      controller.abort()
+      if (when === "during-upload") {
+        await waitUntil(() => fake!.received[0]! > 50_000)
+        expect(fake.received[0]).toBeGreaterThan(50_000)
+        fake.stall()
+        controller.abort()
+      }
       const error = await Promise.race([outcome, Bun.sleep(1_000).then(() => "still uploading")])
       expect(error).toBeInstanceOf(CursorLocalCancellationError)
       expect(session.closed).toBe(true)
+      if (when === "before-call") {
+        expect(fake.received.reduce((total, bytes) => total + bytes, 0)).toBe(0)
+        expect(fake.received.length).toBeLessThanOrEqual(1)
+      }
     } finally {
       closeCachedHttp2SessionsForTests()
       if (opening) await failureOf(opening)
