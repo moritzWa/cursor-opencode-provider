@@ -3,7 +3,7 @@
  * startSession → bidiRunStream → pump against a local HTTP/2 server that plays
  * Cursor's Run endpoint. No network access.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -111,6 +111,9 @@ function restartProcess(): void {
   resetConversationBlobsForTests()
   resetToolRequestsListedSeenForTests()
 }
+
+// Each test starts as a new process, whatever an earlier test file left behind.
+beforeEach(restartProcess)
 
 afterEach(() => {
   setHostCacheDirOverride(undefined)
