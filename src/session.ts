@@ -722,7 +722,12 @@ export class SessionManager {
     }
   }
 
-  async deliverClaim(claim: ContinuationClaim, frames: readonly Uint8Array[]): Promise<DeliveryOutcome> {
+  async deliverClaim(
+    claim: ContinuationClaim,
+    frames: readonly Uint8Array[],
+    /** Called at each actual serialized write, before write() and its drain. */
+    beforeWrite?: () => void,
+  ): Promise<DeliveryOutcome> {
     const { session, execId, pending } = claim
     const key = this.key(session.sessionId, execId)
     const unavailable = (framesWritten: number): DeliveryOutcome | undefined => {
@@ -757,7 +762,10 @@ export class SessionManager {
       }
       for (const frame of frames) {
         try {
-          await writeStreamMessage(session.stream, frame, "continuation result")
+          await writeStreamMessage(session.stream, frame, "continuation result", beforeWrite ? () => {
+            beforeWrite()
+            return true
+          } : undefined)
         } catch (error) {
           // write() returned false before the drain failed: the bytes are buffered.
           if (error instanceof StreamWriteDrainError) framesWritten++

@@ -4,11 +4,11 @@ import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
+import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
-import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
+import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
 import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
@@ -127,6 +127,188 @@ async function streamError(sessionKey: string): Promise<unknown> {
 }
 
 describe("checkpoint eligibility across host results", () => {
+  const readParts = async (model: LanguageModelV3, options: LanguageModelV3CallOptions) => {
+    const parts: LanguageModelV3StreamPart[] = []
+    const { stream } = await model.doStream(options)
+    const reader = stream.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return parts
+      parts.push(value)
+    }
+  }
+  const appendResult = (prompt: LanguageModelV3CallOptions["prompt"], parts: LanguageModelV3StreamPart[], output: string) => {
+    const call = parts.find(part => part.type === "tool-call")
+    if (!call || call.type !== "tool-call") throw new Error("Expected a host tool call")
+    prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+    prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
+  }
+
+  for (const checkpointAt of ["prefix-drain", "final-drain"] as const) {
+    it(`uses the actual result write cutoff when a checkpoint arrives during ${checkpointAt}`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-drain-"))
+      const checkpoint = Uint8Array.of(10, 1, 8)
+      let resumed = false
+      let resumedState: Uint8Array | undefined
+      let blocked = false
+      let checkpointSent = false
+      let checkpointArrivedDuringDrain = false
+      let boundary = 0
+      let drainDone!: () => void
+      const drained = new Promise<void>(resolve => { drainDone = resolve })
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        if (message.run_request) {
+          runs++
+          resumed = !!(message.run_request as { action?: { resume_action?: unknown } }).action?.resume_action
+          resumedState = (message.run_request as { conversation_state?: Uint8Array }).conversation_state
+          if (runs > 1) {
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+          } else send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo done", tool_call_id: "command" } } })
+          return
+        }
+        const control = message.exec_client_control_message as { stream_close?: { id: number } } | undefined
+        const result = message.exec_client_message as { shell_stream?: { start?: unknown } } | undefined
+        if (!checkpointSent && (checkpointAt === "final-drain" ? control?.stream_close?.id === 1 : result?.shell_stream?.start)) {
+          checkpointSent = true
+          send({ conversation_checkpoint_update: checkpoint })
+        }
+        if (control?.stream_close?.id === 1) {
+          void drained.then(() => new Promise<void>(resolve => setImmediate(resolve))).then(() => {
+            send({ interaction_update: { thinking_delta: { text: "after the result" } } })
+            stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
+          })
+        }
+      }
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const key = `ses_checkpoint_${checkpointAt}`
+        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          workspaceRoot: root, retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run the command" }] }]
+        const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": key },
+          tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+        appendResult(prompt, await readParts(model, options), "done")
+        const held = sessionManager.findOpenByOpenCodeSessionId(key)!
+        const write = held.stream.write.bind(held.stream)
+        const waitForDrain = held.stream.waitForDrain?.bind(held.stream)
+        held.stream.write = bytes => {
+          const message = decodeMessage<{ exec_client_message?: { shell_stream?: { start?: unknown } }; exec_client_control_message?: { stream_close?: { id: number } } }>("AgentClientMessage", bytes)
+          const block = checkpointAt === "final-drain"
+            ? message.exec_client_control_message?.stream_close?.id === 1
+            : !!message.exec_client_message?.shell_stream?.start
+          if (block) { blocked = true; boundary = lastFrameArrival() }
+          const accepted = write(bytes)
+          return block ? false : accepted
+        }
+        held.stream.waitForDrain = async () => {
+          if (!blocked) { await waitForDrain?.(); return }
+          const arrived = () => held.heldFrames?.some(queued => {
+            if ((frameArrival(queued) ?? 0) <= boundary) return false
+            const message = decodeMessage<{ conversation_checkpoint_update?: Uint8Array }>("AgentServerMessage", queued.payload)
+            return message.conversation_checkpoint_update?.every((byte, index) => byte === checkpoint[index])
+              && message.conversation_checkpoint_update.length === checkpoint.length
+          }) ?? false
+          for (let i = 0; i < 200 && !arrived(); i++) await new Promise(resolve => setTimeout(resolve, 1))
+          checkpointArrivedDuringDrain = arrived()
+          expect(checkpointArrivedDuringDrain).toBe(true)
+          blocked = false
+          drainDone()
+        }
+        if (checkpointAt === "final-drain") {
+          expect((await readParts(model, options)).some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(resumed).toBe(true)
+          expect(resumedState).toEqual(checkpoint)
+          expect(runs).toBe(2)
+        } else {
+          expect(await readParts(model, options).catch((error: unknown) => error)).toMatchObject({ isRetryable: false })
+          expect(runs).toBe(1)
+        }
+        expect(checkpointArrivedDuringDrain).toBe(true)
+      } finally {
+        drainDone()
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
+  for (const [nextId, incomplete, opaque] of [[1, false, false], [2, false, false], [2, true, false], [2, false, true]] as const) {
+    it(`recovers after a resumed Run's completed exec (id=${nextId}, incomplete=${incomplete}, opaque=${opaque})`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-resumed-result-"))
+      const requests: Array<{ conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }> = []
+      const contexts: Uint8Array[] = []
+      const delivered = new Set<string>()
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        if (message.run_request) {
+          requests.push(message.run_request as typeof requests[number])
+          if (requests.length === 3) { send({ interaction_update: { turn_ended: {} } }); stream.end(); return }
+          send({ exec_server_message: { id: 90, request_context_args: {} } })
+          if (requests.length === 1 && opaque) stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
+          send({ exec_server_message: { id: requests.length === 1 ? 1 : nextId,
+            shell_args: { command: `echo step-${requests.length}`, tool_call_id: `command-${requests.length}` } } })
+        } else if (message.exec_client_message) {
+          const reply = message.exec_client_message as { request_context_result?: { success?: { request_context?: Record<string, unknown> } } }
+          const context = reply.request_context_result?.success?.request_context
+          if (context) contexts.push(encodeMessage("RequestContext", context))
+        } else if (message.exec_client_control_message) {
+          const close = (message.exec_client_control_message as { stream_close?: { id: number } }).stream_close
+          const key = `${requests.length}:${close?.id}`
+          if (!close || close.id !== (requests.length === 1 ? 1 : nextId) || delivered.has(key)) return
+          delivered.add(key)
+          if (requests.length === 1) {
+            send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 9) })
+            send({ interaction_update: { thinking_delta: { text: "checkpointed first result" } } })
+            stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
+          } else stream.end()
+        }
+      }
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          workspaceRoot: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
+        const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": `ses_resume_owners_${nextId}_${incomplete}_${opaque}` },
+          tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+        appendResult(prompt, await readParts(model, options), "first command completed")
+        appendResult(prompt, await readParts(model, options), "second command completed")
+        expect(requests).toHaveLength(2)
+        expect(requests[1]!.action.resume_action).toBeDefined()
+        expect(requests[1]!.conversation_id).toBe(requests[0]!.conversation_id)
+        for (let i = 0; i < 200 && contexts.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 1))
+        expect(contexts).toHaveLength(2)
+        const beforeContext = decodeMessage<Record<string, unknown>>("RequestContext", contexts[0]!)
+        const afterContext = decodeMessage<Record<string, unknown>>("RequestContext", contexts[1]!)
+        const changed = [...new Set([...Object.keys(beforeContext), ...Object.keys(afterContext)])]
+          .filter(key => JSON.stringify(beforeContext[key]) !== JSON.stringify(afterContext[key]))
+        expect(changed).toEqual([])
+        if (incomplete) prompt.splice(1, 2)
+        if (incomplete || opaque) {
+          expect(await readParts(model, options).catch((error: unknown) => error)).toMatchObject({ isRetryable: false })
+          expect(requests).toHaveLength(2)
+        } else {
+          expect((await readParts(model, options)).some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(requests).toHaveLength(3)
+          expect(requests[2]!.action.resume_action).toBeUndefined()
+          expect(requests[2]!.conversation_id).not.toBe(requests[0]!.conversation_id)
+          const text = requests[2]!.action.user_message_action!.user_message.text
+          expect(text.match(/first command completed/g)).toHaveLength(1)
+          expect(text.match(/second command completed/g)).toHaveLength(1)
+        }
+        expect(delivered.size).toBe(2)
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
   for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "followup-before-result", "new-output", "final-error"] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))

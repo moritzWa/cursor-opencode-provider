@@ -143,11 +143,12 @@ OpenCode retries a transient failure after only text or reasoning when the
 turn has no new checkpoint. Stateful activity stays a replay barrier. A drop
 immediately after completed tool results can rebuild from complete host history
 before new output; missing results or unrepresented activity remain final.
-Recovery retains the latest
-eligible checkpoint across token renewal, including a rejected credential on
-an untouched resumed attempt. Follow-ups retain checkpoints received while
-opening the new Run. Two resumed attempts that stream without saving a
+Recovery retains the latest eligible checkpoint across token renewal, including
+a rejected credential on an untouched resumed attempt. Checkpoints received
+while a completed tool result drains remain eligible. Follow-ups retain
+checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
 checkpoint end the turn.
+History recovery keeps completed results from earlier resumed Runs too.
 
 The provider shares Cursor CLI's limits of 10 transport retries and 3 server
 retries across this turn, including OpenCode's retries. OpenCode can stop earlier.

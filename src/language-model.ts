@@ -1174,9 +1174,9 @@ async function doStreamImpl(
                   || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
                   || failed.replaySafety?.historyRebaseUnsafe) return false
                 const completed = new Set(extractToolResults(prompt)
-                  .filter(result => result.sessionId === failed.sessionId).map(result => result.execId))
-                const execIds = failed.replaySafety?.execIds
-                return !!execIds?.length && execIds.every(id => completed.has(id))
+                  .map(result => `${result.sessionId}:${result.execId}`))
+                const execs = failed.replaySafety?.execs
+                return !!execs?.length && execs.every(exec => completed.has(`${exec.sessionId}:${exec.id}`))
               },
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
@@ -1328,7 +1328,10 @@ export async function pumpWithRecovery(input: {
       recovery.kind === "resume" ? next.sessionId : undefined,
     )
     if (recovery.kind === "resume") {
-      next.replaySafety = { ...pumpedSession.replaySafety }
+      next.replaySafety = {
+        ...pumpedSession.replaySafety,
+        execs: pumpedSession.replaySafety?.execs?.slice(),
+      }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
@@ -3561,7 +3564,13 @@ async function deliverContinuationResultsNow(
       ? attachHookAdditionalContexts(frames, hookContexts)
       : undefined
     if (notedFrames) frames = notedFrames
-    const outcome = await sessionManager.deliverClaim(claim, frames)
+    // Ignore checkpoints from before the final result frame's actual write,
+    // including time spent queued behind another write, but admit those that
+    // arrive while that frame drains. Earlier result frames are incomplete.
+    let beforeResultWrite = lastFrameArrival()
+    const outcome = await sessionManager.deliverClaim(claim, frames, () => {
+      beforeResultWrite = lastFrameArrival()
+    })
     if (outcome.kind !== "delivered") {
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
@@ -3569,7 +3578,7 @@ async function deliverContinuationResultsNow(
     }
     deliveredResults++
     if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
-      invalidateResumeCheckpoint(session, lastFrameArrival(), true)
+      invalidateResumeCheckpoint(session, beforeResultWrite, true)
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {

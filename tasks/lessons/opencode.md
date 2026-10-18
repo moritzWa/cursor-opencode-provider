@@ -152,6 +152,11 @@ These are failure lessons shared by both hosts, not a replacement for
   checkpoint for that recovery. A later tool result must not erase an earlier
   uncheckpointed follow-up's barrier: that follow-up may be absent from the
   host prompt. Only a newer eligible checkpoint clears the revocation.
+  Capture result cutoffs at each actual serialized write, before its drain;
+  after-drain timestamps rejected valid checkpoints, while a cutoff before the
+  queue admitted checkpoints predating the completed result. Retain every
+  exec's owning session across resumes: bare stream-local ids both collide and
+  lose earlier completed results (`test/run-error-host.test.ts`, `test/session.test.ts`).
   Reject an unsafe replacement upload before consulting the preceding Run's
   checkpoint: that checkpoint says nothing about work the replacement may have
   started. Failed drains must also project as terminal to both hosts, including

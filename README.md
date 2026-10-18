@@ -338,6 +338,8 @@ the provider can rebuild from host history containing every observed exec's
 result. It sends the completed results once and asks Cursor to continue. A
 checkpoint predating those results is never resumed. Missing results, unknown
 activity or a new interaction keep the failure final.
+A checkpoint received while the completed result drains remains eligible.
+History recovery retains completed results from earlier resumed Runs too.
 
 For direct SDK use, `retry.maxAttempts` adds a total attempt ceiling, including
 the initial attempt; omitting it uses the two Cursor CLI budgets. The existing
