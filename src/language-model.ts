@@ -2602,11 +2602,14 @@ async function readHeldFrames(session: CursorSession, frames: CursorSession["fra
   }
 }
 
+/** In-progress saves still writing; see `settleRunSavesForTests`. */
+const runSavesInFlight = new Set<Promise<void>>()
+
 /** Save a Run's conversation before Cursor ends its turn, with the latest checkpoint Cursor sent. */
 function persistRunInProgress(session: CursorSession, where: string): Promise<void> {
   const sessionKey = session.openCodeSessionId
   if (!sessionKey) return Promise.resolve()
-  return persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
+  const save = persistConversationState(session.cacheDir ?? opencodeGlobalCacheDir(), {
     sessionKey,
     conversationId: session.conversationId,
     requestContext: session.requestContext,
@@ -2619,6 +2622,9 @@ function persistRunInProgress(session: CursorSession, where: string): Promise<vo
   }).catch((error) => {
     trace(`conversation persistence: ${where} save failed sessionKey=${sessionKey}: ${String(error)}`)
   })
+  runSavesInFlight.add(save)
+  void save.finally(() => runSavesInFlight.delete(save))
+  return save
 }
 
 /** How long a Run must wait on host tools before its state is saved for a restart. */
@@ -2726,9 +2732,15 @@ const hostInterrupts = new Map<string, { at: number; reason: string }>()
 /** Cancels still draining; a shutdown or the next turn waits for them so their final save is not cut off. */
 const cancelsInFlight = new Map<CursorSession, Promise<void>>()
 
-/** Test helper: wait for host-interrupt cancels, including their final saves. */
-export async function settleHostInterruptsForTests(): Promise<void> {
-  await Promise.all([...cancelsInFlight.values()])
+/**
+ * Test helper: wait for host-interrupt cancels and in-progress Run saves, which
+ * write after the call that started them returned. Close the Runs first, so a
+ * held Run's save timer finds them closed instead of starting another save.
+ */
+export async function settleRunSavesForTests(): Promise<void> {
+  while (cancelsInFlight.size > 0 || runSavesInFlight.size > 0) {
+    await Promise.all([...cancelsInFlight.values(), ...runSavesInFlight])
+  }
 }
 
 function cancelForHostInterrupt(session: CursorSession, reason: string): void {

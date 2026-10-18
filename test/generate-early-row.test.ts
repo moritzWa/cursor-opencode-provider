@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
@@ -13,6 +13,7 @@ import { resetTurnStateForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
 
 const ORIGIN = "https://agentn.generate-early-row-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -81,7 +82,13 @@ afterAll(async () => {
   }
 })
 
+// `createCursor({ cacheDir })` sets the process-wide host cache root; a later
+// test would write into this file's removed temp dir.
+let previousCache: string | undefined
+beforeEach(() => { previousCache = getHostCacheDirOverride() })
+
 afterEach(() => {
+  setHostCacheDirOverride(previousCache)
   sessionManager.dispose()
   resetTurnStateForTests()
   resetConversationPersistenceForTests()

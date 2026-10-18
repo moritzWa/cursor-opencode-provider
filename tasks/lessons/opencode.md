@@ -375,8 +375,12 @@ These are failure lessons shared by both hosts, not a replacement for
   run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
   cutting the whole project-folder path put it outside a long cache root;
   background spawns kept their logs and children; a stop's save and terminal
-  supervisors wrote after the `finally`/`afterEach` removal. Wait for the
-  writers, then remove; `test/preload.ts` fails any run that leaves an entry.
+  supervisors wrote after the `finally`/`afterEach` removal; a held Run's save
+  landed after its test removed the dir. On Linux only, three tests left
+  `createCursor({ cacheDir })`'s process-wide cache root set, so later files
+  wrote into their removed dirs and failed tests that expected the default
+  root. Wait for the writers, restore the root, then remove; `test/preload.ts`
+  fails any run that leaves an entry and lists its files.
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
   tests need an init reaper. Strip temporary module copies from coverage and
   include Bun editor types (`scripts/strip-copied-coverage.ts`).

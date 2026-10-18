@@ -19,7 +19,7 @@ import { notifyHostInterrupt } from "../dist/host-interrupt.js"
 import { sessionManager } from "../dist/session.js"
 import { getHostCacheDirOverride, setHostCacheDirOverride } from "../dist/context/paths.js"
 import { encodeMessage } from "../dist/protocol/messages.js"
-import { settleHostInterruptsForTests } from "../dist/language-model.js"
+import { settleRunSavesForTests } from "../dist/language-model.js"
 
 
 // Node keeps a large write's full size buffered until it is out and holds back
@@ -229,7 +229,7 @@ for (const [kind, stop] of [["initial", "abort"], ["initial", "host-stop"], ["re
       closeCachedHttp2SessionsForTests()
       if (opening) await failureOf(opening)
       // The stop saves the cancelled Run afterwards; that write would recreate the dir.
-      await settleHostInterruptsForTests()
+      await settleRunSavesForTests()
       setHostCacheDirOverride(previousCache)
       await fs.rm(cacheDir, { recursive: true, force: true })
     }

@@ -247,6 +247,20 @@ describe("opencodeProjectDir", () => {
     expect(shortened).toMatch(/^.{1,84}-[0-9a-f]{7}$/)
   })
 
+  it.each([[83, "-"], [84, ""]])("names a project folder under a %i-character projects root by its hash", (length, prefix) => {
+    const cacheRoot = `/tmp/${"b".repeat(length - "/tmp/".length - "/opencode/projects".length)}`
+    process.env.XDG_CACHE_HOME = cacheRoot
+    process.env.XDG_CONFIG_HOME = "/tmp/xdg-config-empty"
+    const projectsRoot = path.join(cacheRoot, "opencode", "projects")
+    expect(projectsRoot).toHaveLength(length)
+    const workspace = `/Users/${"y".repeat(40)}/project`
+    const full = path.join(projectsRoot, slugifyWorkspacePath(workspace))
+    const hash = createHash("sha256").update(full).digest("hex").slice(0, 7)
+    // At 83 the old cut already ended at `projects/`: that folder keeps its name.
+    expect(opencodeProjectDir(workspace)).toBe(path.join(projectsRoot, `${prefix}${hash}`))
+    if (length === 83) expect(opencodeProjectDir(workspace)).toBe(`${full.slice(0, 84)}-${hash}`)
+  })
+
   it("keeps the shortened name an existing project folder already has", () => {
     process.env.HOME = "/tmp/fake-home"
     delete process.env.XDG_CACHE_HOME
