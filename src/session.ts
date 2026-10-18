@@ -37,7 +37,8 @@ export type CursorContinuationPolicy = {
 }
 
 export const DEFAULT_CONTINUATION_POLICY: Readonly<CursorContinuationPolicy> = {
-  semanticIdleMs: 120_000,
+  // Cursor CLI aborts an active attempt after 30 s without an inbound frame.
+  semanticIdleMs: 30_000,
   hardCapMs: 600_000,
   heartbeatMs: 5_000,
 }

@@ -33,6 +33,32 @@ describe("Cursor CLI retry budgets", () => {
       { type: "file", data: new Uint8Array([1]), mediaType: "image/png" }] }])).not.toBe(key)
   })
 
+  it("recognizes interruption notices with appended host-note parts but not new requests or attachments", () => {
+    const notice = "The previous response was interrupted. Continue from where you left off without repeating completed content."
+    const prompt: LanguageModelV3Prompt = [{ role: "user", content: [{ type: "text", text: "Continue" }] }]
+    const key = retryTurnKey(prompt)
+    const transformed = structuredClone(prompt)
+    const first = transformed[0]!
+    if (first.role !== "user") throw new Error("Expected the initial user message")
+    first.content.push({ type: "text", text: "<system-reminder>Initial request reminder</system-reminder>" })
+    expect(retryTurnKey(transformed)).toBe(key)
+    expect(first.content).toHaveLength(2) // identity normalization must not edit the actual prompt
+    prompt.push({ role: "assistant", content: [{ type: "text", text: "partial answer" }] })
+    for (const extra of ["<system-reminder>Check the pending tasks</system-reminder>", "<system-update>Updated instructions</system-update>"]) {
+      const continued: LanguageModelV3Prompt = [...prompt, { role: "user", content: [
+        { type: "text", text: notice }, { type: "text", text: extra },
+      ] }]
+      expect(retryTurnKey(continued)).not.toBe(key)
+      expect(retryTurnKey(continued, true)).toBe(key)
+    }
+    for (const extra of [
+      { type: "text" as const, text: "Actually inspect another file" },
+      { type: "file" as const, data: new Uint8Array([1]), mediaType: "image/png" },
+    ]) {
+      expect(retryTurnKey([...prompt, { role: "user", content: [{ type: "text", text: notice }, extra] }], true)).not.toBe(key)
+    }
+  })
+
   it("requires a requested host retry before sharing a plain-text continuation's budget", () => {
     const original = turnRetryBudget("session", "original")
     reserveRetry(original, server())

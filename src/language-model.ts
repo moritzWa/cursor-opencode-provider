@@ -6916,11 +6916,18 @@ export function cursorTurnEndedProviderMetadata(
 export function retryTurnKey(prompt: LanguageModelV3CallOptions["prompt"], withoutLastInterruptionNotice = false): string {
   // OpenCode 2 runner/llm.ts emits this synthetic after an incomplete stream;
   // runner/to-llm-message.ts lowers it to an ordinary user text part. Limit
-  // recognition to exact, standalone text after assistant output. The budget
-  // accepts that candidate only after a requested host retry, then remembers
-  // its full key across tool steps. Actual prompt content is never removed.
+  // recognition to exact, standalone text after assistant output. A plugin's
+  // trailing host-note parts do not identify a user turn: they may appear only
+  // on this request and disappear from the next request's history. Normalize
+  // them for hashing only. The budget admits the continuation only after a
+  // requested host retry and remembers its full key across tool steps.
   const interrupted = "The previous response was interrupted. Continue from where you left off without repeating completed content."
-  const messages = prompt.filter(message => message.role !== "system" && !hostTailNote(message))
+  const messages = prompt.filter(message => message.role !== "system" && !hostTailNote(message)).map(message => {
+    if (message.role !== "user") return message
+    let end = message.content.length
+    while (end > 1 && hostTailNote({ role: "user", content: [message.content[end - 1]!] }) !== undefined) end--
+    return end === message.content.length ? message : { ...message, content: message.content.slice(0, end) }
+  })
   let end = messages.length
   while (end > 0 && messages[end - 1]!.role !== "user") end--
   const last = messages[end - 1]

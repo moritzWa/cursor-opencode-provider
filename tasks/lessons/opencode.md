@@ -136,8 +136,11 @@ These are failure lessons shared by both hosts, not a replacement for
   only reasoning; its request reached Cursor only with the next message
   ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
   Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
-  after two resumes without a new one. Its separate 10-transport / 3-server
-  retry budgets belong to the user turn, not one provider call: an output-only
+  after two resumes without a new one. Match its 30 s inbound-silence default;
+  outbound client heartbeats cannot extend it. The transport's 120 s read-idle
+  watchdog is a separate backstop (`test/run-liveness.test.ts`).
+  Its separate 10-transport / 3-server retry budgets belong to the user turn,
+  not one provider call: an output-only
   failure handed to an older host with unbounded retries otherwise restarts the
   allowance forever. Share counts across module copies and host tool steps;
   distinguish partial assistant output and host reminders from a new user turn.
@@ -145,10 +148,16 @@ These are failure lessons shared by both hosts, not a replacement for
   user text, not a `<system-reminder>`, and otherwise reset the budget on every
   continuation (`test/run-error-host.test.ts`). Admit it only after a requested
   host retry, retaining its full prompt key across tool steps; a later literal
-  user request with that text still needs a new budget. Immediately after completed
-  host results, history recovery needs every observed exec's result, no new
-  output, and no opaque interaction or unknown frame. Seed all completed tool
-  steps; retaining only the last result loses earlier work. Never use the stale
+  user request with that text still needs a new budget. Normalize recognized
+  trailing host-note parts in every user message for identity only: plugins
+  append them to the initial request too, without persisting them in history.
+  Keep actual request content and attachment/new-request boundaries intact.
+  An unfinished partial-tool row has no execution authority; close it as
+  unfinished and classify it as output only. Started tool lifecycles, execs and
+  unknown frames still forbid that host retry (`test/run-interruption.test.ts`).
+  Immediately after completed host results, history recovery needs every observed
+  exec's result, no new output, and no opaque interaction or unknown frame.
+  Seed all completed tool steps; retaining only the last result loses earlier work. Never use the stale
   checkpoint for that recovery. A later tool result must not erase an earlier
   uncheckpointed follow-up's barrier: that follow-up may be absent from the
   host prompt. Only a newer eligible checkpoint clears the revocation.

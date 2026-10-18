@@ -241,7 +241,7 @@ const cursor = createCursor({
   // telemetryEnabled: true, // opt in to GetServerConfig telemetry
   // cacheDir: "/path/to/host/cache", // optional; else path bridge or native OpenCode cache
   // retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 8_000 }, // optional stricter total limit
-  // continuation: { heartbeatMs: 5_000, semanticIdleMs: 120_000, hardCapMs: 600_000 },
+  // continuation: { heartbeatMs: 5_000, semanticIdleMs: 30_000, hardCapMs: 600_000 },
 })
 
 const model = cursor.languageModel("composer-2.5")
@@ -330,8 +330,18 @@ budget; early stream closure and the inbound read-idle deadline use the server
 budget. Retries of the same turn share these counts across checkpoints, tool
 steps and OpenCode's own retry calls. A new user turn, successful completion or
 Stop starts a fresh budget. Counts are held in memory for the running process.
-OpenCode 2's interruption notices keep the same budget as the original request.
+OpenCode 2's interruption notices keep the same budget as the original request,
+including when a plugin appends recognized `<system-reminder>` or
+`<system-update>` text parts. These notes remain in the request sent to Cursor;
+attachments and ordinary follow-up text still identify a new request.
 OpenCode may stop earlier under its own retry policy.
+
+Like Cursor CLI, an active Run with no pending host work fails after **30 seconds
+without an inbound frame**. Every inbound frame, including a heartbeat or partial
+tool input, renews this deadline; client heartbeats do not. Silence uses the
+transport retry budget and the 180-second consecutive-stall window. The separate
+120-second transport read-idle watchdog remains a backstop. Direct SDK callers
+can override `continuation.semanticIdleMs` (or its `softHealthMs` alias).
 
 If a Run drops immediately after completed tool results, before new output,
 the provider can rebuild from host history containing every observed exec's
@@ -345,7 +355,9 @@ For direct SDK use, `retry.maxAttempts` adds a total attempt ceiling, including
 the initial attempt; omitting it uses the two Cursor CLI budgets. The existing
 backoff defaults remain 500 ms full jitter, growing exponentially to an 8 s
 ceiling (`baseDelayMs` / `maxDelayMs`). OpenCode controls delays when it owns
-the retry after partial output.
+the retry after partial output. An unfinished tool display row, without an exec
+or started tool lifecycle, also permits a host retry: the row closes as unfinished
+and has no tool side effect to repeat.
 
 Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting OpenCode (or its daemon)
 to bypass both count limits and `retry.maxAttempts`, like Cursor CLI's endless

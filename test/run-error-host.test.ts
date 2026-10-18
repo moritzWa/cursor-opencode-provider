@@ -694,8 +694,11 @@ describe("retry limits across OpenCode calls", () => {
     }
   })
 
-  for (const [endless, maxAttempts, retries] of [[false, undefined, 3], [false, 2, 1], [true, 2, 14]] as const) {
-    it(`bounds output-only host retries (endless=${endless}, maxAttempts=${maxAttempts})`, async () => {
+  for (const [endless, maxAttempts, retries, reminderParts] of [
+    [false, undefined, 3, false], [false, 2, 1, false], [true, 2, 14, false],
+    [false, undefined, 3, true], [false, 2, 1, true], [true, 2, 14, true],
+  ] as const) {
+    it(`bounds output-only host retries (endless=${endless}, maxAttempts=${maxAttempts}, reminderParts=${reminderParts})`, async () => {
       const saved = process.env.CURSOR_ENDLESS_RETRIES
       if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
       else delete process.env.CURSOR_ENDLESS_RETRIES
@@ -711,7 +714,12 @@ describe("retry limits across OpenCode calls", () => {
           retry: { maxAttempts, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
         try {
-          const { stream } = await model.doStream({ prompt, headers: { "x-opencode-session-id": "ses_repeated_output" } })
+          // A plugin transforms this request, not the host's stored history.
+          const requestPrompt = structuredClone(prompt)
+          const last = requestPrompt.at(-1)
+          if (reminderParts && last?.role === "user") last.content.push({ type: "text",
+            text: `<system-reminder>Pending task reminder ${runs}</system-reminder>` })
+          const { stream } = await model.doStream({ prompt: requestPrompt, headers: { "x-opencode-session-id": "ses_repeated_output" } })
           const reader = stream.getReader()
           while (!(await reader.read()).done) { /* drain host-visible output */ }
         } catch (error) { return error }

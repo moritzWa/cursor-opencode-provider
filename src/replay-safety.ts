@@ -11,15 +11,17 @@ export type ReplayBarrierReason =
   | "stateful-interaction"
   | "unknown-or-malformed-frame"
 
-/** Barriers that only showed the host text or reasoning: sending the turn again repeats no side effect. */
-const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set(["visible-text", "visible-reasoning"])
+/** Host output without execution authority: sending the turn again repeats no side effect. */
+const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set([
+  "visible-text", "visible-reasoning", "visible-tool-row",
+])
 
 /** Plain Run-owned state retained across host tool-step pump calls. */
 export type ReplaySafetyState = {
   statefulBarrier?: ReplayBarrierReason
   /** Every exec needs its owner's host result; ids can restart on a resumed Run. */
   execs?: Array<{ sessionId: string; id: number }>
-  /** History cannot represent opaque interactions, unknown frames or display-only work. */
+  /** History cannot represent opaque interactions, unknown frames or started display work. */
   historyRebaseUnsafe?: boolean
 }
 

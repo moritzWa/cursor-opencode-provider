@@ -140,8 +140,13 @@ stored messages are preserved.
 ## Interrupted model requests
 
 OpenCode retries a transient failure after only text or reasoning when the
-turn has no new checkpoint. Stateful activity stays a replay barrier. A drop
-immediately after completed tool results can rebuild from complete host history
+turn has no new checkpoint. An unfinished tool display row also permits retry
+if no exec or started tool lifecycle arrived; it closes without execution.
+Stateful activity stays a replay barrier. Like Cursor CLI, an active Run with no
+pending host work fails after 30 s without an inbound frame; heartbeats and
+partial inputs renew that deadline, while client heartbeats do not. The 120 s
+transport read-idle watchdog remains a backstop. A drop immediately after
+completed tool results can rebuild from complete host history
 before new output; missing results or unrepresented activity remain final.
 Recovery retains the latest eligible checkpoint across token renewal, including
 a rejected credential on an untouched resumed attempt. Checkpoints received

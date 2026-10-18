@@ -270,6 +270,51 @@ describe("interrupted Cursor Run handling", () => {
     expect(parts.some((part: any) => part.type === "finish")).toBe(false)
   })
 
+  for (const afterRow of ["eof", "read-idle", "semantic-idle", "unknown", "started", "exec"] as const) {
+    it(`retries an unfinished display row only without stateful activity (${afterRow})`, async () => {
+      const session = fakeSession(`unfinished-row-${afterRow}`, [
+        serverFrame({ interaction_update: { thinking_delta: { text: "Preparing an edit" } } }),
+        serverFrame({ interaction_update: { partial_tool_call: { call_id: "unfinished-edit",
+          tool_call: { edit_tool_call: { args: { path: "unfinished.txt" } } } } } }),
+        ...(afterRow === "unknown" ? [{ flags: 0, payload: Uint8Array.of(0xa2, 0x06, 0) }] : []),
+        ...(afterRow === "started" ? [serverFrame({ interaction_update: { tool_call_started: { call_id: "unfinished-edit" } } })] : []),
+        ...(afterRow === "exec" ? [serverFrame({ exec_server_message: { id: 4, list_mcp_resources_exec_args: {} } })] : []),
+      ])
+      session.toolCatalog = [{ name: "write", description: "Write a file" }]
+      session.permittedToolNames = new Set(["write"])
+      session.requestContext.env = { workspace_paths: [process.cwd()] }
+      const next = session.frames.next.bind(session.frames)
+      session.frames.next = async () => {
+        const frame = await next()
+        if (frame.done && (afterRow === "read-idle" || afterRow === "semantic-idle")) {
+          throw new CursorTransportError("Cursor Run stalled", { transient: true, replaySafe: true,
+            code: afterRow === "read-idle" ? "CURSOR_READ_IDLE_TIMEOUT" : "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
+        }
+        return frame
+      }
+      const parts: Array<{ type: string; providerExecuted?: boolean; result?: string }> = []
+      try {
+        const failure = await pumpWithRecovery({
+          initialSession: session,
+          controller: controller(parts),
+          recover: async () => { throw new Error("Already displayed output must be retried by the host") },
+        }).catch((error: unknown) => error)
+        const outputOnly = ["eof", "read-idle", "semantic-idle"].includes(afterRow)
+        expect(hostFacingError(failure)).toMatchObject({ isRetryable: outputOnly,
+          responseHeaders: { "x-should-retry": String(outputOnly) } })
+        expect(parts.filter(part => part.type === "tool-input-start")).toHaveLength(1)
+        expect(parts.filter(part => part.type === "tool-input-end")).toHaveLength(1)
+        const calls = parts.filter(part => part.type === "tool-call")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]!.providerExecuted).toBe(true)
+        expect(parts.find(part => part.type === "tool-result")?.result).toBe("Cursor did not finish this tool call.")
+        expect(session.pending.size).toBe(0)
+      } finally {
+        sessionManager.close(session)
+      }
+    })
+  }
+
   it("recovers once on a fresh session and completes only after turn_ended", async () => {
     const interrupted = fakeSession("first", [])
     const recovered = fakeSession("second", [
