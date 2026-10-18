@@ -76,10 +76,9 @@ export function endlessRetriesEnabled(): boolean {
   return process.env.CURSOR_ENDLESS_RETRIES === "1" || process.env.CURSOR_ENDLESS_RETRIES === "true"
 }
 
-/** Cursor CLI counts early EOF / read-idle as server failures, stalls as transport. */
+/** CLI's incomplete-stream error is explicitly transport; an idle deadline is server. */
 export function retryCategory(failure: CursorProviderError): "server" | "transport" {
   return failure.origin === "transport"
-    && failure.code !== "CURSOR_STREAM_CLOSED_EARLY"
     && failure.code !== "CURSOR_READ_IDLE_TIMEOUT" ? "transport" : "server"
 }
 

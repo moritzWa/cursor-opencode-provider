@@ -83,8 +83,8 @@ describe("Cursor CLI retry budgets", () => {
     expect(budget.retries).toBe(13)
   })
 
-  it("uses the server budget for early EOF and read-idle, and transport for stalls", () => {
-    expect(retryCategory(new CursorRunInterruptedError())).toBe("server")
+  it("uses transport for incomplete streams and stalls, and server for read-idle", () => {
+    expect(retryCategory(new CursorRunInterruptedError())).toBe("transport")
     expect(retryCategory(new CursorTransportError("idle", { code: "CURSOR_READ_IDLE_TIMEOUT", transient: true, replaySafe: true }))).toBe("server")
     expect(retryCategory(stall())).toBe("transport")
   })

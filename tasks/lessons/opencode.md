@@ -139,6 +139,10 @@ These are failure lessons shared by both hosts, not a replacement for
   after two resumes without a new one. Match its 30 s inbound-silence default;
   outbound client heartbeats cannot extend it. The transport's 120 s read-idle
   watchdog is a separate backstop (`test/run-liveness.test.ts`).
+  Classify the constructed error, not only the signature table: CLI marks a
+  stream ending without `turnEnded` as transport, so it receives ten retries,
+  even though a different early-close signature uses the server category
+  (`test/run-error-host.test.ts`, `test/retry-budget.test.ts`).
   Its separate 10-transport / 3-server retry budgets belong to the user turn,
   not one provider call: an output-only
   failure handed to an older host with unbounded retries otherwise restarts the

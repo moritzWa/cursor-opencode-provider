@@ -385,7 +385,7 @@ describe("interrupted Cursor Run handling", () => {
     expect(writes).toHaveLength(4)
   })
 
-  it("stops early EOF after three server retries, like Cursor CLI", async () => {
+  it("stops early EOF after ten transport retries, like Cursor CLI", async () => {
     let recoveries = 0
     await expect(
       pumpWithRecovery({
@@ -398,7 +398,7 @@ describe("interrupted Cursor Run handling", () => {
         },
       }),
     ).rejects.toBeInstanceOf(CursorRetryExhaustedError)
-    expect(recoveries).toBe(3)
+    expect(recoveries).toBe(10)
   })
 
   it("does not leak OpenCode SessionRetry triggers after unavailable retries finish", async () => {
@@ -675,8 +675,8 @@ describe("interrupted Cursor Run handling", () => {
         throw new CursorTransportError("connect reset", { transient: true, replaySafe: true, code: "ECONNRESET" })
       },
     })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
-    // First EOF spends one server retry; failed opens then spend ten transport retries.
-    expect(openings).toBe(11)
+    // The initial EOF and failed replacement opens share ten transport retries.
+    expect(openings).toBe(10)
   })
 
   for (const endless of [false, true]) {

@@ -27,6 +27,7 @@ let client: http2.ClientHttp2Session
 let trailer: Record<string, unknown> = {}
 let runs = 0
 let partialOutput = false
+let bareEof = false
 let scripted: ((stream: http2.ServerHttp2Stream, message: Record<string, unknown>) => void) | undefined
 const savedProxy: Record<string, string | undefined> = {}
 
@@ -62,7 +63,7 @@ beforeAll(async () => {
             interaction_update: { thinking_delta: { text: "Already delivered" } },
           })))
         }
-        stream.write(frame(Buffer.from(JSON.stringify(trailer)), 2))
+        if (!bareEof) stream.write(frame(Buffer.from(JSON.stringify(trailer)), 2))
         stream.end()
       }
     })
@@ -98,6 +99,7 @@ afterEach(() => {
   resetCheckpointsForTests()
   runs = 0
   partialOutput = false
+  bareEof = false
   scripted = undefined
 })
 
@@ -694,11 +696,12 @@ describe("retry limits across OpenCode calls", () => {
     }
   })
 
-  for (const [endless, maxAttempts, retries, reminderParts] of [
-    [false, undefined, 3, false], [false, 2, 1, false], [true, 2, 14, false],
-    [false, undefined, 3, true], [false, 2, 1, true], [true, 2, 14, true],
+  for (const [endless, maxAttempts, retries, reminderParts, incomplete] of [
+    [false, undefined, 3, false, false], [false, 2, 1, false, false], [true, 2, 14, false, false],
+    [false, undefined, 3, true, false], [false, 2, 1, true, false], [true, 2, 14, true, false],
+    [false, undefined, 10, true, true],
   ] as const) {
-    it(`bounds output-only host retries (endless=${endless}, maxAttempts=${maxAttempts}, reminderParts=${reminderParts})`, async () => {
+    it(`bounds output-only host retries (endless=${endless}, maxAttempts=${maxAttempts}, reminderParts=${reminderParts}, bareEOF=${incomplete})`, async () => {
       const saved = process.env.CURSOR_ENDLESS_RETRIES
       if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
       else delete process.env.CURSOR_ENDLESS_RETRIES
@@ -706,6 +709,7 @@ describe("retry limits across OpenCode calls", () => {
       cacheHttp2SessionForTests(ORIGIN, client)
       trailer = { error: { code: "unavailable" } }
       partialOutput = true
+      bareEof = incomplete
       const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Hello" }] }]
       const attempt = async () => {
         // Hosts may reload the SDK model between retries. State belongs to the turn.
