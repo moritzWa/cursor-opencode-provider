@@ -121,6 +121,13 @@ entrypoints; never try to unify them.
 subset of the 2.0 context from `src/opencode2/types.ts`, so an OpenCode 2.0
 patch release does not require a plugin dependency bump.
 
+The current 2.0 public plugin context exposes `ctx.permission.assert`, although
+the tool execution context still has no `ask`. Image save adapts that domain to
+the shared external-directory/edit gates, with session/agent/tool-call source.
+Native refusal errors retain their identity so OpenCode can end the step. Only
+older snapshots without this domain use the containment-only image fallback.
+Plugin event subscriptions receive an AbortSignal and are cancelled on cleanup.
+
 Compile-time usage checks against the documented OpenCode 2.0 host contract live
 in `test/opencode2-conformance.types.ts` (contract: `test/opencode2-host-contract.ts`).
 They are checked by `tsc -p tsconfig.test.json`, which `bun run typecheck` runs

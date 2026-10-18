@@ -30,6 +30,7 @@ import {
 } from "../src/host-agent-mode.js"
 import { registerCursorShellCall } from "../src/shell-timeout.js"
 import { stageCursorImage } from "../src/image-staging.js"
+import { registerCursorImageSaveTool } from "../src/opencode2/image-save-tool.js"
 import { hostPlansDir, opencode2PlanDir, setHostCacheDirOverride, setNativePlansDir } from "../src/context/paths.js"
 import { hostSkillFiles, resetHostSkillFilesForTests } from "../src/context/skills.js"
 import { writeCache } from "../src/models.js"
@@ -896,6 +897,77 @@ describe("opencode2 setup", () => {
 
     expect(disposed.sort()).toEqual([...registered].sort())
   })
+
+  test("cleanup cancels a quiet event subscription without waiting for another event", async () => {
+    const { ctx } = fakeContext()
+    let signal: AbortSignal | undefined
+    let closed = false
+    ctx.event.subscribe = (options: { signal: AbortSignal }) => {
+      signal = options.signal
+      return (async function* () {
+        try {
+          await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }))
+        } finally {
+          closed = true
+        }
+      })()
+    }
+    const cleanup = await setupPlugin(ctx)
+    expect(signal?.aborted).toBe(false)
+    await cleanup()
+    expect(signal?.aborted).toBe(true)
+    await Promise.resolve()
+    expect(closed).toBe(true)
+  })
+
+  test.each([undefined, "external_directory", "edit"] as const)(
+    "image save enforces native permission ordering and preserves refusal identity (%s)",
+    async (deny) => {
+      const { ctx, sessionLocations } = fakeContext()
+      const workspace = mkdtempSync(join(tmpdir(), "oc2-native-img-ws-"))
+      const projectDir = mkdtempSync(join(tmpdir(), "oc2-native-img-proj-"))
+      const refusal = new Error("native permission rejection")
+      const requests: any[] = []
+      ctx.permission = { assert: async (request: any) => {
+        requests.push(request)
+        if (request.action === deny) throw refusal
+      } }
+      sessionLocations.set("ses_native_img", workspace)
+      let tool: any
+      registerCursorImageSaveTool({ add: (value) => { tool = value } }, ctx)
+      const target = join(projectDir, "assets", "native.png")
+      const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 1])
+      try {
+        const image_id = stageCursorImage({ path: target, projectDir, mime: "image/png", data: png })
+        const result = tool.execute({ image_id }, {
+          sessionID: "ses_native_img", agent: "build", messageID: "msg_native", id: "call_native",
+        })
+        if (deny) {
+          await expect(result).rejects.toBe(refusal)
+          expect(existsSync(join(projectDir, "assets"))).toBe(false)
+        } else {
+          await result
+          expect(readFileSync(target)).toEqual(Buffer.from(png))
+        }
+        expect(requests.map((r) => r.action)).toEqual(
+          deny === "external_directory" ? ["external_directory"] : ["external_directory", "edit"],
+        )
+        expect(requests[0]).toMatchObject({
+          sessionID: "ses_native_img", agent: "build",
+          source: { type: "tool", messageID: "msg_native", id: "call_native" },
+        })
+        expect(requests[0].resources).toHaveLength(1)
+        expect(requests[0].save).toEqual(requests[0].resources)
+        if (requests[1]) {
+          expect(requests[1].save).toEqual(["*"])
+          expect(requests[1].resources).toEqual([requests[1].metadata.filepath])
+        }
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+        rmSync(projectDir, { recursive: true, force: true })
+      }
+    },
+  )
 
   test("the provider transform is a no-op until models are published", async () => {
     const cacheDir = mkdtempSync(join(tmpdir(), "cursor-oc2-plugin-empty-"))

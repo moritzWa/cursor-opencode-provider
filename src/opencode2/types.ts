@@ -358,7 +358,20 @@ export type SessionDomain = {
 // ── Events ──
 
 export type EventDomain = {
-  readonly subscribe: (...args: any[]) => any
+  readonly subscribe: (options?: { readonly signal?: AbortSignal }) => any
+}
+
+/** Public plugin permission domain, distinct from the tool execution context. */
+export type PermissionDomain = {
+  readonly assert: (input: {
+    sessionID: string
+    agent?: string
+    action: string
+    resources: readonly string[]
+    save?: readonly string[]
+    metadata?: Record<string, unknown>
+    source?: { type: "tool"; messageID: string; id: string }
+  }) => Promise<void>
 }
 
 // ── Plugin ──
@@ -446,6 +459,7 @@ export type PluginContext = {
   readonly websearch?: WebSearchDomain
   readonly mcp?: McpDomain
   readonly skill?: SkillDomain
+  readonly permission?: PermissionDomain
 }
 
 export type Cleanup = () => Promise<void> | void
