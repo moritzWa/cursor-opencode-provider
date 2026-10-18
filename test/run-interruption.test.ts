@@ -14,7 +14,8 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError, hostFacingError } from "../src/errors.js"
+import { writeStreamMessage } from "../src/stream-write.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -632,6 +633,55 @@ describe("interrupted Cursor Run handling", () => {
     // First EOF spends one server retry; failed opens then spend ten transport retries.
     expect(openings).toBe(11)
   })
+
+  for (const endless of [false, true]) {
+    for (const renewal of [false, true]) {
+      for (const upload of ["throw", "drain"] as const) {
+        it(`ends an unsafe replacement ${upload} with an older checkpoint (renewal=${renewal}, endless=${endless})`, async () => {
+          const saved = process.env.CURSOR_ENDLESS_RETRIES
+          if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
+          else delete process.env.CURSOR_ENDLESS_RETRIES
+          const checkpoint = Uint8Array.of(10, 1, 21)
+          let openings = 0
+          let renewals = 0
+          let uploadFailure: unknown
+          try {
+            const failure = await pumpWithRecovery({
+              initialSession: fakeSession("before-unsafe-replacement", [
+                serverFrame({ conversation_checkpoint_update: checkpoint }),
+                ...(renewal ? [endStreamError("unauthenticated")] : []),
+              ]),
+              controller: controller([]), retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+              renewRejectedCredential: () => { renewals++ },
+              recover: async recovery => {
+                openings++
+                expect(recovery).toMatchObject({ kind: "resume", checkpoint })
+                // A second opening makes the buggy path finish instead of looping.
+                if (openings > 1) return fakeSession("unexpected-replay", [turnEnded()])
+                const stream = fakeSession("ambiguous-upload", []).stream
+                const reset = Object.assign(new Error("upload connection reset"), { code: "ECONNRESET" })
+                stream.write = () => { if (upload === "throw") throw reset; return false }
+                stream.waitForDrain = async () => { throw reset }
+                try { await writeStreamMessage(stream, Uint8Array.of(1), "replacement Run request") }
+                catch (error) { uploadFailure = error; throw error }
+                throw new Error("The replacement upload must fail")
+              },
+            }).catch((error: unknown) => error)
+
+            expect(hostFacingError(failure)).toMatchObject({
+              statusCode: 400, isRetryable: false, responseHeaders: { "x-should-retry": "false" },
+            })
+            expect(failure).toMatchObject({ retryable: false, replaySafe: false, cause: uploadFailure })
+            expect(openings).toBe(1)
+            expect(renewals).toBe(renewal ? 1 : 0)
+          } finally {
+            if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+            else process.env.CURSOR_ENDLESS_RETRIES = saved
+          }
+        })
+      }
+    }
+  }
 
   it("uses retry.maxAttempts as the total Run attempt budget", async () => {
     let recoveries = 0

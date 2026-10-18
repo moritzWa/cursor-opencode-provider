@@ -898,10 +898,10 @@ export function createCursorLanguageModel(
           forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
           throw new CursorLocalCancellationError("Cursor Run setup cancelled", error)
         }
-        if (!failure.transient) throw failure
-        if (!failure.replaySafe) {
+        if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
           throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
         }
+        if (!failure.transient) throw failure
         reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
         throw hostRetryError(failure, true)
       } catch (terminal) {
@@ -1346,6 +1346,11 @@ export async function pumpWithRecovery(input: {
       session = await reopen(pumped, failure, checkpoint)
     } catch (error) {
       const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
+      // The failed upload belongs to the replacement Run. The preceding Run's
+      // checkpoint cannot prove that the replacement did not already start work.
+      if (!failure.replaySafe && (failure.transient || failure.origin === "transport")) {
+        throw retrySuppressedError(failure, "while opening the replacement Run", retryBudget.retries + 1, maxRecoveries + 1)
+      }
       if (!failure.transient) throw error
       openingFailure = failure
     }

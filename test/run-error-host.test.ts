@@ -386,11 +386,12 @@ describe("retry limits across OpenCode calls", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-setup-retry-budget-"))
     let renewals = 0
     let ambiguous = false
+    let transient = true
     const model = createCursor({
       name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
       getAccessToken: async () => {
         renewals++
-        throw new CursorTransportError("connection reset", { transient: true, replaySafe: !ambiguous, code: "ECONNRESET" })
+        throw new CursorTransportError("connection reset", { transient, replaySafe: !ambiguous, code: "ECONNRESET" })
       },
     }).languageModel("composer-2.5")
     const attempt = async (): Promise<unknown> => {
@@ -411,6 +412,8 @@ describe("retry limits across OpenCode calls", () => {
       expect(renewals).toBe(11)
       await notifyHostInterrupt("ses_setup_retries", "test-stop")
       ambiguous = true
+      expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+      transient = false
       expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
       expect(runs).toBe(0)
     } finally {

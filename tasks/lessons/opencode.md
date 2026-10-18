@@ -141,6 +141,10 @@ These are failure lessons shared by both hosts, not a replacement for
   failure handed to an older host with unbounded retries otherwise restarts the
   allowance forever. Share counts across module copies and host tool steps;
   distinguish partial assistant output and host reminders from a new user turn.
+  Reject an unsafe replacement upload before consulting the preceding Run's
+  checkpoint: that checkpoint says nothing about work the replacement may have
+  started. Failed drains must also project as terminal to both hosts, including
+  during credential renewal and endless mode (`test/run-interruption.test.ts`).
   Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
   consecutive-stall retry window (`src/retry-budget.ts`,
   `test/retry-budget.test.ts`, `test/run-error-host.test.ts`).

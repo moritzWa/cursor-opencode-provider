@@ -341,9 +341,10 @@ the retry after partial output.
 Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting OpenCode (or its daemon)
 to bypass both count limits and `retry.maxAttempts`, like Cursor CLI's endless
 retry mode. This keeps retrying eligible transient failures; it preserves Stop,
-final errors, authentication rules and tool replay guards. It also retains
-Cursor CLI's safety cutoffs: two resumed attempts that stream without a new
-checkpoint end the turn, and consecutive semantic-stall retries stop once
+final errors, authentication rules and tool replay guards. An upload with
+uncertain delivery ends the turn even when an older checkpoint exists.
+Cursor CLI's safety cutoffs remain: two resumed attempts that stream without a
+new checkpoint end the turn, and consecutive semantic-stall retries stop once
 180 seconds have elapsed since the first stall retry. A non-stall failure resets
 that stall window. The setting does not override OpenCode's own retry limits.
 
