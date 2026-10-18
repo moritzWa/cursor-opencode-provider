@@ -13,8 +13,10 @@ import {
 } from "../src/protocol/tools.js"
 import { noteToolRequestsListedSeen, resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import {
+  EARLY_ROW_CLOSED,
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
+  earlyRowHandoff,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
@@ -699,6 +701,68 @@ describe("early edit rows", () => {
     }
   }
 
+  // A rewrite with unchanged content has no text to replace, so it stays a
+  // `write` on native catalogs; the patch tool takes it as an Add File.
+  for (const catalog of catalogs) {
+    it(`completes the row for an unchanged rewrite (${catalog.label})`, async () => {
+      const workspace = tempDir()
+      const file = path.join(workspace, "same.txt")
+      fs.writeFileSync(file, "one\n")
+      const { session, parts } = catalogSession(
+        [...editHandshake("edit-same", file, 17, "one\n"), turnEnded()],
+        catalog,
+        workspace,
+      )
+      await run(session, parts)
+
+      if (catalog.fileTool !== "native") {
+        expectBoundRow(parts, catalog.fileTool)
+        sessionManager.resolve(session.sessionId, 18)
+        return
+      }
+      // The row cannot become `write` once started, so it completes and names the call that carries on.
+      const start = parts.find((part) => part.type === "tool-input-start")
+      const handoff = parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id)
+      const write = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+      expect(start).toMatchObject({ toolName: "edit" })
+      expect(parts.find((part) => part.type === "tool-call" && part.providerExecuted))
+        .toMatchObject({ toolCallId: start?.id, toolName: "edit" })
+      expect(handoff).toMatchObject({ toolName: "edit", result: earlyRowHandoff("write"), isError: false })
+      expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+      expect(write).toMatchObject({ toolName: "write" })
+      expect(write.toolCallId.startsWith("cursor_")).toBe(true)
+      expect(JSON.parse(write.input)).toMatchObject({ content: "one\n" })
+      expect(parts.findIndex((part) => part === handoff)).toBeLessThan(parts.findIndex((part) => part === write))
+      sessionManager.resolve(session.sessionId, 18)
+    })
+  }
+
+  it("hands the row off to a host read the prediction did not expect", async () => {
+    const workspace = tempDir()
+    const announced = path.join(workspace, "announced.txt")
+    const other = path.join(workspace, "other.txt")
+    fs.writeFileSync(announced, "one\n")
+    fs.writeFileSync(other, "two\n")
+    const callId = "edit-other-read"
+    // A read of another file under the edit's call id is not the edit's private read, so the host answers it.
+    const { session, parts } = catalogSession([
+      partial(callId, announced),
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 3, read_args: { path: other, tool_call_id: callId } },
+      }),
+    ], catalogs[0]!, workspace)
+    await run(session, parts)
+
+    const start = parts.find((part) => part.type === "tool-input-start")
+    const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
+    expect(start).toMatchObject({ toolName: "edit" })
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+      .toMatchObject({ result: earlyRowHandoff("read"), isError: false })
+    expect(read).toMatchObject({ toolName: "read" })
+    expect(read.toolCallId.startsWith("cursor_")).toBe(true)
+    sessionManager.resolve(session.sessionId, 3)
+  })
+
   it("closes the row when the exec is a different tool", async () => {
     const file = existingFile()
     const { session, parts } = pumpSession([
@@ -717,6 +781,9 @@ describe("early edit rows", () => {
     const shell = parts.find((part) => part.type === "tool-call" && part.toolName === "bash")
     expect(start?.toolName).toBe("edit")
     expect(closed?.toolCallId).toBe(start?.id)
+    // The shell is another call; the announced edit never ran.
+    expect(parts.find((part) => part.type === "tool-result" && part.toolCallId === start?.id))
+      .toMatchObject({ result: EARLY_ROW_CLOSED, isError: true })
     expect(shell?.toolCallId.startsWith("cursor_")).toBe(true)
     expect(parts.findIndex((part) => part === closed)).toBeLessThan(parts.findIndex((part) => part === shell))
     expect(parts.at(-1)?.type).toBe("finish")

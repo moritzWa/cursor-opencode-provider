@@ -167,8 +167,11 @@ These are failure lessons shared by both hosts, not a replacement for
   prediction also needs the exec's first step: an edit of a file outside the
   workspace sends its private read to OpenCode's `read`, which closed the row
   as a failed edit on 193 of 530 edits in a day (#106). Decide both from one
-  predicate (`hostToolForCursorEdit`, `cursorEditReadReachesHost`,
-  `test/early-tool-rows.test.ts`).
+  predicate. Content-dependent remaps stay unpredictable: a rewrite with
+  unchanged content stays a `write`. OpenCode 2 rejects a renamed call and
+  both hosts reject an identical `edit`, so such a row completes as a hand-off
+  naming the real call, never as a failure (`hostToolForCursorEdit`,
+  `cursorEditReadReachesHost`, `earlyRowHandoff`, `test/early-tool-rows.test.ts`).
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,
