@@ -7,8 +7,11 @@ import {
   cursorEditReadAnswer,
   cursorEditReadReachesHost,
   hostToolForCursorEdit,
+  OPENCODE_1_TOOL_DIALECT,
+  OPENCODE_2_TOOL_DIALECT,
   toolsToDescriptors,
 } from "../src/protocol/tools.js"
+import { noteToolRequestsListedSeen, resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import {
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
@@ -24,6 +27,7 @@ const tempDirs: string[] = []
 
 afterEach(() => {
   sessionManager.dispose()
+  resetToolRequestsListedSeenForTests()
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -392,15 +396,82 @@ describe("early edit rows", () => {
     sessionManager.resolve(session.sessionId, 5)
   })
 
-  // The file-tool catalogs an edit can be remapped onto: native tools, and
-  // the patch tool that replaces edit/write for eligible GPT models.
-  const mutationCatalogs = {
-    "edit and write": ["read", "edit", "write"],
-    "OpenCode 1.x GPT apply_patch": ["read", "apply_patch"],
-    "OpenCode 2 GPT patch": ["read", "patch"],
-  } as const
-  type MutationCatalog = keyof typeof mutationCatalogs
-  const catalogTools = (catalog: MutationCatalog) => mutationCatalogs[catalog].map((name) => ({ name, description: name }))
+  // File tools per host: native edit/write, or the patch tool that replaces
+  // them for eligible GPT models. After a model switch the epoch catalog keeps
+  // every tool it has seen; only this turn's permitted set names the file tool.
+  type FileTool = "native" | "apply_patch" | "patch"
+  const catalogs: Array<{
+    label: string
+    advertised: string[]
+    permitted?: string[]
+    dialect: CursorSession["hostToolDialect"]
+    fileTool: FileTool
+  }> = [
+    { label: "OpenCode 1.x native", advertised: ["read", "edit", "write"], dialect: OPENCODE_1_TOOL_DIALECT, fileTool: "native" },
+    { label: "OpenCode 1.x GPT", advertised: ["read", "apply_patch"], dialect: OPENCODE_1_TOOL_DIALECT, fileTool: "apply_patch" },
+    {
+      label: "OpenCode 1.x native then GPT",
+      advertised: ["read", "edit", "write", "apply_patch"],
+      permitted: ["read", "apply_patch"],
+      dialect: OPENCODE_1_TOOL_DIALECT,
+      fileTool: "apply_patch",
+    },
+    {
+      label: "OpenCode 1.x GPT then native",
+      advertised: ["read", "apply_patch", "edit", "write"],
+      permitted: ["read", "edit", "write"],
+      dialect: OPENCODE_1_TOOL_DIALECT,
+      fileTool: "native",
+    },
+    { label: "OpenCode 2 native", advertised: ["read", "edit", "write"], dialect: OPENCODE_2_TOOL_DIALECT, fileTool: "native" },
+    { label: "OpenCode 2 GPT", advertised: ["read", "patch"], dialect: OPENCODE_2_TOOL_DIALECT, fileTool: "patch" },
+    {
+      label: "OpenCode 2 native then GPT",
+      advertised: ["read", "edit", "write", "patch"],
+      permitted: ["read", "patch"],
+      dialect: OPENCODE_2_TOOL_DIALECT,
+      fileTool: "patch",
+    },
+    {
+      label: "OpenCode 2 GPT then native",
+      advertised: ["read", "patch", "edit", "write"],
+      permitted: ["read", "edit", "write"],
+      dialect: OPENCODE_2_TOOL_DIALECT,
+      fileTool: "native",
+    },
+  ]
+  function catalogSession(payloads: Uint8Array[], catalog: (typeof catalogs)[number], root: string) {
+    const pumped = pumpSession(payloads, catalog.advertised.map((name) => ({ name, description: name })))
+    if (catalog.permitted) pumped.session.permittedToolNames = new Set(catalog.permitted)
+    pumped.session.hostToolDialect = catalog.dialect
+    pumped.session.requestContext.env = { workspace_paths: [root] }
+    return pumped
+  }
+  /** The host tool the edit's mutation becomes; `null` when the provider refuses it before any call. */
+  type ExpectedTool = Record<FileTool, string | null>
+  const replacesText: ExpectedTool = { native: "edit", apply_patch: "apply_patch", patch: "patch" }
+  const createsFile: ExpectedTool = { native: "write", apply_patch: "apply_patch", patch: "patch" }
+
+  function expectNoFailedRow(parts: any[]): void {
+    expect(parts.filter((part) => part.type === "tool-call" && part.providerExecuted)).toEqual([])
+    expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+  }
+
+  function expectBoundRow(parts: any[], toolName: string | null): void {
+    expectNoFailedRow(parts)
+    const starts = parts.filter((part) => part.type === "tool-input-start")
+    const calls = parts.filter((part) => part.type === "tool-call")
+    if (toolName === null) {
+      expect(starts).toEqual([])
+      expect(calls).toEqual([])
+      return
+    }
+    expect(starts).toHaveLength(1)
+    expect(starts[0]).toMatchObject({ toolName })
+    expect(starts[0].id.startsWith("cursor-early_")).toBe(true)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ toolCallId: starts[0].id, toolName })
+  }
 
   // #106: these reads go to OpenCode's permission-aware `read` and end the
   // step, so a row opened for the edit could only close as a failed edit.
@@ -444,18 +515,16 @@ describe("early edit rows", () => {
     },
   ]
   for (const target of hostReadTargets) {
-    for (const catalog of Object.keys(mutationCatalogs) as MutationCatalog[]) {
-      it.skipIf(!!target.skip)(`opens no row before the host read of ${target.label} (${catalog})`, async () => {
+    for (const catalog of catalogs) {
+      it.skipIf(!!target.skip)(`opens no row before the host read of ${target.label} (${catalog.label})`, async () => {
         const workspace = tempDir()
         const file = target.setup(workspace)
         const callId = "edit-host-read"
-        const { session, parts } = pumpSession(editHandshake(callId, file, 3), catalogTools(catalog))
-        session.requestContext.env = { workspace_paths: [workspace] }
+        const { session, parts } = catalogSession(editHandshake(callId, file, 3), catalog, workspace)
         await run(session, parts)
 
         expect(parts.filter((part) => part.type === "tool-input-start")).toEqual([])
-        expect(parts.filter((part) => part.type === "tool-call" && part.providerExecuted)).toEqual([])
-        expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+        expectNoFailedRow(parts)
         const calls = parts.filter((part) => part.type === "tool-call")
         expect(calls).toHaveLength(1)
         expect(calls[0]).toMatchObject({ toolName: "read" })
@@ -472,7 +541,8 @@ describe("early edit rows", () => {
   const providerReadTargets: Array<{
     label: string
     setup(workspace: string): { root: string; file: string }
-    tool: Record<MutationCatalog, string>
+    text?: string
+    tool: ExpectedTool
   }> = [
     {
       label: "a regular workspace file",
@@ -481,7 +551,28 @@ describe("early edit rows", () => {
         fs.writeFileSync(file, "one\n")
         return { root: workspace, file }
       },
-      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+      tool: replacesText,
+    },
+    {
+      label: "a workspace file without a final newline",
+      setup(workspace) {
+        const file = path.join(workspace, "no-newline.txt")
+        fs.writeFileSync(file, "one")
+        return { root: workspace, file }
+      },
+      tool: replacesText,
+    },
+    {
+      // `patch` strips carriage returns, so that conversion refuses the edit
+      // before any call; the prediction withholds its row (#81).
+      label: "a CRLF workspace file",
+      setup(workspace) {
+        const file = path.join(workspace, "crlf.txt")
+        fs.writeFileSync(file, "one\r\ntwo\r\n")
+        return { root: workspace, file }
+      },
+      text: "one\r\nTWO\r\n",
+      tool: { native: "edit", apply_patch: "apply_patch", patch: null },
     },
     {
       label: "a workspace file through a symlinked workspace root",
@@ -491,16 +582,7 @@ describe("early edit rows", () => {
         fs.symlinkSync(workspace, root)
         return { root, file: path.join(root, "notes.txt") }
       },
-      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
-    },
-    {
-      label: "a workspace file without a final newline",
-      setup(workspace) {
-        const file = path.join(workspace, "no-newline.txt")
-        fs.writeFileSync(file, "one")
-        return { root: workspace, file }
-      },
-      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+      tool: replacesText,
     },
     {
       // An empty file has no text to replace, so its whole-file write stays a write.
@@ -510,14 +592,14 @@ describe("early edit rows", () => {
         fs.writeFileSync(file, "")
         return { root: workspace, file }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+      tool: createsFile,
     },
     {
       label: "a new file outside the workspace",
       setup(workspace) {
         return { root: workspace, file: path.join(tempDir(), "new.txt") }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+      tool: createsFile,
     },
     {
       // Missing-target validation answers its read; Cursor then creates the file.
@@ -527,27 +609,92 @@ describe("early edit rows", () => {
         fs.symlinkSync(path.join(tempDir(), "gone.txt"), file)
         return { root: workspace, file }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+      tool: createsFile,
     },
   ]
   for (const target of providerReadTargets) {
-    for (const catalog of Object.keys(mutationCatalogs) as MutationCatalog[]) {
-      it(`keeps the row for ${target.label} and binds it to the edit (${catalog})`, async () => {
+    for (const catalog of catalogs) {
+      it(`keeps the row for ${target.label} and binds it to the edit (${catalog.label})`, async () => {
         const { root, file } = target.setup(tempDir())
-        const callId = "edit-provider-read"
-        const { session, parts } = pumpSession(editHandshake(callId, file, 17, "edited\n"), catalogTools(catalog))
-        session.requestContext.env = { workspace_paths: [root] }
+        // A refused edit keeps the step open until Cursor ends its turn.
+        const { session, parts } = catalogSession(
+          [...editHandshake("edit-provider-read", file, 17, target.text ?? "edited\n"), turnEnded()],
+          catalog,
+          root,
+        )
         await run(session, parts)
 
-        const start = parts.find((part) => part.type === "tool-input-start")
-        const calls = parts.filter((part) => part.type === "tool-call")
-        expect(start?.toolName).toBe(target.tool[catalog])
-        expect(start?.id.startsWith("cursor-early_")).toBe(true)
-        expect(calls).toHaveLength(1)
-        expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: target.tool[catalog] })
-        expect(calls[0].providerExecuted).toBeUndefined()
-        expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+        expectBoundRow(parts, target.tool[catalog.fileTool])
+        if (target.tool[catalog.fileTool] === null) {
+          expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
+        }
         sessionManager.resolve(session.sessionId, 18)
+      })
+    }
+  }
+
+  // A creation can skip the private read: Cursor sends the write at once.
+  const creationTargets: Array<{ label: string; setup(workspace: string): string }> = [
+    { label: "a new workspace file", setup: (workspace) => path.join(workspace, "created.txt") },
+    { label: "a new file outside the workspace", setup: () => path.join(tempDir(), "created.txt") },
+  ]
+  for (const target of creationTargets) {
+    for (const catalog of catalogs) {
+      it(`binds the row for ${target.label} written without a read (${catalog.label})`, async () => {
+        const workspace = tempDir()
+        const file = target.setup(workspace)
+        const callId = "edit-create"
+        const { session, parts } = catalogSession([
+          partial(callId, file),
+          encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 5, write_args: { path: file, file_text: "created\n", tool_call_id: callId } },
+          }),
+        ], catalog, workspace)
+        await run(session, parts)
+
+        expectBoundRow(parts, createsFile[catalog.fileTool])
+        sessionManager.resolve(session.sessionId, 5)
+      })
+    }
+  }
+
+  // A held parallel step keeps pumping after the host read, and a later
+  // announcement may open a row while the step waits for its other calls.
+  for (const order of ["outside first", "inside first"] as const) {
+    for (const catalog of catalogs) {
+      it(`skips only the host-read edit's row in a parallel step, ${order} (${catalog.label})`, async () => {
+        noteToolRequestsListedSeen()
+        const workspace = tempDir()
+        const inside = path.join(workspace, "inside.txt")
+        fs.writeFileSync(inside, "one\n")
+        const outside = path.join(tempDir(), "outside.txt")
+        fs.writeFileSync(outside, "one\n")
+        const outsideEdit = editHandshake("edit-outside", outside, 3)
+        const insideEdit = editHandshake("edit-inside", inside, 5, "edited\n")
+        const listed = encodeMessage("AgentServerMessage", {
+          interaction_update: { tool_requests_listed: { call_count: 2 } },
+        })
+        const { session, parts } = catalogSession(
+          order === "outside first" ? [listed, ...outsideEdit, ...insideEdit] : [listed, ...insideEdit, ...outsideEdit],
+          catalog,
+          workspace,
+        )
+        await run(session, parts)
+
+        expectNoFailedRow(parts)
+        const starts = parts.filter((part) => part.type === "tool-input-start")
+        const calls = parts.filter((part) => part.type === "tool-call")
+        const read = calls.find((part) => part.toolName === "read")
+        const mutation = calls.find((part) => part.toolName !== "read")
+        expect(calls).toHaveLength(2)
+        expect(read?.toolCallId.startsWith("cursor_")).toBe(true)
+        expect(starts).toHaveLength(1)
+        expect(starts[0]).toMatchObject({ toolName: replacesText[catalog.fileTool] })
+        expect(mutation).toMatchObject({ toolCallId: starts[0].id, toolName: replacesText[catalog.fileTool] })
+        expect(parts.filter((part) => part.type === "finish").map((part) => part.finishReason.unified))
+          .toEqual(["tool-calls"])
+        sessionManager.resolve(session.sessionId, 3)
+        sessionManager.resolve(session.sessionId, 6)
       })
     }
   }
