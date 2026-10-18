@@ -131,6 +131,66 @@ These are failure lessons shared by both hosts, not a replacement for
   eligible checkpoint only behind the replay barrier; a late tool result needs
   history recovery because `resume_action` re-requests that tool
   (`pumpWithRecovery`, `test/parallel-pump.test.ts`).
+- **A replay the provider must refuse can still be the host's to retry.**
+  Making every suppressed replay final ended a turn whose Run dropped after
+  only reasoning; its request reached Cursor only with the next message
+  ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
+  Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
+  after two resumes without a new one. Match its 30 s inbound-silence default;
+  outbound client heartbeats cannot extend it. The transport's 120 s read-idle
+  watchdog is a separate backstop (`test/run-liveness.test.ts`).
+  Classify the constructed error, not only the signature table: CLI marks a
+  stream ending without `turnEnded` as transport, so it receives ten retries,
+  even though a different early-close signature uses the server category
+  (`test/run-error-host.test.ts`, `test/retry-budget.test.ts`).
+  Its separate 10-transport / 3-server retry budgets belong to the user turn,
+  not one provider call: an output-only
+  failure handed to an older host with unbounded retries otherwise restarts the
+  allowance forever. Share counts across module copies and host tool steps;
+  distinguish partial assistant output and host reminders from a new user turn.
+  Test the canonical host projection: OpenCode 2's interruption notice is plain
+  user text, not a `<system-reminder>`, and otherwise reset the budget on every
+  continuation (`test/run-error-host.test.ts`). Admit it only after a requested
+  host retry, retaining its full prompt key across tool steps; a later literal
+  user request with that text still needs a new budget. Normalize recognized
+  trailing host-note parts in every user message for identity only: plugins
+  append them to the initial request too, without persisting them in history.
+  Keep actual request content and attachment/new-request boundaries intact.
+  An unfinished partial-tool row has no execution authority; close it as
+  unfinished and classify it as output only. Started tool lifecycles, execs and
+  unknown frames still forbid that host retry (`test/run-interruption.test.ts`).
+  Immediately after completed host results, history recovery needs every observed
+  exec's result, no new output, and no opaque interaction or unknown frame.
+  Seed all completed tool steps; retaining only the last result loses earlier work. Never use the stale
+  checkpoint for that recovery. A later tool result must not erase an earlier
+  uncheckpointed follow-up's barrier: that follow-up may be absent from the
+  host prompt. Only a newer eligible checkpoint clears the revocation.
+  Capture result cutoffs at each actual serialized write, before its drain;
+  after-drain timestamps rejected valid checkpoints, while a cutoff before the
+  queue admitted checkpoints predating the completed result. Retain every
+  exec's owning session across resumes: bare stream-local ids both collide and
+  lose earlier completed results (`test/run-error-host.test.ts`, `test/session.test.ts`).
+  Reject an unsafe replacement upload before consulting the preceding Run's
+  checkpoint: that checkpoint says nothing about work the replacement may have
+  started. Failed drains must also project as terminal to both hosts, including
+  during credential renewal and endless mode (`test/run-interruption.test.ts`).
+  Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
+  consecutive-stall retry window (`src/retry-budget.ts`,
+  `test/retry-budget.test.ts`, `test/run-error-host.test.ts`).
+  Record every barrier, not the first:
+  text before a stateful frame must not read as output-only. Keep stateful
+  barriers on the Run across tool-step pumps, and retain checkpoints before
+  credential renewal as well as transient recovery; otherwise a completed
+  command becomes host-retryable or a renewed attempt forgets its saved state.
+  Result delivery and follow-up user actions invalidate older checkpoints;
+  compare frame arrival order so a queued pre-result checkpoint cannot become
+  eligible just because the pump reads it after delivery. Capture a follow-up's
+  arrival cutoff before opening its replacement Run: its checkpoint can arrive
+  before the old stream finishes draining. An inherited tool barrier still
+  permits one credential renewal on an untouched resume with an eligible
+  checkpoint; new output or stateful activity must prevent it
+  (`AttemptReplaySafety`, `test/parallel-pump.test.ts`,
+  `test/run-interruption.test.ts`, `test/run-error-host.test.ts`).
 - **A helper must not take over its parent.** A smaller catalog was mistaken for
   a helper despite carrying the parent's pending result. Reconcile that result
   first; isolate genuine helpers (`test/fresh-turn-drain.test.ts`). An empty

@@ -137,6 +137,31 @@ output](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/sr
 The plugin adjusts only the request's projection of Cursor-owned results;
 stored messages are preserved.
 
+## Interrupted model requests
+
+OpenCode retries a transient failure after only text or reasoning when the
+turn has no new checkpoint. An unfinished tool display row also permits retry
+if no exec or started tool lifecycle arrived; it closes without execution.
+Stateful activity stays a replay barrier. Like Cursor CLI, an active Run with no
+pending host work fails after 30 s without an inbound frame; heartbeats and
+partial inputs renew that deadline, while client heartbeats do not. The 120 s
+transport read-idle watchdog remains a backstop. A drop immediately after
+completed tool results can rebuild from complete host history
+before new output; missing results or unrepresented activity remain final.
+Recovery retains the latest eligible checkpoint across token renewal, including
+a rejected credential on an untouched resumed attempt. Checkpoints received
+while a completed tool result drains remain eligible. Follow-ups retain
+checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
+checkpoint end the turn.
+History recovery keeps completed results from earlier resumed Runs too.
+
+The provider shares Cursor CLI's limits of 10 transport retries and 3 server
+retries across this turn, including OpenCode's retries. OpenCode can stop earlier.
+Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting the host
+to bypass count limits while retaining replay guards, Stop, final errors, the
+two-resume cutoff and the 180 s consecutive semantic-stall retry window.
+See [retry limits](../README.md#retry-limits) for classification and SDK options.
+
 ## Troubleshooting
 
 | Problem | What to try |
