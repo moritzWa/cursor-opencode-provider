@@ -36,8 +36,12 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Same commands as `bun run test:coverage`, spelled out because the
+      # coverage job below checks out PR heads that may predate that script.
       - name: Test
-        run: bun run test:coverage
+        run: |
+          bun test --coverage --coverage-reporter=lcov
+          bun scripts/strip-copied-coverage.ts
 
       # On a push the tested commit is the one Codecov records. Pull requests
       # upload from the coverage job below.
@@ -89,8 +93,11 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      # Keep in step with the test job's commands.
       - name: Test
-        run: bun run test:coverage
+        run: |
+          bun test --coverage --coverage-reporter=lcov
+          bun scripts/strip-copied-coverage.ts
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
