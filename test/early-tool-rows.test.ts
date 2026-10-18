@@ -392,11 +392,12 @@ describe("early edit rows", () => {
     sessionManager.resolve(session.sessionId, 5)
   })
 
-  // The 1.x and 2.0 file-tool catalogs an edit can be remapped onto.
+  // The file-tool catalogs an edit can be remapped onto: native tools, and
+  // the patch tool that replaces edit/write for eligible GPT models.
   const mutationCatalogs = {
     "edit and write": ["read", "edit", "write"],
-    "OpenCode 1.x apply_patch": ["read", "apply_patch"],
-    "OpenCode 2 patch": ["read", "patch", "write"],
+    "OpenCode 1.x GPT apply_patch": ["read", "apply_patch"],
+    "OpenCode 2 GPT patch": ["read", "patch"],
   } as const
   type MutationCatalog = keyof typeof mutationCatalogs
   const catalogTools = (catalog: MutationCatalog) => mutationCatalogs[catalog].map((name) => ({ name, description: name }))
@@ -480,7 +481,7 @@ describe("early edit rows", () => {
         fs.writeFileSync(file, "one\n")
         return { root: workspace, file }
       },
-      tool: { "edit and write": "edit", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "patch" },
+      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
     },
     {
       label: "a workspace file through a symlinked workspace root",
@@ -490,7 +491,16 @@ describe("early edit rows", () => {
         fs.symlinkSync(workspace, root)
         return { root, file: path.join(root, "notes.txt") }
       },
-      tool: { "edit and write": "edit", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "patch" },
+      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
+    },
+    {
+      label: "a workspace file without a final newline",
+      setup(workspace) {
+        const file = path.join(workspace, "no-newline.txt")
+        fs.writeFileSync(file, "one")
+        return { root: workspace, file }
+      },
+      tool: { "edit and write": "edit", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
     },
     {
       // An empty file has no text to replace, so its whole-file write stays a write.
@@ -500,14 +510,14 @@ describe("early edit rows", () => {
         fs.writeFileSync(file, "")
         return { root: workspace, file }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
     },
     {
       label: "a new file outside the workspace",
       setup(workspace) {
         return { root: workspace, file: path.join(tempDir(), "new.txt") }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
     },
     {
       // Missing-target validation answers its read; Cursor then creates the file.
@@ -517,7 +527,7 @@ describe("early edit rows", () => {
         fs.symlinkSync(path.join(tempDir(), "gone.txt"), file)
         return { root: workspace, file }
       },
-      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+      tool: { "edit and write": "write", "OpenCode 1.x GPT apply_patch": "apply_patch", "OpenCode 2 GPT patch": "patch" },
     },
   ]
   for (const target of providerReadTargets) {
