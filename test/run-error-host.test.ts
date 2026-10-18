@@ -127,7 +127,7 @@ async function streamError(sessionKey: string): Promise<unknown> {
 }
 
 describe("checkpoint eligibility across host results", () => {
-  for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "new-output", "final-error"] as const) {
+  for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "followup-before-result", "new-output", "final-error"] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
       type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
@@ -137,12 +137,17 @@ describe("checkpoint eligibility across host results", () => {
         const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
         if (message.run_request) {
           requests.push(message.run_request as RunRequest)
-          if (requests.length > 1) {
+          if (requests.length > (scenario === "followup-before-result" ? 2 : 1)) {
             send({ interaction_update: { turn_ended: {} } })
             stream.end()
             return
           }
-          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          if (requests.length === 1) send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          if (scenario === "followup-before-result" && requests.length === 1) {
+            send({ interaction_update: { text_delta: { text: "Checking the workspace" } } })
+            send({ interaction_update: { turn_ended: {} } })
+            return
+          }
           if (scenario === "unknown") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0))) // unknown field 100
           if (scenario === "unrepresented-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
@@ -200,7 +205,7 @@ describe("checkpoint eligibility across host results", () => {
         } else {
           expect(await read().catch((error: unknown) => error)).toMatchObject({ isRetryable: false,
             responseHeaders: { "x-should-retry": "false" } })
-          expect(requests).toHaveLength(1)
+          expect(requests).toHaveLength(scenario === "followup-before-result" ? 2 : 1)
         }
         expect(delivered).toEqual([1, 2])
       } finally {

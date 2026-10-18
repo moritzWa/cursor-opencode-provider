@@ -149,7 +149,9 @@ These are failure lessons shared by both hosts, not a replacement for
   host results, history recovery needs every observed exec's result, no new
   output, and no opaque interaction or unknown frame. Seed all completed tool
   steps; retaining only the last result loses earlier work. Never use the stale
-  checkpoint for that recovery.
+  checkpoint for that recovery. A later tool result must not erase an earlier
+  uncheckpointed follow-up's barrier: that follow-up may be absent from the
+  host prompt. Only a newer eligible checkpoint clears the revocation.
   Reject an unsafe replacement upload before consulting the preceding Run's
   checkpoint: that checkpoint says nothing about work the replacement may have
   started. Failed drains must also project as terminal to both hosts, including

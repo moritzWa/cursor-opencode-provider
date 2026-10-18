@@ -833,8 +833,11 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
 /** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
 function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival(), hostResult = false): void {
   session.resumeCheckpoint = undefined
-  session.checkpointRevoked = true
+  // A later result cannot make an earlier uncheckpointed follow-up appear
+  // represented in this call's host history. Only a new checkpoint clears it.
   session.checkpointRevokedByHostResult = hostResult
+    && (!session.checkpointRevoked || session.checkpointRevokedByHostResult === true)
+  session.checkpointRevoked = true
   session.resumeCheckpointAfterFrame = afterFrame
 }
 
