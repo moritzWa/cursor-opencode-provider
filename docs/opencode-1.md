@@ -122,6 +122,8 @@ and [1.x incident lessons](../tasks/lessons/opencode-1.md).
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
+A host shell failure reaches Cursor once as stderr in streamed and unary
+results; distinct command output remains on stdout.
 
 The classic plugin releases unstarted shell reservations from persisted tool
 error events as well as the after hook, because rejection can stop the host

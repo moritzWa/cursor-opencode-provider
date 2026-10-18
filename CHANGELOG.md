@@ -12,6 +12,7 @@
 
 - A Cursor Task with attached files hands the subagent exact file paths to open itself, keeps Cursor's description, and avoids extra parent reads, including runtime metadata attachments; unstatable attachments report failure ([#82](https://github.com/oakimov/cursor-opencode-provider/issues/82), based on a fix by [@nkoynov](https://github.com/nkoynov))
 - Shell results preserve whitespace when removing internal wrapper markers, retain partial output on stream failures, and keep successful timeout-shaped output unchanged in both native host projections ([#98](https://github.com/oakimov/cursor-opencode-provider/pull/98))
+- Like Cursor CLI, a shell call that fails in OpenCode, such as one in a missing working directory, reaches Cursor once as stderr instead of as both stdout and stderr, in streamed and unary shell results ([#101](https://github.com/oakimov/cursor-opencode-provider/issues/101), reported by [@nkoynov](https://github.com/nkoynov))
 - Shell output reaches the model exactly as the command printed it, as with Cursor CLI. Lines such as branch names, `#!/bin/sh` or `PREFIX=/usr/local` were prefixed with the workspace path, and relative paths printed after a `cd` pointed at the wrong directory ([#96](https://github.com/oakimov/cursor-opencode-provider/issues/96), based on [#54](https://github.com/oakimov/cursor-opencode-provider/pull/54) by [@nkoynov](https://github.com/nkoynov))
 - After a restart, a turn that resumes a saved conversation no longer attaches every image in the session's history again, and an image you attach is not sent again as history on the next turn ([#78](https://github.com/oakimov/cursor-opencode-provider/pull/78) by [@nkoynov](https://github.com/nkoynov), [#75](https://github.com/oakimov/cursor-opencode-provider/issues/75))
 - On OpenCode 1.x, GPT edits keep existing CRLF line endings even when Cursor sends the replacement as LF ([#81](https://github.com/oakimov/cursor-opencode-provider/pull/81) by [@nkoynov](https://github.com/nkoynov))
@@ -47,6 +48,7 @@
 - A configured reasoning effort changes only the effort of Cursor's default variant; Claude models with a thinking parameter no longer switch to their non-thinking variant ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 - Unmarked 1M variants retain their max-mode fallback after model discovery and cache reload; explicit non-max markers remain authoritative ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95))
 - Saved 500k variant selections on base and Fast model entries remain available after upgrading; dedicated 500k entries still provide the full host context budget ([#95](https://github.com/oakimov/cursor-opencode-provider/pull/95), reported by [@nkoynov](https://github.com/nkoynov))
+- With a long OpenCode cache path, Cursor's project folder (agent tools, terminals, generated assets) stays inside the cache's `projects` directory instead of being created next to the cache directory; project folders that already worked keep their names ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102), reported by [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.2] - 2026-10-15
 
