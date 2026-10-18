@@ -62,6 +62,7 @@ bun install
 bun run typecheck          # source and test projects
 bun run build              # tsc → dist/
 bun test
+bun run test:coverage      # CI's lcov run, with copied-module records stripped
 bun run test:node-http2     # build + Node transport regressions
 bun run check:pricing      # fixture coverage, not live regeneration
 bun run generate:pricing   # live Cursor pricing/context/capability metadata
