@@ -436,6 +436,13 @@ These are failure lessons shared by both hosts, not a replacement for
   stop later pushes in the same shell sequence. Require successful exit before
   publishing, and scan commit bodies and coauthor trailers as well as author /
   committer identities. A clean file diff alone does not establish privacy.
+- **Coverage must be measured on the commit it is reported for.** On a pull
+  request, checkout tests the merge with main while codecov-action files the
+  report under the PR head. Once main changed `src/language-model.ts`, PR #107's
+  patch showed 4 missing lines that were main's uncovered branch at the same
+  line numbers; the PR's own lines were all hit. The required job keeps testing
+  the merge; a separate PR job measures coverage on the head
+  (`.github/workflows/ci.yml`).
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
