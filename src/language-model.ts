@@ -91,6 +91,8 @@ import {
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   hostToolForCursorEdit,
+  cursorEditReadAnswer,
+  cursorEditReadReachesHost,
   buildCompleteEditReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
@@ -180,6 +182,7 @@ import {
   EARLY_ROW_CLOSED,
   EarlyToolRows,
   cursorEditAnnouncement,
+  earlyRowHandoff,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
@@ -4498,32 +4501,18 @@ export async function pump(
     const absolutePath = resolvePath(requestedPath)
     if (absolutePath !== resolvePath(editPath)) return false
 
-    let exists = true
-    try {
-      fs.lstatSync(absolutePath)
-    } catch (error) {
-      const code = error && typeof error === "object" && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined
-      if (code !== "ENOENT") return false
-      exists = false
+    const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
+    if (answer === "external") {
+      parsed.resultMetadata = {
+        ...parsed.resultMetadata,
+        correlatedEditCallId: displayCallId,
+      }
+      return false
     }
+    if (answer === "host") return false
 
-    if (exists) {
-      // Do not bypass OpenCode's external-directory permission boundary, even
-      // through a symlink rooted in the workspace.
+    if (answer === "complete") {
       try {
-        const realRoot = fs.realpathSync(workspaceRoot)
-        const realTarget = fs.realpathSync(absolutePath)
-        const relative = path.relative(realRoot, realTarget)
-        if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-          parsed.resultMetadata = {
-            ...parsed.resultMetadata,
-            correlatedEditCallId: displayCallId,
-          }
-          return false
-        }
-
         const frames = buildCompleteEditReadMessages(parsed.id, absolutePath, requestedPath)
         if (!frames) return false
         for (const frame of frames) {
@@ -4548,6 +4537,7 @@ export async function pump(
       }
     }
 
+    // "empty": a missing target.
     try {
       for (const frame of buildExecClientMessages({
         execId: parsed.id,
@@ -4736,7 +4726,8 @@ export async function pump(
     for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
     return owed
   }
-  const closeEarlyRow = (row: EarlyToolRow) => {
+  /** `continuedAs`: the host tool this Cursor call runs as instead; otherwise it never ran. */
+  const closeEarlyRow = (row: EarlyToolRow, continuedAs?: string) => {
     replaySafety.markBarrier("visible-tool-row")
     // Text that streamed while the row was open ends before its tool-call.
     closeOpenSpans()
@@ -4752,8 +4743,8 @@ export async function pump(
       type: "tool-result",
       toolCallId: row.toolCallId,
       toolName: row.toolName,
-      result: EARLY_ROW_CLOSED,
-      isError: true,
+      result: continuedAs ? earlyRowHandoff(continuedAs) : EARLY_ROW_CLOSED,
+      isError: !continuedAs,
     } as V3Part)
   }
   const settleOpenEarlyRows = () => {
@@ -5815,7 +5806,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             )
             if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
-              closeEarlyRow(boundEarly)
+              closeEarlyRow(boundEarly, parsed.toolName)
             } else {
               replaySafety.markBarrier("visible-tool-row")
               safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
@@ -6231,11 +6222,12 @@ export async function pump(
         owedPending: owedPendingCount(),
       })
     ) {
-      const toolName = hostToolForCursorEdit(
-        announced.path,
-        fileToolNames(),
-        workspaceRootFromRequestContext(session.requestContext),
-      )
+      const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+      // An edit whose private read goes to the host gets that read as its first
+      // exec, which would close the row as a failed edit.
+      const toolName = cursorEditReadReachesHost(path.resolve(workspaceRoot, announced.path), workspaceRoot)
+        ? undefined
+        : hostToolForCursorEdit(announced.path, fileToolNames(), workspaceRoot)
       if (!toolName) earlyRows.skip(announced.callId)
       else {
         const row: EarlyToolRow = {
