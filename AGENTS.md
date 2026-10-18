@@ -16,6 +16,15 @@ agent protocol. TypeScript ESM; Bun installs/tests; `tsc` builds `dist/`.
   [host guide](docs/README.md). Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
   [review rules](docs/review-rules.md), including every Greptile finding and
   applicable Codecov issue. User-facing changes need an Unreleased changelog line.
+- Never leave TMPDIR remnants, from tests, scripts or your own scratch work
+  (files, directories, worktrees, detached processes and their logs). Remove
+  what you create before finishing; first await the writes and stop the
+  processes that could recreate it (`settleRunSavesForTests`,
+  `reapBackgroundSpawn`, `stopProcessesUsing`), and restore the process-wide
+  host cache root that `createCursor({ cacheDir })` sets. `test/preload.ts`
+  gives every `bun test` run a private TMPDIR and fails the run when anything
+  is left in it; Node test scripts import `test/node-tmpdir.mjs` first for the
+  same guard.
 
 ## Non-negotiable provider / compatibility-layer boundary
 

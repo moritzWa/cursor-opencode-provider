@@ -371,14 +371,29 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Isolate fixture state.** Capture teardown paths before awaiting; restore
   host-agent callbacks and cache overrides. One leaked cache root broke later
   plugin tests (`test/host-interrupt.test.ts`).
+- **A removed temp dir can come back.** Tests left about 200 TMPDIR entries per
+  run ([#102](https://github.com/oakimov/cursor-opencode-provider/issues/102)):
+  cutting the whole project-folder path put it outside a long cache root;
+  background spawns kept their logs and children; a stop's save and terminal
+  supervisors wrote after the `finally`/`afterEach` removal; a held Run's save
+  landed after its test removed the dir. On Linux only, three tests left
+  `createCursor({ cacheDir })`'s process-wide cache root set, so later files
+  wrote into their removed dirs and failed tests that expected the default
+  root. Wait for the writers, restore the root, then remove; `test/preload.ts`
+  fails any run that leaves an entry and lists its files. Killing only a
+  background shell's marker PID leaves compound-command descendants alive;
+  stop its tree and await exit (`test/background-spawn.test.ts`). A failed
+  process listing or a writer surviving termination must fail cleanup, not
+  silently permit removal (`test/process-cleanup.test.ts`). Test log content
+  separately from its path-bearing diagnostic header (`test/debug.test.ts`).
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
   tests need an init reaper. Strip temporary module copies from coverage and
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. A dated version
-  heading is not proof of publication: retain entries in the maintainer-designated
-  upcoming release instead of moving them to Unreleased. Concurrent Unreleased
+  compare with the release, not an intermediate PR state. A versioned heading
+  or package version bump does not establish publication. Verify release status
+  and keep entries in the maintainer-designated upcoming release. Concurrent changelog
   insertions can conflict despite independent code; compare the union of entries
   after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in
