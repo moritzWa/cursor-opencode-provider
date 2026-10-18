@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { APICallError, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
@@ -15,6 +15,7 @@ import { resetTurnStateForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import { notifyHostInterrupt } from "../src/host-interrupt.js"
 
 const ORIGIN = "https://agentn.run-error-test.cursor.sh"
 const PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] as const
@@ -378,4 +379,103 @@ describe("Run errors as the host sees them", () => {
     expect(cause).toMatchObject({ hostRetryable: true, transient: false, replaySafe: false, code: "unavailable" })
     expect(runs).toBe(1)
   }, 30_000)
+})
+
+describe("retry limits across OpenCode calls", () => {
+  it("also budgets transient setup errors and refuses ambiguous uploads", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-setup-retry-budget-"))
+    let renewals = 0
+    let ambiguous = false
+    const model = createCursor({
+      name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
+      getAccessToken: async () => {
+        renewals++
+        throw new CursorTransportError("connection reset", { transient: true, replaySafe: !ambiguous, code: "ECONNRESET" })
+      },
+    }).languageModel("composer-2.5")
+    const attempt = async (): Promise<unknown> => {
+      try {
+        return await model.doStream({
+          prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+          headers: { "x-opencode-session-id": "ses_setup_retries" },
+        })
+      } catch (error) { return error }
+    }
+    try {
+      for (let i = 0; i < 10; i++) {
+        const error = await attempt()
+        expect(error).toMatchObject({ isRetryable: true })
+        expect(error).toHaveProperty("message", expect.not.stringContaining("after visible output"))
+      }
+      expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+      expect(renewals).toBe(11)
+      await notifyHostInterrupt("ses_setup_retries", "test-stop")
+      ambiguous = true
+      expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+      expect(runs).toBe(0)
+    } finally {
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  for (const [endless, maxAttempts, retries] of [[false, undefined, 3], [false, 2, 1], [true, 2, 14]] as const) {
+    it(`bounds output-only host retries (endless=${endless}, maxAttempts=${maxAttempts})`, async () => {
+      const saved = process.env.CURSOR_ENDLESS_RETRIES
+      if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
+      else delete process.env.CURSOR_ENDLESS_RETRIES
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-host-retry-budget-"))
+      cacheHttp2SessionForTests(ORIGIN, client)
+      trailer = { error: { code: "unavailable" } }
+      partialOutput = true
+      const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Hello" }] }]
+      const attempt = async () => {
+        // Hosts may reload the SDK model between retries. State belongs to the turn.
+        const model = createCursor({
+          name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          retry: { maxAttempts, baseDelayMs: 1, maxDelayMs: 1 },
+        }).languageModel("composer-2.5")
+        try {
+          const { stream } = await model.doStream({ prompt, headers: { "x-opencode-session-id": "ses_repeated_output" } })
+          const reader = stream.getReader()
+          while (!(await reader.read()).done) { /* drain host-visible output */ }
+        } catch (error) { return error }
+      }
+      try {
+        for (let i = 0; i < retries; i++) {
+          expect(await attempt()).toMatchObject({ isRetryable: true, responseHeaders: { "x-should-retry": "true" } })
+          // OpenCode 2 keeps partial assistant output. A host system reminder is not a new request.
+          prompt.push({ role: "assistant", content: [{ type: "text", text: `partial ${i}` }] })
+          prompt.push({ role: "user", content: [{ type: "text", text: "<system-reminder>Retry the interrupted step.</system-reminder>" }] })
+        }
+        expect(runs).toBe(retries)
+        if (endless) {
+          trailer = { error: { code: "permission_denied" } }
+          expect(await attempt()).toMatchObject({ isRetryable: false, responseHeaders: { "x-should-retry": "false" } })
+        } else {
+          expect(await attempt()).toMatchObject({ isRetryable: false, statusCode: 400, responseHeaders: { "x-should-retry": "false" } })
+          expect(runs).toBe(retries + 1)
+          // A later identical user message is a new turn, even in the same session.
+          prompt.push({ role: "user", content: [{ type: "text", text: "Hello" }] })
+          expect(await attempt()).toMatchObject({ isRetryable: true })
+          // Stop also resets a failed turn when there is no longer an open Run.
+          await notifyHostInterrupt("ses_repeated_output", "test-stop")
+          expect(await attempt()).toMatchObject({ isRetryable: true })
+          scripted = (stream, message) => {
+            if (!message.run_request) return
+            stream.end(frame(encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } })))
+          }
+          expect(await attempt()).toBeUndefined()
+          scripted = undefined
+          expect(await attempt()).toMatchObject({ isRetryable: true })
+        }
+      } finally {
+        if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+        else process.env.CURSOR_ENDLESS_RETRIES = saved
+        sessionManager.dispose()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
 })

@@ -429,9 +429,11 @@ export function toCursorProviderError(
  * does that here (see `hostFacingError`), and the lost-request record carries
  * the user's request once.
  */
-export function hostRetryError(cause: CursorProviderError): CursorProviderError {
+export function hostRetryError(cause: CursorProviderError, beforeOutput = false): CursorProviderError {
   return new CursorProviderError(
-    `${cause.message} after visible output, before Cursor saved a checkpoint; the turn can be sent again`,
+    beforeOutput
+      ? `${cause.message}; the Run could not start and the turn can be sent again`
+      : `${cause.message} after visible output, before Cursor saved a checkpoint; the turn can be sent again`,
     {
       origin: cause.origin,
       transient: false,

@@ -42,7 +42,7 @@ describe("Cursor provider errors", () => {
 
   it("strictly bounds retry policy options", () => {
     expect(resolveRetryPolicy(undefined)).toEqual({
-      maxAttempts: 3,
+      maxAttempts: undefined,
       baseDelayMs: 500,
       maxDelayMs: 8_000,
     })

@@ -3,6 +3,7 @@ import path from "node:path"
 import { createHash } from "node:crypto"
 import { APICallError } from "@ai-sdk/provider"
 import protobuf from "protobufjs"
+import { newRetryBudget, turnRetryBudget, forgetRetryBudget, reserveRetry, resetRetryBudgetsForTests, type RetryBudget } from "./retry-budget.js"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -247,7 +248,6 @@ import {
   CursorLocalCancellationError,
   CursorProtocolError,
   CursorProviderError,
-  CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
   hostFacingError,
@@ -364,7 +364,6 @@ type PromptIdentity = { hostAgent?: string; systemPromptHash?: string }
 const promptIdentityBySession = new Map<string, PromptIdentity>()
 export const MAX_TURN_STATE_SESSIONS = 256
 const DEFAULT_RETRY_POLICY = {
-  maxAttempts: 3,
   baseDelayMs: 500,
   maxDelayMs: 8_000,
 } as const
@@ -449,7 +448,7 @@ export function isSoleControlFrame(payload: Uint8Array): boolean {
 }
 
 export type CursorRetryPolicy = {
-  maxAttempts: number
+  maxAttempts?: number
   baseDelayMs: number
   maxDelayMs: number
 }
@@ -471,10 +470,10 @@ export function resolveRetryPolicy(options: CursorRetryOptions | undefined): Cur
       throw new CursorProtocolError(`Unknown Cursor retry option: ${key}`)
     }
   }
-  const maxAttempts = retryInteger("maxAttempts", options?.maxAttempts, DEFAULT_RETRY_POLICY.maxAttempts)
+  const maxAttempts = options?.maxAttempts === undefined ? undefined : retryInteger("maxAttempts", options.maxAttempts, 1)
   const baseDelayMs = retryInteger("baseDelayMs", options?.baseDelayMs, DEFAULT_RETRY_POLICY.baseDelayMs)
   const maxDelayMs = retryInteger("maxDelayMs", options?.maxDelayMs, DEFAULT_RETRY_POLICY.maxDelayMs)
-  if (maxAttempts > MAX_RETRY_ATTEMPTS) {
+  if (maxAttempts !== undefined && maxAttempts > MAX_RETRY_ATTEMPTS) {
     throw new CursorProtocolError(`Cursor retry maxAttempts must be no greater than ${MAX_RETRY_ATTEMPTS}`)
   }
   if (baseDelayMs > MAX_RETRY_DELAY_MS || maxDelayMs > MAX_RETRY_DELAY_MS) {
@@ -887,8 +886,29 @@ export function createCursorLanguageModel(
   })
   // Credential resolution and session setup can fail before a stream exists.
   // Both public entrypoints must project those failures just like pump errors.
-  const doStream = (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> =>
-    doStreamImpl(modelId, options, callOptions).catch((error) => { throw hostFacingError(error) })
+  const doStream = async (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> => {
+    const retryPolicy = resolveRetryPolicy(options.retry)
+    const retryBudget = turnRetryBudget(opencodeSessionKey(callOptions), retryTurnKey(callOptions.prompt))
+    try {
+      return await doStreamImpl(modelId, options, callOptions, retryPolicy, retryBudget)
+    } catch (error) {
+      const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor Run setup failed" })
+      try {
+        if (callOptions.abortSignal?.aborted) {
+          forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
+          throw new CursorLocalCancellationError("Cursor Run setup cancelled", error)
+        }
+        if (!failure.transient) throw failure
+        if (!failure.replaySafe) {
+          throw retrySuppressedError(failure, "while opening the Run", retryBudget.retries + 1, retryPolicy.maxAttempts ?? 14)
+        }
+        reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+        throw hostRetryError(failure, true)
+      } catch (terminal) {
+        throw hostFacingError(terminal)
+      }
+    }
+  }
   return {
     specificationVersion: "v3",
     provider: providerId,
@@ -926,13 +946,14 @@ async function doStreamImpl(
   modelId: string,
   options: CreateCursorOptions,
   callOptions: LanguageModelV3CallOptions,
+  retryPolicy: CursorRetryPolicy,
+  retryBudget: RetryBudget,
 ): Promise<LanguageModelV3StreamResult> {
   await restoreSessionState(opencodeSessionKey(callOptions), opencodeGlobalCacheDir())
   const withoutAnswered = await leaveOutAnsweredEarlySteers(callOptions.prompt, opencodeSessionKey(callOptions))
   if (withoutAnswered === "all") return { stream: answeredSteerStream() }
   if (withoutAnswered) callOptions = { ...callOptions, prompt: withoutAnswered }
   const prompt = callOptions.prompt
-  const retryPolicy = resolveRetryPolicy(options.retry)
   // The Bearer token is resolved for every Run this call opens, including
   // recovery Runs after a long-held tool: a host `getAccessToken` (or the
   // apiKey exchange) renews it, so a Run never starts on a token that expired
@@ -1140,6 +1161,7 @@ async function doStreamImpl(
               controller,
               abortSignal: callOptions.abortSignal,
               retryPolicy,
+              retryBudget,
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
               ...(credentialRenewable
@@ -1148,6 +1170,9 @@ async function doStreamImpl(
             })
           } finally {
             pumpingThisStream = false
+          }
+          if (activeSession.closed && activeSession.pending.size === 0) {
+            forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
           }
           try {
             controller.close()
@@ -1164,6 +1189,9 @@ async function doStreamImpl(
             pendingExecs: activeSession.pending.size,
           })
         } catch (e) {
+          if (e instanceof CursorLocalCancellationError || callOptions.abortSignal?.aborted) {
+            forgetRetryBudget(opencodeSessionKey(callOptions), retryBudget)
+          }
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
           // A Run the host stopped is drained and closed by its cancel.
@@ -1209,6 +1237,7 @@ export async function pumpWithRecovery(input: {
   controller: ReadableStreamDefaultController<V3Part>
   abortSignal?: AbortSignal
   retryPolicy?: CursorRetryPolicy
+  retryBudget?: RetryBudget
   recover: (recovery: CursorRunRecovery) => Promise<CursorSession>
   onSession?: (session: CursorSession) => void
   maxRecoveries?: number
@@ -1223,9 +1252,10 @@ export async function pumpWithRecovery(input: {
   let session = input.initialSession
   const retryPolicy = input.retryPolicy ?? {
     ...DEFAULT_RETRY_POLICY,
-    maxAttempts: (input.maxRecoveries ?? 1) + 1,
+    ...(input.maxRecoveries === undefined ? {} : { maxAttempts: input.maxRecoveries + 1 }),
   }
-  const maxRecoveries = retryPolicy.maxAttempts - 1
+  const retryBudget = input.retryBudget ?? newRetryBudget()
+  const maxRecoveries = retryPolicy.maxAttempts === undefined ? 13 : retryPolicy.maxAttempts - 1
   let credentialRenewed = false
   // As in Cursor CLI's Run retry loop: an attempt without a checkpoint of its
   // own resumes the latest one this turn received, and two resumed attempts
@@ -1233,6 +1263,7 @@ export async function pumpWithRecovery(input: {
   let turnCheckpoint: Uint8Array | undefined
   let resumedAttempt = false
   let noProgressResumes = 0
+  let openingFailure: CursorProviderError | undefined
   input.onSession?.(session)
 
   const reopen = async (
@@ -1308,10 +1339,22 @@ export async function pumpWithRecovery(input: {
     return next
   }
 
+  // A replacement can fail before pump() starts (for example while connecting).
+  // Classify it in this same loop rather than exposing an unbudgeted host retry.
+  const reopenAttempt = async (pumped: CursorSession, failure: CursorProviderError, checkpoint: Uint8Array | undefined) => {
+    try {
+      session = await reopen(pumped, failure, checkpoint)
+    } catch (error) {
+      const failure = toCursorProviderError(error, { replaySafe: true, fallback: "Cursor recovery setup failed" })
+      if (!failure.transient) throw error
+      openingFailure = failure
+    }
+  }
+
   for (let attempt = 0; ; attempt++) {
     const pumpedSession = session
     const pumpOwner = Symbol("cursor-pump")
-    sessionManager.beginPump(pumpedSession, pumpOwner)
+    if (!openingFailure) sessionManager.beginPump(pumpedSession, pumpOwner)
     // OpenCode 1.x stops a turn by aborting the signal, before the AI SDK cancels
     // the stream. Cancel at Cursor, as the stream's cancel() does, so Cursor ends
     // the Run on a checkpoint; a reply still waiting for drain would hold the
@@ -1331,6 +1374,11 @@ export async function pumpWithRecovery(input: {
       ? listenForHostSteers(pumpedSession.openCodeSessionId, (steer) => injectHostSteer(pumpedSession, steer))
       : undefined
     try {
+      if (openingFailure) {
+        const failure = openingFailure
+        openingFailure = undefined
+        throw failure
+      }
       await pump(
         pumpedSession,
         input.controller,
@@ -1340,10 +1388,14 @@ export async function pumpWithRecovery(input: {
         },
         input.abortSignal,
       )
+      if (pumpedSession.closed && pumpedSession.pending.size === 0) {
+        forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
+      }
       return session
     } catch (error) {
       // A cancelled Run's stream fails or ends on purpose; recovering would restart the stopped turn.
       if (pumpedSession.hostInterrupted || input.abortSignal?.aborted) {
+        forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
         if (error instanceof CursorLocalCancellationError) throw error
         throw new CursorLocalCancellationError("Cursor Run cancelled: the host stopped the turn", error)
       }
@@ -1377,7 +1429,7 @@ export async function pumpWithRecovery(input: {
         )
         sessionManager.close(pumpedSession, "remote-error", failure)
         input.renewRejectedCredential()
-        session = await reopen(
+        await reopenAttempt(
           pumpedSession,
           failure,
           checkpoint,
@@ -1402,6 +1454,7 @@ export async function pumpWithRecovery(input: {
         // provider from doing so; the host can, unless a side effect would repeat.
         if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
           trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
+          reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
           throw hostRetryError(failure)
         }
         throw retrySuppressedError(
@@ -1411,9 +1464,7 @@ export async function pumpWithRecovery(input: {
           maxRecoveries + 1,
         )
       }
-      if (attempt >= maxRecoveries) {
-        throw new CursorRetryExhaustedError(attempt + 1, failure)
-      }
+      reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
       trace(
         `Run interrupted: sessionId=${pumpedSession.sessionId} attempt=${attempt + 1}/${maxRecoveries} ` +
           `err=${failure.message} — ${checkpoint ? `resuming ${checkpoint.length}B checkpoint` : "rebasing fresh Run"}`,
@@ -1422,7 +1473,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      session = await reopen(pumpedSession, failure, checkpoint)
+      await reopenAttempt(pumpedSession, failure, checkpoint)
     } finally {
       input.abortSignal?.removeEventListener("abort", stopPumpedRun)
       stopSteers?.()
@@ -2741,6 +2792,7 @@ export function cancelRunForHostInterrupt(
 
 async function cancelRun(session: CursorSession, reason: string, opts?: { graceMs?: number }): Promise<void> {
   session.hostInterrupted = reason
+  forgetRetryBudget(session.openCodeSessionId)
   dropLostRequest(session.openCodeSessionId)
   // Stopped while its turn end was being saved, the host may have kept only part of the step.
   if (session.openCodeSessionId && sessionManager.isActivelyPumping(session)) {
@@ -2840,6 +2892,7 @@ onHostInterrupt(async (openCodeSessionId, reason, at) => {
   for (const [id, stop] of hostInterrupts) {
     if (stop.at < at - HOST_INTERRUPT_MEMORY_MS) hostInterrupts.delete(id)
   }
+  forgetRetryBudget(openCodeSessionId)
   hostInterrupts.set(openCodeSessionId, { at, reason })
   for (const session of sessionManager.openSessionsStoppedWith(openCodeSessionId)) {
     if (requestedBefore(session, at)) cancelForHostInterrupt(session, reason)
@@ -6822,6 +6875,14 @@ export function cursorTurnEndedProviderMetadata(
   }
 }
 
+/** Partial assistant output may grow on a host retry; it is not a new user turn. */
+function retryTurnKey(prompt: LanguageModelV3CallOptions["prompt"]): string {
+  const messages = prompt.filter(message => message.role !== "system" && !hostTailNote(message))
+  let end = messages.length
+  while (end > 0 && messages[end - 1]!.role !== "user") end--
+  return createHash("sha256").update(JSON.stringify(messages.slice(0, end))).digest("hex")
+}
+
 /** All user messages after the last assistant/tool boundary form one live user turn. */
 export function liveUserTurn(prompt: LanguageModelV3CallOptions["prompt"]): { start: number; text: string } | undefined {
   let start = prompt.length
@@ -7325,6 +7386,7 @@ export function resolveTurnConversationReset(input: {
 }
 
 export function resetTurnStateForTests(): void {
+  resetRetryBudgetsForTests()
   toolCatalogBySession.clear()
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()

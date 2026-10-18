@@ -240,7 +240,7 @@ const cursor = createCursor({
   // agentBaseURL: "https://agentn.us.api5.cursor.sh", // explicit Run host override
   // telemetryEnabled: true, // opt in to GetServerConfig telemetry
   // cacheDir: "/path/to/host/cache", // optional; else path bridge or native OpenCode cache
-  // retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 8_000 },
+  // retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 8_000 }, // optional stricter total limit
   // continuation: { heartbeatMs: 5_000, semanticIdleMs: 120_000, hardCapMs: 600_000 },
 })
 
@@ -248,7 +248,7 @@ const model = cursor.languageModel("composer-2.5")
 // model implements AI SDK LanguageModelV3 (doStream / doGenerate)
 ```
 
-Give one credential source. The provider uses the first present and never falls back from one to another: `getAccessToken` (an async function returning the current access token, called for every Run so a long-running process can renew its login; it receives `{ forceRefresh: true }` once after Cursor rejects a token), then `accessToken` (a JWT sent as-is, never renewed), then `apiKey` (a raw `crsr_...` key, exchanged for a JWT and exchanged again near its expiry, the way Cursor CLI renews an API-key login). Optional: `apiBaseURL`, `agentBaseURL`, `cacheDir`, `headers`, `telemetryEnabled`, `retry`, and `continuation`. `cacheDir` pins the host cache root for model/version caches and Cursor project metadata; when omitted, the provider uses an injected structural host path bridge or the native OpenCode XDG cache described in [Paths](#paths-host-cache). An untouched checkpoint resume may renew a rejected credential once, while keeping completed tools behind the replay barrier. Follow-up Runs retain checkpoints received while opening. Transient failures resume from the latest checkpoint produced by that Run, matching Cursor CLI; without an eligible checkpoint, retries remain limited to replay-safe attempts so completed text or tool work is not duplicated. Once that budget is spent, or replay is unsafe, the terminal error does not re-arm OpenCode's outer retry loop. Pending-tool inactivity is renewed by OpenCode activity from the session or its descendants. The older `baseURL` option is still accepted as a legacy alias for `agentBaseURL`.
+Give one credential source. The provider uses the first present and never falls back from one to another: `getAccessToken` (an async function returning the current access token, called for every Run so a long-running process can renew its login; it receives `{ forceRefresh: true }` once after Cursor rejects a token), then `accessToken` (a JWT sent as-is, never renewed), then `apiKey` (a raw `crsr_...` key, exchanged for a JWT and exchanged again near its expiry, the way Cursor CLI renews an API-key login). Optional: `apiBaseURL`, `agentBaseURL`, `cacheDir`, `headers`, `telemetryEnabled`, `retry`, and `continuation`. `cacheDir` pins the host cache root for model/version caches and Cursor project metadata; when omitted, the provider uses an injected structural host path bridge or the native OpenCode XDG cache described in [Paths](#paths-host-cache). An untouched checkpoint resume may renew a rejected credential once, while keeping completed tools behind the replay barrier. Follow-up Runs retain checkpoints received while opening. Transient failures resume from the latest checkpoint produced by that Run, matching Cursor CLI; without an eligible checkpoint, retries remain limited to replay-safe attempts so completed text or tool work is not duplicated. See [retry limits](#retry-limits) for the shared provider/host budget and endless retry option. Once that budget is spent, or replay is unsafe, the terminal error does not re-arm OpenCode's outer retry loop. Pending-tool inactivity is renewed by OpenCode activity from the session or its descendants. The older `baseURL` option is still accepted as a legacy alias for `agentBaseURL`.
 
 ### Shell results
 
@@ -322,6 +322,31 @@ Transcript storage is supplied
 separately through `CURSOR_AGENT_TRANSCRIPTS_FOLDER`; the provider neither
 creates that directory nor writes host transcripts into it.
 
+## Retry limits
+
+Following Cursor CLI, each user turn allows **10 transport retries** and
+**3 server retries**, counted separately. Connection failures use the transport
+budget; early stream closure and the inbound read-idle deadline use the server
+budget. Retries of the same turn share these counts across checkpoints, tool
+steps and OpenCode's own retry calls. A new user turn, successful completion or
+Stop starts a fresh budget. Counts are held in memory for the running process.
+OpenCode may stop earlier under its own retry policy.
+
+For direct SDK use, `retry.maxAttempts` adds a total attempt ceiling, including
+the initial attempt; omitting it uses the two Cursor CLI budgets. The existing
+backoff defaults remain 500 ms full jitter, growing exponentially to an 8 s
+ceiling (`baseDelayMs` / `maxDelayMs`). OpenCode controls delays when it owns
+the retry after partial output.
+
+Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting OpenCode (or its daemon)
+to bypass both count limits and `retry.maxAttempts`, like Cursor CLI's endless
+retry mode. This keeps retrying eligible transient failures; it preserves Stop,
+final errors, authentication rules and tool replay guards. It also retains
+Cursor CLI's safety cutoffs: two resumed attempts that stream without a new
+checkpoint end the turn, and consecutive semantic-stall retries stop once
+180 seconds have elapsed since the first stall retry. A non-stall failure resets
+that stall window. The setting does not override OpenCode's own retry limits.
+
 ## Environment variables
 
 | Variable | Description |
@@ -331,6 +356,7 @@ creates that directory nor writes host transcripts into it.
 | `CURSOR_GET_SERVER_CONFIG_TELEMETRY` | Set to `1` or `true` to opt the `GetServerConfig` lookup into telemetry in OpenCode/plugin usage |
 | `HTTPS_PROXY` / `https_proxy` | HTTP CONNECT proxy for HTTPS. Bun `fetch` uses this for unary RPCs; the Run HTTP/2 session also tunnels through it (see `NO_PROXY`). The Run tunnel supports only `http://` proxy URLs (Basic auth via userinfo); `https://` and SOCKS proxy URLs leave the Run on a direct connection. `HTTP_PROXY` is not used for HTTPS |
 | `NO_PROXY` / `no_proxy` | Comma/space hosts that bypass the proxy (`*`, exact host, or `.suffix` / `suffix` domain forms; a `host:port` entry bypasses only that port) |
+| `CURSOR_ENDLESS_RETRIES` | Set to `1` or `true` to bypass retry count limits; off by default. Safety cutoffs and host retry limits still apply. See [retry limits](#retry-limits). |
 | `CURSOR_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
 | `CURSOR_PROVIDER_DEBUG_FILE` | Debug log path (default: `debug-<pid>.log` under `$TMPDIR/cursor-provider-logs-<uid>/`) |
 | `CURSOR_AGENT_TRANSCRIPTS_FOLDER` | Optional folder containing past-chat transcripts, advertised to Cursor on OpenCode 1.x and 2.0. Sent only if it is an existing directory; unset, empty, missing, non-directory, or unstatable paths are omitted. Relative paths resolve against the workspace. The provider does not create the folder or write transcripts. |
@@ -480,7 +506,7 @@ The package root intentionally stays plugin-safe for OpenCode's classic loader. 
 | “Too many connections from different devices” | Device IDs are derived from stable OS identifiers (same approach as the Cursor CLI). Avoid running multiple clients that invent different machine fingerprints for the same account. |
 | Empty or stale model list | Delete `<host-cache>/cursor-models.json` (native default `~/.cache/opencode/`) and restart OpenCode. A compatibility layer may supply a different host-cache root through the structural path bridge. Existing Cursor auth is enough to refill the cache; re-login only if auth itself is broken. Cache TTL is 24h; a failed background refresh keeps serving the previous cache. |
 | Stream hangs or HTTP/2 errors | The provider keeps Cursor's Run open across OpenCode tool calls, rotates aged shared connections, resumes transient interruptions from the latest eligible Cursor checkpoint, and falls back to a fresh-history rebase only before stateful output when no checkpoint exists. A transient interruption after only text or reasoning, without a checkpoint from that turn, is left to OpenCode to retry. Completed tools remain replay barriers across host steps; credential renewal retains the latest eligible checkpoint. Repeated resumes without progress end as an error. Behind an HTTP proxy, set `HTTPS_PROXY` (and `NO_PROXY` as needed): unary `fetch` and the Run HTTP/2 CONNECT tunnel both honor them. With debug logging enabled, look for `Run interrupted`, `resuming … checkpoint`, `rebasing fresh Run`, or `h2 connect via HTTPS proxy`. Restart OpenCode after rebuilding a local `file://` install. |
-| No response / silent 200 + close | HTTP 200 alone is not a successful agent turn: the provider now requires Cursor's explicit `turn_ended`, captures HTTP/2 trailers/GOAWAY, and recovers once from bare EOF. The Run host still comes from in-memory `GetServerConfig` resolution; set `CURSOR_PROVIDER_DEBUG=1` to confirm the host and termination reason. |
+| No response / silent 200 + close | HTTP 200 alone is not a successful agent turn: the provider now requires Cursor's explicit `turn_ended`, captures HTTP/2 trailers/GOAWAY, and retries bare EOF within the server retry budget. The Run host still comes from in-memory `GetServerConfig` resolution; set `CURSOR_PROVIDER_DEBUG=1` to confirm the host and termination reason. |
 | Visible `<shell_metadata>` timeout text | Rebuild and restart a local install. Cursor's shell timeout is carried on its exec request; the provider now removes OpenCode's internal timeout envelope before it is rendered or stored, then returns Cursor's typed timeout or background-handoff event instead of treating the text as successful stdout. |
 | `Unsupported Cursor exec variant …` | The error names the canonical Cursor CLI request field, its expected result field, and this provider's handling classification. Known `handling=unsupported` variants (Cursor-native capabilities without a safe OpenCode AI SDK bridge) are now soft-denied on the wire with a populated typed error/`rejected`/`allowlisted:false` result and the Run continues — look for `exec: SOFT-DENIED …` in the debug log and a `Workspace root: …` suffix in the deny text — while `unknown request field` still hard-fails as protocol drift; `handling=opencode-tool` or `provider-control` indicates a provider decoder/dispatch regression. Enable the debug log and report the full named error. |
 | Need wire-level logs | Set `CURSOR_PROVIDER_DEBUG=1` (optional `CURSOR_PROVIDER_DEBUG_FILE`; the default is `debug-<pid>.log` under `$TMPDIR/cursor-provider-logs-<uid>/`) and reproduce the issue. Every completed turn emits a `turn usage validation: status=ok\|mismatch` line confirming token-accounting integrity and a `cache diagnosis:` line showing warm/cold checkpoint continuity, raw read/write/uncached tokens, cache-read coverage of the prior context, context/category deltas, stable RequestContext hashes, and Run step/tool counts. Checkpoint lines include Cursor's current category totals. Cursor does not expose per-model-call cache splits, so the diagnostic labels that value unavailable instead of inferring it from aggregate `TurnEnded` counters. |

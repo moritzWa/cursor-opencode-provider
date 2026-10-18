@@ -218,6 +218,13 @@ an untouched resumed attempt. Follow-ups retain checkpoints received while
 opening the new Run. Two resumed attempts that stream without saving a
 checkpoint end the turn.
 
+The provider shares Cursor CLI's limits of 10 transport retries and 3 server
+retries across this turn, including OpenCode's retries. OpenCode can stop earlier.
+Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting the host (or its daemon)
+to bypass count limits while retaining replay guards, Stop, final errors, the
+two-resume cutoff and the 180 s consecutive semantic-stall retry window.
+See [retry limits](../README.md#retry-limits) for classification and SDK options.
+
 ## Mid-turn steers and Stop
 
 A plain-text steer without files or skills can reach an actively pumping Cursor

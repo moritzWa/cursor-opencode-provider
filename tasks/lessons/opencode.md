@@ -136,7 +136,15 @@ These are failure lessons shared by both hosts, not a replacement for
   only reasoning; its request reached Cursor only with the next message
   ([#100](https://github.com/oakimov/cursor-opencode-provider/issues/100)).
   Cursor CLI resends the action, resumes the turn's latest checkpoint, and stops
-  after two resumes without a new one. Record every barrier, not the first:
+  after two resumes without a new one. Its separate 10-transport / 3-server
+  retry budgets belong to the user turn, not one provider call: an output-only
+  failure handed to an older host with unbounded retries otherwise restarts the
+  allowance forever. Share counts across module copies and host tool steps;
+  distinguish partial assistant output and host reminders from a new user turn.
+  Endless mode bypasses counts only, preserving replay guards and CLI's 180 s
+  consecutive-stall retry window (`src/retry-budget.ts`,
+  `test/retry-budget.test.ts`, `test/run-error-host.test.ts`).
+  Record every barrier, not the first:
   text before a stateful frame must not read as output-only. Keep stateful
   barriers on the Run across tool-step pumps, and retain checkpoints before
   credential renewal as well as transient recovery; otherwise a completed

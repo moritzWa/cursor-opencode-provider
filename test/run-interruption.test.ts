@@ -14,7 +14,7 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorAuthError, CursorRetryExhaustedError, CursorServerError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
 import { sessionFixture } from "./session-fixture.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
@@ -339,19 +339,20 @@ describe("interrupted Cursor Run handling", () => {
     expect(writes).toHaveLength(4)
   })
 
-  it("surfaces a second interruption instead of retrying forever", async () => {
+  it("stops early EOF after three server retries, like Cursor CLI", async () => {
     let recoveries = 0
     await expect(
       pumpWithRecovery({
         initialSession: fakeSession("first-eof", []),
         controller: controller([]),
+        retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
         recover: async () => {
           recoveries++
           return fakeSession("second-eof", [])
         },
       }),
     ).rejects.toBeInstanceOf(CursorRetryExhaustedError)
-    expect(recoveries).toBe(1)
+    expect(recoveries).toBe(3)
   })
 
   it("does not leak OpenCode SessionRetry triggers after unavailable retries finish", async () => {
@@ -584,6 +585,54 @@ describe("interrupted Cursor Run handling", () => {
     }
   })
 
+  it.each([false, true])("keeps transport counts across replacement checkpoints (endless=%s)", async endless => {
+    const saved = process.env.CURSOR_ENDLESS_RETRIES
+    if (endless) process.env.CURSOR_ENDLESS_RETRIES = "1"
+    else delete process.env.CURSOR_ENDLESS_RETRIES
+    let attempts = 0
+    const checkpointedFailure = () => {
+      attempts++
+      const session = fakeSession(`transport-budget-${attempts}`, [
+        serverFrame({ conversation_checkpoint_update: Uint8Array.of(10, 1, attempts) }),
+        ...(endless && attempts === 15 ? [turnEnded()] : []),
+      ])
+      const next = session.frames.next.bind(session.frames)
+      session.frames.next = async () => {
+        const frame = await next()
+        if (frame.done) throw new CursorTransportError("reset", { transient: true, replaySafe: true, code: "ECONNRESET" })
+        return frame
+      }
+      return session
+    }
+    try {
+      const pumping = pumpWithRecovery({
+        initialSession: checkpointedFailure(), controller: controller([]),
+        retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+        recover: async () => checkpointedFailure(),
+      })
+      if (endless) await pumping
+      else await expect(pumping).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+      expect(attempts).toBe(endless ? 15 : 11)
+    } finally {
+      if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+      else process.env.CURSOR_ENDLESS_RETRIES = saved
+    }
+  })
+
+  it("budgets replacement connection failures in the same loop", async () => {
+    let openings = 0
+    await expect(pumpWithRecovery({
+      initialSession: fakeSession("before-replacement-connect-failures", []),
+      controller: controller([]), retryPolicy: { baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => {
+        openings++
+        throw new CursorTransportError("connect reset", { transient: true, replaySafe: true, code: "ECONNRESET" })
+      },
+    })).rejects.toBeInstanceOf(CursorRetryExhaustedError)
+    // First EOF spends one server retry; failed opens then spend ten transport retries.
+    expect(openings).toBe(11)
+  })
+
   it("uses retry.maxAttempts as the total Run attempt budget", async () => {
     let recoveries = 0
     await expect(
@@ -703,7 +752,10 @@ describe("interrupted Cursor Run handling", () => {
     expect(recoveries).toBe(3)
   })
 
-  it("stops after two resumed attempts stream without saving a checkpoint, like Cursor CLI", async () => {
+  it.each([false, true])("stops after two resumed attempts stream without saving a checkpoint (endless=%s)", async endless => {
+    const saved = process.env.CURSOR_ENDLESS_RETRIES
+    if (endless) process.env.CURSOR_ENDLESS_RETRIES = "true"
+    else delete process.env.CURSOR_ENDLESS_RETRIES
     const checkpoint = Uint8Array.from([0x0a, 0x01, 0x06])
     let recoveries = 0
     const failure = await pumpWithRecovery({
@@ -723,6 +775,8 @@ describe("interrupted Cursor Run handling", () => {
     expect(failure).toMatchObject({ retryable: false, transient: false })
     expect((failure as Error).message).toContain("2 resume attempts made no progress")
     expect(recoveries).toBe(2)
+    if (saved === undefined) delete process.env.CURSOR_ENDLESS_RETRIES
+    else process.env.CURSOR_ENDLESS_RETRIES = saved
   })
 
   it("does not resume an earlier checkpoint once the Run sent a newer user message", async () => {
