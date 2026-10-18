@@ -211,6 +211,8 @@ export type CursorSession = {
    * recovery must not resume earlier state that lacks the delivered input.
    */
   checkpointRevoked?: boolean
+  /** Only a delivered host result, rather than an unrepresented follow-up, revoked it. */
+  checkpointRevokedByHostResult?: boolean
   /** Ignore queued checkpoints received before the latest message/result delivery. */
   resumeCheckpointAfterFrame?: number
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */

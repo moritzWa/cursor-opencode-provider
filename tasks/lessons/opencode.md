@@ -141,6 +141,15 @@ These are failure lessons shared by both hosts, not a replacement for
   failure handed to an older host with unbounded retries otherwise restarts the
   allowance forever. Share counts across module copies and host tool steps;
   distinguish partial assistant output and host reminders from a new user turn.
+  Test the canonical host projection: OpenCode 2's interruption notice is plain
+  user text, not a `<system-reminder>`, and otherwise reset the budget on every
+  continuation (`test/run-error-host.test.ts`). Admit it only after a requested
+  host retry, retaining its full prompt key across tool steps; a later literal
+  user request with that text still needs a new budget. Immediately after completed
+  host results, history recovery needs every observed exec's result, no new
+  output, and no opaque interaction or unknown frame. Seed all completed tool
+  steps; retaining only the last result loses earlier work. Never use the stale
+  checkpoint for that recovery.
   Reject an unsafe replacement upload before consulting the preceding Run's
   checkpoint: that checkpoint says nothing about work the replacement may have
   started. Failed drains must also project as terminal to both hosts, including

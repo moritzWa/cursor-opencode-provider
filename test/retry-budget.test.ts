@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { CursorRetryExhaustedError, CursorServerError, CursorTransportError, hostFacingError } from "../src/errors.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
+import { retryTurnKey } from "../src/language-model.js"
+import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
 import { endlessRetriesEnabled, forgetRetryBudget, newRetryBudget, reserveRetry, resetRetryBudgetsForTests, retryCategory, turnRetryBudget } from "../src/retry-budget.js"
 
 const savedEndless = process.env.CURSOR_ENDLESS_RETRIES
@@ -15,6 +17,35 @@ const server = () => new CursorServerError("unavailable", { transient: true, rep
 const stall = () => new CursorTransportError("Stalled", { transient: true, replaySafe: true, code: "CURSOR_SEMANTIC_IDLE_TIMEOUT" })
 
 describe("Cursor CLI retry budgets", () => {
+  it("ignores only standalone host interruption notices in an ongoing turn", () => {
+    const notice = "The previous response was interrupted. Continue from where you left off without repeating completed content."
+    const user = (text: string): LanguageModelV3Prompt[number] => ({ role: "user", content: [{ type: "text", text }] })
+    const prompt: LanguageModelV3Prompt = [user("Continue")]
+    const key = retryTurnKey(prompt)
+    prompt.push({ role: "assistant", content: [{ type: "text", text: "partial answer" }] })
+    prompt.push(user("<system-update>new instructions</system-update>"), user(notice))
+    expect(retryTurnKey(prompt)).not.toBe(key)
+    expect(retryTurnKey(prompt, true)).toBe(key)
+    expect(retryTurnKey([user(notice)])).not.toBe(retryTurnKey([]))
+    expect(retryTurnKey([...prompt, user("Continue")])).not.toBe(key)
+    expect(retryTurnKey([...prompt, user(`${notice}\nPlease inspect the diff`)])).not.toBe(key)
+    expect(retryTurnKey([...prompt, { role: "user", content: [{ type: "text", text: notice },
+      { type: "file", data: new Uint8Array([1]), mediaType: "image/png" }] }])).not.toBe(key)
+  })
+
+  it("requires a requested host retry before sharing a plain-text continuation's budget", () => {
+    const original = turnRetryBudget("session", "original")
+    reserveRetry(original, server())
+    expect(turnRetryBudget("session", "user-quote", "original")).not.toBe(original)
+    original.hostRetryPending = true
+    expect(turnRetryBudget("session", "host-notice", "original")).toBe(original)
+    // The admitted prompt still owns the same budget during later tool steps.
+    expect(turnRetryBudget("session", "host-notice", "original")).toBe(original)
+    original.hostRetryPending = true
+    expect(turnRetryBudget("session", "next-host-notice", "host-notice")).toBe(original)
+    expect(turnRetryBudget("session", "later-user-quote", "next-host-notice")).not.toBe(original)
+  })
+
   it("allows ten transport retries and three server retries independently", () => {
     delete process.env.CURSOR_ENDLESS_RETRIES
     const budget = newRetryBudget()

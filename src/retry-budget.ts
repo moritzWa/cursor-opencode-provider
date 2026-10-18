@@ -7,6 +7,9 @@ export type RetryBudget = {
   transport: number
   retries: number
   stallStartedAt?: number
+  /** A plain-text host continuation is admitted only after we requested a host retry. */
+  hostRetryPending?: boolean
+  hostRetryKey?: string
 }
 
 const budgets = () => processShared("run-retry-budgets.v1", () => new Map<string, Map<string, RetryBudget>>())
@@ -18,7 +21,7 @@ export function newRetryBudget(): RetryBudget {
 }
 
 /** A host retry or tool continuation must not mint a fresh retry allowance. */
-export function turnRetryBudget(sessionKey: string | undefined, turnKey: string): RetryBudget {
+export function turnRetryBudget(sessionKey: string | undefined, turnKey: string, continuationKey?: string): RetryBudget {
   if (!sessionKey) return newRetryBudget()
   const sessions = budgets()
   let turns = sessions.get(sessionKey)
@@ -27,10 +30,27 @@ export function turnRetryBudget(sessionKey: string | undefined, turnKey: string)
   }
   sessions.delete(sessionKey)
   sessions.set(sessionKey, turns)
-  let budget = turns.get(turnKey)
+  const lookup = (key: string): [string, RetryBudget] | undefined => {
+    const direct = turns.get(key)
+    return direct ? [key, direct] : [...turns].find(([, budget]) => budget.hostRetryKey === key)
+  }
+  let entry = lookup(turnKey)
+  let budget = entry?.[1]
+  const currentKey = turnKey
+  if (entry) turnKey = entry[0]
+  if (!budget && continuationKey !== undefined) {
+    entry = lookup(continuationKey)
+    const previous = entry?.[1]
+    if (previous?.hostRetryPending) {
+      budget = previous
+      budget.hostRetryKey = currentKey
+      turnKey = entry![0]
+    }
+  }
   if (!budget) {
     budget = newRetryBudget()
   }
+  budget.hostRetryPending = false
   turns.delete(turnKey)
   turns.set(turnKey, budget)
   // Abandoned host retries and ephemeral helpers never reach turn_ended.

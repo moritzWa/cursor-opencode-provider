@@ -831,9 +831,10 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
 }
 
 /** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
-function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival()): void {
+function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival(), hostResult = false): void {
   session.resumeCheckpoint = undefined
   session.checkpointRevoked = true
+  session.checkpointRevokedByHostResult = hostResult
   session.resumeCheckpointAfterFrame = afterFrame
 }
 
@@ -844,6 +845,7 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
     && arrived <= session.resumeCheckpointAfterFrame) return
   session.resumeCheckpoint = Uint8Array.from(bytes)
   session.checkpointRevoked = false
+  session.checkpointRevokedByHostResult = false
   session.resumeCheckpointAfterFrame = undefined
 }
 
@@ -888,7 +890,8 @@ export function createCursorLanguageModel(
   // Both public entrypoints must project those failures just like pump errors.
   const doStream = async (callOptions: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> => {
     const retryPolicy = resolveRetryPolicy(options.retry)
-    const retryBudget = turnRetryBudget(opencodeSessionKey(callOptions), retryTurnKey(callOptions.prompt))
+    const retryBudget = turnRetryBudget(opencodeSessionKey(callOptions),
+      retryTurnKey(callOptions.prompt), retryTurnKey(callOptions.prompt, true))
     try {
       return await doStreamImpl(modelId, options, callOptions, retryPolicy, retryBudget)
     } catch (error) {
@@ -903,6 +906,7 @@ export function createCursorLanguageModel(
         }
         if (!failure.transient) throw failure
         reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+        retryBudget.hostRetryPending = true
         throw hostRetryError(failure, true)
       } catch (terminal) {
         throw hostFacingError(terminal)
@@ -1162,6 +1166,15 @@ async function doStreamImpl(
               abortSignal: callOptions.abortSignal,
               retryPolicy,
               retryBudget,
+              canRebaseFromHistory: (failed) => {
+                if (failed !== session || trailingToolResults.length === 0
+                  || !failed.checkpointRevokedByHostResult || failed.pending.size > 0
+                  || failed.replaySafety?.historyRebaseUnsafe) return false
+                const completed = new Set(extractToolResults(prompt)
+                  .filter(result => result.sessionId === failed.sessionId).map(result => result.execId))
+                const execIds = failed.replaySafety?.execIds
+                return !!execIds?.length && execIds.every(id => completed.has(id))
+              },
               recover: (recovery) => openSession({ recovery }),
               onSession: (next) => { activeSession = next },
               ...(credentialRenewable
@@ -1238,6 +1251,8 @@ export async function pumpWithRecovery(input: {
   abortSignal?: AbortSignal
   retryPolicy?: CursorRetryPolicy
   retryBudget?: RetryBudget
+  /** Proven completed host results can seed history without replaying their calls. */
+  canRebaseFromHistory?: (session: CursorSession) => boolean
   recover: (recovery: CursorRunRecovery) => Promise<CursorSession>
   onSession?: (session: CursorSession) => void
   maxRecoveries?: number
@@ -1279,7 +1294,7 @@ export async function pumpWithRecovery(input: {
             conversationId: pumpedSession.conversationId,
             checkpoint: Uint8Array.from(checkpoint),
           }
-        : { kind: "rebase" }
+        : { kind: "rebase", ...(input.canRebaseFromHistory?.(pumpedSession) ? { reason: "completed-tool-results" as const } : {}) }
     resumedAttempt = recovery.kind === "resume"
     // A rebase opens another conversation; its checkpoints start over.
     if (!resumedAttempt) turnCheckpoint = undefined
@@ -1454,12 +1469,14 @@ export async function pumpWithRecovery(input: {
           throw noProgressResumeError(failure, noProgressResumes)
         }
       }
-      if (!failure.replaySafe && !checkpoint) {
+      const historyRecovery = failure.replayBarrier === undefined && input.canRebaseFromHistory?.(pumpedSession)
+      if (!failure.replaySafe && !checkpoint && !historyRecovery) {
         // Cursor CLI sends the same action again. Shown output keeps the
         // provider from doing so; the host can, unless a side effect would repeat.
         if (failure.replayBarrier === "output-only" && !pumpedSession.checkpointRevoked) {
           trace(`Run interrupted after output only: sessionId=${pumpedSession.sessionId} — leaving the retry to the host`)
           reserveRetry(retryBudget, failure, retryPolicy.maxAttempts)
+          retryBudget.hostRetryPending = true
           throw hostRetryError(failure)
         }
         throw retrySuppressedError(
@@ -1496,7 +1513,7 @@ export async function pumpWithRecovery(input: {
 }
 
 export type CursorRunRecovery =
-  | { kind: "rebase"; reason?: "checkpoint-unusable" | "unfinished-prior-run" }
+  | { kind: "rebase"; reason?: "checkpoint-unusable" | "unfinished-prior-run" | "completed-tool-results" }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
@@ -1891,7 +1908,9 @@ async function startSession(
     liveTurnStart: liveTurn?.start,
     preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun,
     // A foreign-history rebase replays the other model's tool results too.
-    toolResults: isCompaction || foreignHistory || checkpointUnusable || unfinishedPriorRun ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    toolResults: isCompaction || foreignHistory || checkpointUnusable || unfinishedPriorRun
+      || (recovery?.kind === "rebase" && recovery.reason === "completed-tool-results")
+      ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
   })
   const userTurnHostNotes = prepareUserTurnHostNotes({
     sessionKey,
@@ -3547,7 +3566,7 @@ async function deliverContinuationResultsNow(
     }
     deliveredResults++
     if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
-      invalidateResumeCheckpoint(session)
+      invalidateResumeCheckpoint(session, lastFrameArrival(), true)
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
@@ -5041,6 +5060,7 @@ export async function pump(
       }
     }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
+    if (replayFrame.barrier === "non-control-exec") replaySafety.recordExec(esm?.id)
     // Reseeding is allowed only while every frame so far was positively a
     // control frame. Anything else, including unknown top-level fields, may have
     // carried output or stateful activity.
@@ -6881,10 +6901,24 @@ export function cursorTurnEndedProviderMetadata(
 }
 
 /** Partial assistant output may grow on a host retry; it is not a new user turn. */
-function retryTurnKey(prompt: LanguageModelV3CallOptions["prompt"]): string {
+export function retryTurnKey(prompt: LanguageModelV3CallOptions["prompt"], withoutLastInterruptionNotice = false): string {
+  // OpenCode 2 runner/llm.ts emits this synthetic after an incomplete stream;
+  // runner/to-llm-message.ts lowers it to an ordinary user text part. Limit
+  // recognition to exact, standalone text after assistant output. The budget
+  // accepts that candidate only after a requested host retry, then remembers
+  // its full key across tool steps. Actual prompt content is never removed.
+  const interrupted = "The previous response was interrupted. Continue from where you left off without repeating completed content."
   const messages = prompt.filter(message => message.role !== "system" && !hostTailNote(message))
   let end = messages.length
   while (end > 0 && messages[end - 1]!.role !== "user") end--
+  const last = messages[end - 1]
+  if (withoutLastInterruptionNotice && last?.role === "user" && last.content.length === 1
+    && last.content[0]?.type === "text" && last.content[0].text === interrupted
+    && messages[end - 2]?.role === "assistant") {
+    // Remove only this continuation, retaining earlier literal user requests.
+    end--
+    while (end > 0 && messages[end - 1]!.role !== "user") end--
+  }
   return createHash("sha256").update(JSON.stringify(messages.slice(0, end))).digest("hex")
 }
 

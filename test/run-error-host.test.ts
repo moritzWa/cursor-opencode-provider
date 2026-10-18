@@ -11,7 +11,7 @@ import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
 import { sessionManager } from "../src/session.js"
-import { resetTurnStateForTests } from "../src/language-model.js"
+import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
@@ -127,6 +127,91 @@ async function streamError(sessionKey: string): Promise<unknown> {
 }
 
 describe("checkpoint eligibility across host results", () => {
+  for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "new-output", "final-error"] as const) {
+    it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
+      type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
+      const requests: RunRequest[] = []
+      const delivered: number[] = []
+      scripted = (stream, message) => {
+        const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        if (message.run_request) {
+          requests.push(message.run_request as RunRequest)
+          if (requests.length > 1) {
+            send({ interaction_update: { turn_ended: {} } })
+            stream.end()
+            return
+          }
+          send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+          if (scenario === "unknown") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0))) // unknown field 100
+          if (scenario === "unrepresented-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
+          if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
+          send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo first", tool_call_id: "first" } } })
+        } else if (message.exec_client_message) {
+          const id = (message.exec_client_message as { id: number }).id
+          if (!(message.exec_client_message as Record<string, unknown>).shell_stream || delivered.includes(id)) return
+          delivered.push(id)
+          if (id === 1) {
+            send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
+          } else {
+            if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
+            if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
+            else stream.end() // no checkpoint after either completed result
+          }
+        }
+      }
+      cacheHttp2SessionForTests(ORIGIN, client)
+      try {
+        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+          workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
+        const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
+        const options = { prompt, headers: { "x-opencode-session-id": `ses_result_history_${scenario}` },
+          tools: [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
+        const read = async () => {
+          const parts: LanguageModelV3StreamPart[] = []
+          const { stream } = await model.doStream(options)
+          const reader = stream.getReader()
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            parts.push(value)
+          }
+          return parts
+        }
+        for (const output of ["first completed", "second completed"]) {
+          const parts = await read()
+          const call = parts.find(part => part.type === "tool-call")
+          if (!call || call.type !== "tool-call") throw new Error("Expected a host command")
+          prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+          prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
+        }
+        if (scenario === "missing-history") prompt.splice(1, 2)
+        if (scenario === "complete") {
+          const parts = await read()
+          expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
+          expect(parts.some(part => part.type === "tool-call")).toBe(false)
+          expect(requests).toHaveLength(2)
+          expect(requests[1]!.action.resume_action).toBeUndefined()
+          expect(requests[1]!.conversation_id).not.toBe(requests[0]!.conversation_id)
+          const text = requests[1]!.action.user_message_action!.user_message.text
+          expect(text.match(/first completed/g)).toHaveLength(1)
+          expect(text.match(/second completed/g)).toHaveLength(1)
+          expect(text).toContain("Do not repeat completed work")
+        } else {
+          expect(await read().catch((error: unknown) => error)).toMatchObject({ isRetryable: false,
+            responseHeaders: { "x-should-retry": "false" } })
+          expect(requests).toHaveLength(1)
+        }
+        expect(delivered).toEqual([1, 2])
+      } finally {
+        sessionManager.dispose()
+        await settleRunSavesForTests()
+        setHostCacheDirOverride(undefined)
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }, 30_000)
+  }
+
   for (const [afterResult, rejectReplacement] of [[false, false], [true, false], [true, true]] as const) {
     it(`only resumes a checkpoint received after the result (after: ${afterResult}, expired replacement: ${rejectReplacement})`, async () => {
       const checkpoint = Uint8Array.of(10, 1, 7)
@@ -447,9 +532,10 @@ describe("retry limits across OpenCode calls", () => {
       try {
         for (let i = 0; i < retries; i++) {
           expect(await attempt()).toMatchObject({ isRetryable: true, responseHeaders: { "x-should-retry": "true" } })
-          // OpenCode 2 keeps partial assistant output. A host system reminder is not a new request.
+          // Canonical OpenCode 2 runner/llm.ts Continue outcome, lowered by
+          // runner/to-llm-message.ts as a plain user message (no reminder wrapper).
           prompt.push({ role: "assistant", content: [{ type: "text", text: `partial ${i}` }] })
-          prompt.push({ role: "user", content: [{ type: "text", text: "<system-reminder>Retry the interrupted step.</system-reminder>" }] })
+          prompt.push({ role: "user", content: [{ type: "text", text: "The previous response was interrupted. Continue from where you left off without repeating completed content." }] })
         }
         expect(runs).toBe(retries)
         if (endless) {
@@ -458,6 +544,17 @@ describe("retry limits across OpenCode calls", () => {
         } else {
           expect(await attempt()).toMatchObject({ isRetryable: false, statusCode: 400, responseHeaders: { "x-should-retry": "false" } })
           expect(runs).toBe(retries + 1)
+          // After a final error, typing the exact same text is a genuine new
+          // request: there is no pending provider-requested host retry.
+          prompt.push({ role: "assistant", content: [{ type: "text", text: "final partial answer" }] })
+          prompt.push({ role: "user", content: [{ type: "text", text: "The previous response was interrupted. Continue from where you left off without repeating completed content." }] })
+          expect(await attempt()).toMatchObject({ isRetryable: true })
+          for (let i = 1; i < retries; i++) {
+            prompt.push({ role: "assistant", content: [{ type: "text", text: `literal request partial ${i}` }] })
+            prompt.push({ role: "user", content: [{ type: "text", text: "The previous response was interrupted. Continue from where you left off without repeating completed content." }] })
+            expect(await attempt()).toMatchObject({ isRetryable: true })
+          }
+          expect(await attempt()).toMatchObject({ isRetryable: false })
           // A later identical user message is a new turn, even in the same session.
           prompt.push({ role: "user", content: [{ type: "text", text: "Hello" }] })
           expect(await attempt()).toMatchObject({ isRetryable: true })

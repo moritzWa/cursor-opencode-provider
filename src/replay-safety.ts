@@ -15,7 +15,13 @@ export type ReplayBarrierReason =
 const OUTPUT_ONLY_BARRIERS: ReadonlySet<ReplayBarrierReason> = new Set(["visible-text", "visible-reasoning"])
 
 /** Plain Run-owned state retained across host tool-step pump calls. */
-export type ReplaySafetyState = { statefulBarrier?: ReplayBarrierReason }
+export type ReplaySafetyState = {
+  statefulBarrier?: ReplayBarrierReason
+  /** Every non-control exec must have a completed host result before history recovery. */
+  execIds?: number[]
+  /** History cannot represent opaque interactions, unknown frames or display-only work. */
+  historyRebaseUnsafe?: boolean
+}
 
 export class AttemptReplaySafety {
   private barrierReason: ReplayBarrierReason | undefined
@@ -32,10 +38,20 @@ export class AttemptReplaySafety {
     if (!OUTPUT_ONLY_BARRIERS.has(reason)) {
       this.stateful = true
       this.state.statefulBarrier ??= reason
+      if (reason !== "non-control-exec") this.state.historyRebaseUnsafe = true
     }
     if (this.barrierReason) return
     this.barrierReason = reason
     trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
+  }
+
+  recordExec(id: unknown): void {
+    const ids = this.state.execIds ??= []
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || ids.includes(id)) {
+      this.state.historyRebaseUnsafe = true
+      return
+    }
+    ids.push(id)
   }
 
   applyTo(failure: CursorProviderError): CursorProviderError {

@@ -330,7 +330,14 @@ budget; early stream closure and the inbound read-idle deadline use the server
 budget. Retries of the same turn share these counts across checkpoints, tool
 steps and OpenCode's own retry calls. A new user turn, successful completion or
 Stop starts a fresh budget. Counts are held in memory for the running process.
+OpenCode 2's interruption notices keep the same budget as the original request.
 OpenCode may stop earlier under its own retry policy.
+
+If a Run drops immediately after completed tool results, before new output,
+the provider can rebuild from host history containing every observed exec's
+result. It sends the completed results once and asks Cursor to continue. A
+checkpoint predating those results is never resumed. Missing results, unknown
+activity or a new interaction keep the failure final.
 
 For direct SDK use, `retry.maxAttempts` adds a total attempt ceiling, including
 the initial attempt; omitting it uses the two Cursor CLI budgets. The existing

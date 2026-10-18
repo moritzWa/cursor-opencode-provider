@@ -208,7 +208,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   Stateful barriers survive host tool steps. Two resumed attempts that stream
   without a new checkpoint end the turn. With
   no checkpoint in the turn, a transient failure after only text or reasoning
-  is `hostRetryable` (the CLI resends the action); any other barrier stays final.
+  is `hostRetryable` (the CLI resends the action). A silent drop immediately
+  after delivered host results may rebase from history only when every observed
+  exec has a completed result and no opaque activity occurred. Include all
+  completed tool steps; never resume their earlier checkpoint. Other barriers
+  stay final.
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it

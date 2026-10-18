@@ -211,8 +211,10 @@ patch operations that would lose CRLF bytes before changing a file. Native
 ## Interrupted model requests
 
 OpenCode retries a transient failure after only text or reasoning when the
-turn has no new checkpoint. Stateful activity, including a completed tool from
-an earlier host step, stays a replay barrier. Recovery retains the latest
+turn has no new checkpoint. Stateful activity stays a replay barrier. A drop
+immediately after completed tool results can rebuild from complete host history
+before new output; missing results or unrepresented activity remain final.
+Recovery retains the latest
 eligible checkpoint across token renewal, including a rejected credential on
 an untouched resumed attempt. Follow-ups retain checkpoints received while
 opening the new Run. Two resumed attempts that stream without saving a
@@ -220,6 +222,7 @@ checkpoint end the turn.
 
 The provider shares Cursor CLI's limits of 10 transport retries and 3 server
 retries across this turn, including OpenCode's retries. OpenCode can stop earlier.
+The host's plain-text interruption notice does not reset the provider's budget.
 Set `CURSOR_ENDLESS_RETRIES=1` or `true` before starting the host (or its daemon)
 to bypass count limits while retaining replay guards, Stop, final errors, the
 two-resume cutoff and the 180 s consecutive semantic-stall retry window.
