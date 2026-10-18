@@ -391,9 +391,9 @@ These are failure lessons shared by both hosts, not a replacement for
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. A dated version
-  heading is not proof of publication: retain entries in the maintainer-designated
-  upcoming release instead of moving them to Unreleased. Concurrent Unreleased
+  compare with the release, not an intermediate PR state. A versioned heading
+  or package version bump does not establish publication. Verify release status
+  and keep entries in the maintainer-designated upcoming release. Concurrent changelog
   insertions can conflict despite independent code; compare the union of entries
   after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in
