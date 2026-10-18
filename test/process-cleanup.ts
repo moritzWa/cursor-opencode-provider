@@ -13,10 +13,47 @@ export function processTable(): { pid: number; ppid: number; command: string }[]
       } catch { return [] }
     })
   }
-  return spawnSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).stdout.split("\n").flatMap(line => {
+  const result = spawnSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`Cannot inspect test processes: ps exited ${result.status}: ${result.stderr}`)
+  return result.stdout.split("\n").flatMap(line => {
     const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)
     return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]! }] : []
   })
+}
+
+function killProcess(pid: number): void {
+  try { process.kill(pid, "SIGKILL") } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+  }
+}
+
+/** Stop descendants first, allowing their owning shell to reap them. */
+export async function stopProcessTree(pid: number): Promise<void> {
+  const entries = processTable()
+  const tree = [pid]
+  for (let index = 0; index < tree.length; index++) {
+    for (const entry of entries) {
+      if (entry.ppid === tree[index] && !tree.includes(entry.pid)) tree.push(entry.pid)
+    }
+  }
+  const waitGone = async (pids: number[]) => {
+    const end = Date.now() + 2000
+    while (pids.some(pid => {
+      try { process.kill(pid, 0); return true } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+        return false
+      }
+    })) {
+      if (Date.now() >= end) throw new Error(`Test processes did not stop: ${pids.join(", ")}`)
+      await Bun.sleep(25)
+    }
+  }
+  const descendants = tree.slice(1).reverse()
+  for (const child of descendants) killProcess(child)
+  await waitGone(descendants)
+  killProcess(pid)
+  await waitGone([pid])
 }
 
 /**
@@ -35,6 +72,6 @@ export async function stopProcessesUsing(dir: string, waitMs = 3000): Promise<vo
     return true
   }
   if (await settled(waitMs)) return
-  for (const { pid } of owners()) { try { process.kill(pid, "SIGKILL") } catch { /* already exited */ } }
-  await settled(2000)
+  for (const { pid } of owners()) killProcess(pid)
+  if (!await settled(2000)) throw new Error(`Test processes still use the temporary directory: ${owners().map(entry => entry.pid).join(", ")}`)
 }

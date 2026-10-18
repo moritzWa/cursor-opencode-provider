@@ -380,7 +380,12 @@ These are failure lessons shared by both hosts, not a replacement for
   `createCursor({ cacheDir })`'s process-wide cache root set, so later files
   wrote into their removed dirs and failed tests that expected the default
   root. Wait for the writers, restore the root, then remove; `test/preload.ts`
-  fails any run that leaves an entry and lists its files.
+  fails any run that leaves an entry and lists its files. Killing only a
+  background shell's marker PID leaves compound-command descendants alive;
+  stop its tree and await exit (`test/background-spawn.test.ts`). A failed
+  process listing or a writer surviving termination must fail cleanup, not
+  silently permit removal (`test/process-cleanup.test.ts`). Test log content
+  separately from its path-bearing diagnostic header (`test/debug.test.ts`).
 - **Match CI environments.** Narrow PATH fixtures omitted mkdir; Linux shell
   tests need an init reaper. Strip temporary module copies from coverage and
   include Bun editor types (`scripts/strip-copied-coverage.ts`).

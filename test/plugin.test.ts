@@ -680,7 +680,7 @@ describe("CursorPlugin shell result hooks", () => {
       stderr: "pipe",
     })
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
-    reapBackgroundSpawn(result.stdout.toString())
+    await reapBackgroundSpawn(result.stdout.toString())
   })
 
   it("keeps timeout-shaped successful stdout in output and metadata.output", async () => {
