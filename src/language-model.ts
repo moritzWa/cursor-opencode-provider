@@ -90,6 +90,8 @@ import {
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   hostToolForCursorEdit,
+  cursorEditReadAnswer,
+  cursorEditReadReachesHost,
   buildCompleteEditReadMessages,
   rejectPartialReadMutation,
   binaryWritePayload,
@@ -4319,32 +4321,18 @@ export async function pump(
     const absolutePath = resolvePath(requestedPath)
     if (absolutePath !== resolvePath(editPath)) return false
 
-    let exists = true
-    try {
-      fs.lstatSync(absolutePath)
-    } catch (error) {
-      const code = error && typeof error === "object" && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined
-      if (code !== "ENOENT") return false
-      exists = false
+    const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
+    if (answer === "external") {
+      parsed.resultMetadata = {
+        ...parsed.resultMetadata,
+        correlatedEditCallId: displayCallId,
+      }
+      return false
     }
+    if (answer === "host") return false
 
-    if (exists) {
-      // Do not bypass OpenCode's external-directory permission boundary, even
-      // through a symlink rooted in the workspace.
+    if (answer === "complete") {
       try {
-        const realRoot = fs.realpathSync(workspaceRoot)
-        const realTarget = fs.realpathSync(absolutePath)
-        const relative = path.relative(realRoot, realTarget)
-        if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-          parsed.resultMetadata = {
-            ...parsed.resultMetadata,
-            correlatedEditCallId: displayCallId,
-          }
-          return false
-        }
-
         const frames = buildCompleteEditReadMessages(parsed.id, absolutePath, requestedPath)
         if (!frames) return false
         for (const frame of frames) {
@@ -4369,6 +4357,7 @@ export async function pump(
       }
     }
 
+    // "empty": a missing target.
     try {
       for (const frame of buildExecClientMessages({
         execId: parsed.id,
@@ -6048,11 +6037,12 @@ export async function pump(
         owedPending: owedPendingCount(),
       })
     ) {
-      const toolName = hostToolForCursorEdit(
-        announced.path,
-        fileToolNames(),
-        workspaceRootFromRequestContext(session.requestContext),
-      )
+      const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+      // An edit whose private read goes to the host gets that read as its first
+      // exec, which would close the row as a failed edit.
+      const toolName = cursorEditReadReachesHost(path.resolve(workspaceRoot, announced.path), workspaceRoot)
+        ? undefined
+        : hostToolForCursorEdit(announced.path, fileToolNames(), workspaceRoot)
       if (!toolName) earlyRows.skip(announced.callId)
       else {
         const row: EarlyToolRow = {

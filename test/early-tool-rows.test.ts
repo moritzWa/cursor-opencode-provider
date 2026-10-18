@@ -3,7 +3,12 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { encodeMessage } from "../src/protocol/messages.js"
-import { hostToolForCursorEdit, toolsToDescriptors } from "../src/protocol/tools.js"
+import {
+  cursorEditReadAnswer,
+  cursorEditReadReachesHost,
+  hostToolForCursorEdit,
+  toolsToDescriptors,
+} from "../src/protocol/tools.js"
 import {
   UNBOUND_EXEC_ID,
   cursorEditAnnouncement,
@@ -43,6 +48,46 @@ function partial(callId: string, filePath: string): Uint8Array {
       },
     },
   })
+}
+
+/** Cursor's edit as it arrives: announced, started, then its private read under the edit's call id. */
+function editHandshake(callId: string, target: string, readExecId: number, writeText?: string): Uint8Array[] {
+  const frames = [
+    partial(callId, target),
+    encodeMessage("AgentServerMessage", {
+      interaction_update: {
+        tool_call_started: { call_id: callId, tool_call: { edit_tool_call: { args: { path: target } } } },
+      },
+    }),
+    encodeMessage("AgentServerMessage", {
+      exec_server_message: { id: readExecId, read_args: { path: target, tool_call_id: callId } },
+    }),
+  ]
+  if (writeText !== undefined) {
+    frames.push(encodeMessage("AgentServerMessage", {
+      exec_server_message: {
+        id: readExecId + 1,
+        write_args: { path: target, file_text: writeText, tool_call_id: callId },
+      },
+    }))
+  }
+  return frames
+}
+
+const canChmod = process.platform !== "win32" && process.getuid?.() !== 0
+
+/**
+ * Bun's realpath needs read access to the file and Node's does not, so on Bun
+ * an unreadable file's containment is unproven and it is treated as external.
+ * Either way OpenCode's `read` answers it.
+ */
+function lockedFileAnswer(locked: string): "host" | "external" {
+  try {
+    fs.realpathSync(locked)
+    return "host"
+  } catch {
+    return "external"
+  }
 }
 
 function turnEnded(): Uint8Array {
@@ -104,12 +149,20 @@ async function run(session: CursorSession, parts: any[]): Promise<void> {
 }
 
 describe("hostToolForCursorEdit", () => {
-  it("predicts edit for an existing file, write for a new one, and withholds a patch that would change CRLF", () => {
+  it("predicts edit for an existing file, write for a new or empty one, and withholds a patch that would change CRLF", () => {
     const dir = tempDir()
     const crlf = path.join(dir, "crlf.txt")
     const lf = path.join(dir, "lf.txt")
     fs.writeFileSync(crlf, "a\r\nb\r\n")
     fs.writeFileSync(lf, "a\nb\n")
+    const empty = path.join(dir, "empty.txt")
+    fs.writeFileSync(empty, "")
+    // An empty file has no text for an edit to replace: like a creation, it stays a write.
+    expect(hostToolForCursorEdit(empty, new Set(["edit", "write"]))).toBe("write")
+    expect(hostToolForCursorEdit(empty, new Set(["edit"]))).toBeUndefined()
+    expect(hostToolForCursorEdit(empty, new Set(["write", "patch"]))).toBe("write")
+    expect(hostToolForCursorEdit(empty, new Set(["patch"]))).toBe("patch")
+    expect(hostToolForCursorEdit(empty, new Set(["apply_patch"]))).toBe("apply_patch")
     // A missing file is a creation: it stays a write, else becomes the patch tool's Add File.
     expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit", "write"]))).toBe("write")
     expect(hostToolForCursorEdit(path.join(dir, "missing.txt"), new Set(["edit"]))).toBeUndefined()
@@ -124,6 +177,63 @@ describe("hostToolForCursorEdit", () => {
     expect(hostToolForCursorEdit(dir, new Set(["patch"]))).toBeUndefined()
     expect(hostToolForCursorEdit("relative.txt", new Set(["patch"]))).toBeUndefined()
     expect(hostToolForCursorEdit(lf, new Set(["write"]))).toBeUndefined()
+  })
+})
+
+describe("cursorEditReadAnswer", () => {
+  it("answers workspace files and missing targets itself, and leaves outside or ineligible files to the host", () => {
+    const workspace = tempDir()
+    const inside = path.join(workspace, "inside.txt")
+    const empty = path.join(workspace, "empty.txt")
+    const subdir = path.join(workspace, "dir")
+    const huge = path.join(workspace, "huge.bin")
+    fs.writeFileSync(inside, "one\n")
+    fs.writeFileSync(empty, "")
+    fs.mkdirSync(subdir)
+    // Sparse: one byte over Cursor's 50 MB edit limit without writing it.
+    fs.writeFileSync(huge, "")
+    fs.truncateSync(huge, 50 * 1024 * 1024 + 1)
+    const outsideDir = tempDir()
+    const outside = path.join(outsideDir, "outside.txt")
+    fs.writeFileSync(outside, "one\n")
+    const linkOut = path.join(workspace, "link-out.txt")
+    const linkIn = path.join(outsideDir, "link-in.txt")
+    const dangling = path.join(workspace, "dangling.txt")
+    fs.symlinkSync(outside, linkOut)
+    fs.symlinkSync(inside, linkIn)
+    fs.symlinkSync(path.join(outsideDir, "gone.txt"), dangling)
+    const rootLink = path.join(tempDir(), "workspace-link")
+    fs.symlinkSync(workspace, rootLink)
+
+    const cases: Array<[string, string, string, ReturnType<typeof cursorEditReadAnswer>, boolean]> = [
+      ["regular workspace file", inside, workspace, "complete", false],
+      ["empty workspace file", empty, workspace, "complete", false],
+      ["workspace file through a symlinked root", path.join(rootLink, "inside.txt"), rootLink, "complete", false],
+      ["outside symlink into the workspace", linkIn, workspace, "complete", false],
+      ["missing workspace file", path.join(workspace, "new.txt"), workspace, "empty", false],
+      ["missing outside file", path.join(outsideDir, "new.txt"), workspace, "empty", false],
+      ["existing outside file", outside, workspace, "external", true],
+      ["the workspace's parent", path.dirname(workspace), workspace, "external", false],
+      ["workspace symlink to an outside file", linkOut, workspace, "external", true],
+      // The handshake leaves it to the host; missing-target validation answers it first.
+      ["dangling workspace symlink", dangling, workspace, "external", false],
+      ["workspace directory", subdir, workspace, "host", false],
+      ["file over the edit limit", huge, workspace, "host", true],
+      ["path through a file", path.join(inside, "child"), workspace, "host", false],
+    ]
+    for (const [label, target, root, answer, reachesHost] of cases) {
+      expect({ label, answer: cursorEditReadAnswer(target, root) }).toEqual({ label, answer })
+      expect({ label, reachesHost: cursorEditReadReachesHost(target, root) }).toEqual({ label, reachesHost })
+    }
+  })
+
+  it.skipIf(!canChmod)("leaves a workspace file the provider cannot read to the host", () => {
+    const workspace = tempDir()
+    const locked = path.join(workspace, "locked.txt")
+    fs.writeFileSync(locked, "secret\n")
+    fs.chmodSync(locked, 0o000)
+    expect(cursorEditReadAnswer(locked, workspace)).toBe(lockedFileAnswer(locked))
+    expect(cursorEditReadReachesHost(locked, workspace)).toBe(true)
   })
 })
 
@@ -282,37 +392,160 @@ describe("early edit rows", () => {
     sessionManager.resolve(session.sessionId, 5)
   })
 
-  it("closes the row when the announced call's exec becomes another tool", async () => {
-    const workspace = tempDir()
-    const outside = path.join(tempDir(), "outside.txt")
-    fs.writeFileSync(outside, "one\n")
-    const callId = "edit-outside"
-    const { session, parts } = pumpSession([
-      partial(callId, outside),
-      // Outside the workspace, the edit's private read goes through the host's permission-aware read.
-      encodeMessage("AgentServerMessage", {
-        exec_server_message: { id: 3, read_args: { path: outside, tool_call_id: callId } },
-      }),
-    ], [
-      { name: "read", description: "Read" },
-      { name: "edit", description: "Edit" },
-    ])
-    session.requestContext.env = { workspace_paths: [workspace] }
-    await run(session, parts)
+  // The 1.x and 2.0 file-tool catalogs an edit can be remapped onto.
+  const mutationCatalogs = {
+    "edit and write": ["read", "edit", "write"],
+    "OpenCode 1.x apply_patch": ["read", "apply_patch"],
+    "OpenCode 2 patch": ["read", "patch", "write"],
+  } as const
+  type MutationCatalog = keyof typeof mutationCatalogs
+  const catalogTools = (catalog: MutationCatalog) => mutationCatalogs[catalog].map((name) => ({ name, description: name }))
 
-    const start = parts.find((part) => part.type === "tool-input-start")
-    const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
-    const read = parts.find((part) => part.type === "tool-call" && !part.providerExecuted)
-    expect(start?.toolName).toBe("edit")
-    expect(closed?.toolCallId).toBe(start?.id)
-    expect(read?.toolName).toBe("read")
-    expect(read?.toolCallId.startsWith("cursor_")).toBe(true)
-    sessionManager.resolve(session.sessionId, 3)
-  })
+  // #106: these reads go to OpenCode's permission-aware `read` and end the
+  // step, so a row opened for the edit could only close as a failed edit.
+  const hostReadTargets: Array<{
+    label: string
+    skip?: boolean
+    setup(workspace: string): string
+    /** Only a read whose containment is unproven is upgraded once the host authorizes it. */
+    authorizes(file: string): boolean
+  }> = [
+    {
+      label: "an existing file outside the workspace",
+      setup() {
+        const outside = path.join(tempDir(), "outside.txt")
+        fs.writeFileSync(outside, "one\n")
+        return outside
+      },
+      authorizes: () => true,
+    },
+    {
+      label: "a workspace symlink to an outside file",
+      setup(workspace) {
+        const outside = path.join(tempDir(), "outside.txt")
+        fs.writeFileSync(outside, "one\n")
+        const link = path.join(workspace, "link.txt")
+        fs.symlinkSync(outside, link)
+        return link
+      },
+      authorizes: () => true,
+    },
+    {
+      label: "a workspace file the provider cannot read",
+      skip: !canChmod,
+      setup(workspace) {
+        const locked = path.join(workspace, "locked.txt")
+        fs.writeFileSync(locked, "secret\n")
+        fs.chmodSync(locked, 0o000)
+        return locked
+      },
+      authorizes: (file) => lockedFileAnswer(file) === "external",
+    },
+  ]
+  for (const target of hostReadTargets) {
+    for (const catalog of Object.keys(mutationCatalogs) as MutationCatalog[]) {
+      it.skipIf(!!target.skip)(`opens no row before the host read of ${target.label} (${catalog})`, async () => {
+        const workspace = tempDir()
+        const file = target.setup(workspace)
+        const callId = "edit-host-read"
+        const { session, parts } = pumpSession(editHandshake(callId, file, 3), catalogTools(catalog))
+        session.requestContext.env = { workspace_paths: [workspace] }
+        await run(session, parts)
+
+        expect(parts.filter((part) => part.type === "tool-input-start")).toEqual([])
+        expect(parts.filter((part) => part.type === "tool-call" && part.providerExecuted)).toEqual([])
+        expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+        const calls = parts.filter((part) => part.type === "tool-call")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]).toMatchObject({ toolName: "read" })
+        expect(calls[0].toolCallId.startsWith("cursor_")).toBe(true)
+        // The exec handler made the same decision from the same predicate.
+        expect(session.pending.get(3)?.resultMetadata?.correlatedEditCallId)
+          .toBe(target.authorizes(file) ? callId : undefined)
+        sessionManager.resolve(session.sessionId, 3)
+      })
+    }
+  }
+
+  // The provider answers each of these reads, so the row binds to the edit's mutation.
+  const providerReadTargets: Array<{
+    label: string
+    setup(workspace: string): { root: string; file: string }
+    tool: Record<MutationCatalog, string>
+  }> = [
+    {
+      label: "a regular workspace file",
+      setup(workspace) {
+        const file = path.join(workspace, "notes.txt")
+        fs.writeFileSync(file, "one\n")
+        return { root: workspace, file }
+      },
+      tool: { "edit and write": "edit", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "patch" },
+    },
+    {
+      label: "a workspace file through a symlinked workspace root",
+      setup(workspace) {
+        fs.writeFileSync(path.join(workspace, "notes.txt"), "one\n")
+        const root = path.join(tempDir(), "workspace-link")
+        fs.symlinkSync(workspace, root)
+        return { root, file: path.join(root, "notes.txt") }
+      },
+      tool: { "edit and write": "edit", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "patch" },
+    },
+    {
+      // An empty file has no text to replace, so its whole-file write stays a write.
+      label: "an empty workspace file",
+      setup(workspace) {
+        const file = path.join(workspace, "empty.txt")
+        fs.writeFileSync(file, "")
+        return { root: workspace, file }
+      },
+      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+    },
+    {
+      label: "a new file outside the workspace",
+      setup(workspace) {
+        return { root: workspace, file: path.join(tempDir(), "new.txt") }
+      },
+      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+    },
+    {
+      // Missing-target validation answers its read; Cursor then creates the file.
+      label: "a dangling workspace symlink",
+      setup(workspace) {
+        const file = path.join(workspace, "dangling.txt")
+        fs.symlinkSync(path.join(tempDir(), "gone.txt"), file)
+        return { root: workspace, file }
+      },
+      tool: { "edit and write": "write", "OpenCode 1.x apply_patch": "apply_patch", "OpenCode 2 patch": "write" },
+    },
+  ]
+  for (const target of providerReadTargets) {
+    for (const catalog of Object.keys(mutationCatalogs) as MutationCatalog[]) {
+      it(`keeps the row for ${target.label} and binds it to the edit (${catalog})`, async () => {
+        const { root, file } = target.setup(tempDir())
+        const callId = "edit-provider-read"
+        const { session, parts } = pumpSession(editHandshake(callId, file, 17, "edited\n"), catalogTools(catalog))
+        session.requestContext.env = { workspace_paths: [root] }
+        await run(session, parts)
+
+        const start = parts.find((part) => part.type === "tool-input-start")
+        const calls = parts.filter((part) => part.type === "tool-call")
+        expect(start?.toolName).toBe(target.tool[catalog])
+        expect(start?.id.startsWith("cursor-early_")).toBe(true)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]).toMatchObject({ toolCallId: start?.id, toolName: target.tool[catalog] })
+        expect(calls[0].providerExecuted).toBeUndefined()
+        expect(parts.filter((part) => part.type === "tool-result" && part.isError)).toEqual([])
+        sessionManager.resolve(session.sessionId, 18)
+      })
+    }
+  }
 
   it("closes the row when the exec is a different tool", async () => {
+    const file = existingFile()
     const { session, parts } = pumpSession([
-      partial("edit-1", existingFile()),
+      partial("edit-1", file),
       encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 4, shell_args: { command: "pwd", tool_call_id: "shell-1" } },
       }),
@@ -320,6 +553,7 @@ describe("early edit rows", () => {
       { name: "edit", description: "Edit" },
       { name: "bash", description: "Shell" },
     ])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
     await run(session, parts)
     const start = parts.find((part) => part.type === "tool-input-start")
     const closed = parts.find((part) => part.type === "tool-call" && part.providerExecuted)
@@ -333,11 +567,13 @@ describe("early edit rows", () => {
   })
 
   it("stays open across later text and closes before the step finishes", async () => {
+    const file = existingFile()
     const { session, parts } = pumpSession([
-      partial("edit-1", existingFile()),
+      partial("edit-1", file),
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "still writing" } } }),
       turnEnded(),
     ], [{ name: "edit", description: "Edit" }])
+    session.requestContext.env = { workspace_paths: [path.dirname(file)] }
     await run(session, parts)
     const startAt = parts.findIndex((part) => part.type === "tool-input-start")
     const textAt = parts.findIndex((part) => part.type === "text-delta")
@@ -361,6 +597,7 @@ describe("early edit rows", () => {
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "no row" } } }),
       turnEnded(),
     ], [{ name: "patch", description: "Patch" }])
+    refused.session.requestContext.env = { workspace_paths: [dir] }
     await run(refused.session, refused.parts)
     expect(refused.parts.some((part) => part.type === "tool-input-start")).toBe(false)
 
@@ -369,6 +606,7 @@ describe("early edit rows", () => {
       encodeMessage("AgentServerMessage", { interaction_update: { text_delta: { text: "title" } } }),
       turnEnded(),
     ], [{ name: "edit", description: "Edit" }])
+    lifecycle.session.requestContext.env = { workspace_paths: [dir] }
     lifecycle.session.allowTools = false
     await run(lifecycle.session, lifecycle.parts)
     expect(lifecycle.parts.some((part) => part.type === "tool-input-start")).toBe(false)

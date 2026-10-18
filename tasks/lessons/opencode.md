@@ -163,7 +163,12 @@ These are failure lessons shared by both hosts, not a replacement for
   `test/lost-request-run.test.ts`).
 - **Predict the tool the remap will produce.** An announced edit on a new file
   becomes `write`; predicting `edit` showed a failed row beside every created
-  file (`hostToolForCursorEdit`, `test/early-tool-rows.test.ts`).
+  file. An empty file has no text to replace, so it stays `write` too. A
+  prediction also needs the exec's first step: an edit of a file outside the
+  workspace sends its private read to OpenCode's `read`, which closed the row
+  as a failed edit on 193 of 530 edits in a day (#106). Decide both from one
+  predicate (`hostToolForCursorEdit`, `cursorEditReadReachesHost`,
+  `test/early-tool-rows.test.ts`).
 - **Silence of model text is not inactivity.** A large tool input arrived as
   heartbeats/token counts for minutes; renew semantic liveness on every inbound
   frame. Pending real execs also need the CLI's three-second client heartbeats,

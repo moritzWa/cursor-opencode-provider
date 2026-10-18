@@ -186,8 +186,9 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
   in order for the pump. Recheck queued aborts after registering their exec.
   Preserve iterator ownership across timeouts and handoffs.
 - Respect `tool_requests_listed` when emitting parallel calls. Early edit rows
-  predict the remapped host tool, close if no exec arrives, and retain routing
-  after Run closure/restart so a late result can rebuild from history.
+  predict the remapped host tool, open none when the edit's private read goes
+  to the host, close if no exec arrives, and retain routing after Run
+  closure/restart so a late result can rebuild from history.
 - Drain a held Run before a fresh user turn. Rebuild late tool results from
   host history; checkpoint resume would request the tool again. Never replay
   side effects after the replay barrier or treat EOF as successful `stop`.
