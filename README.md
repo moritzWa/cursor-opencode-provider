@@ -250,6 +250,13 @@ const model = cursor.languageModel("composer-2.5")
 
 Give one credential source. The provider uses the first present and never falls back from one to another: `getAccessToken` (an async function returning the current access token, called for every Run so a long-running process can renew its login; it receives `{ forceRefresh: true }` once after Cursor rejects a token), then `accessToken` (a JWT sent as-is, never renewed), then `apiKey` (a raw `crsr_...` key, exchanged for a JWT and exchanged again near its expiry, the way Cursor CLI renews an API-key login). Optional: `apiBaseURL`, `agentBaseURL`, `cacheDir`, `headers`, `telemetryEnabled`, `retry`, and `continuation`. `cacheDir` pins the host cache root for model/version caches and Cursor project metadata; when omitted, the provider uses an injected structural host path bridge or the native OpenCode XDG cache described in [Paths](#paths-host-cache). Transient failures resume from the latest checkpoint produced by that Run, matching Cursor CLI; without an eligible checkpoint, retries remain limited to replay-safe attempts so completed text or tool work is not duplicated. Once that budget is spent, or replay is unsafe, the terminal error does not re-arm OpenCode's outer retry loop. Pending-tool inactivity is renewed by OpenCode activity from the session or its descendants. The older `baseURL` option is still accepted as a legacy alias for `agentBaseURL`.
 
+### Shell results
+
+A failed host shell call reaches Cursor once as stderr in streamed and unary
+results. Distinct partial command output remains on stdout. See the
+[1.x shell guide](docs/opencode-1.md#shell-failures-and-interruption) and
+[2.0 tool guide](docs/opencode-2.md#feature-parity-vs-the-classic-plugin).
+
 ### Runtime folders
 
 `agent-tools/` and `terminals/` live under the provider's per-workspace project

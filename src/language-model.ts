@@ -3362,12 +3362,17 @@ async function deliverContinuationResultsNow(
           })]
         }
         if (frames.length === 0) {
-          const images = r.error ? [] : execResultImages(pending.resultField, r.images)
+          const error = r.error ?? shellResult?.error
+          const images = error ? [] : execResultImages(pending.resultField, r.images)
+          // A failed host tool reports one text as both output and error. Include
+          // failures captured by the shell hook when the SDK keeps only text.
+          // Distinct partial command output still belongs on stdout.
+          const failureText = shellResult !== undefined && error !== undefined && r.output === error
           frames = buildExecClientMessages({
             execId: r.execId,
             resultField: pending.resultField,
-            output: shellResult?.output ?? r.output,
-            error: r.error ?? shellResult?.error,
+            output: failureText ? "" : shellResult?.output ?? r.output,
+            error,
             refusal: r.refusal,
             interrupted: r.interrupted,
             toolName: pending.toolName ?? r.toolName,

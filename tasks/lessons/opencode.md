@@ -247,9 +247,15 @@ These are failure lessons shared by both hosts, not a replacement for
   Check the host projections before the encoder too: secondary display cleanup
   must respect the captured native exit, and failed shell streams must retain
   partial stdout (`test/plugin.test.ts`, `test/plugin-opencode2.test.ts`,
-  `test/continuation-session.test.ts`). Private wrapper cleanup removes exactly
-  the launcher's separator, preserving spaces, CRLF, blank lines and literal
-  placeholders (`test/shell-timeout.test.ts`).
+  `test/continuation-session.test.ts`). A failed host tool's single text is
+  both `output` and `error`; sending both put it in stdout and stderr
+  ([#101](https://github.com/oakimov/cursor-opencode-provider/issues/101)).
+  Deduplicate against the effective error, including a shell-hook failure when
+  the SDK retains only text; keep distinct partial output on stdout
+  (`test/continuation-session.test.ts`).
+  Like Cursor CLI, stdout is only what the command printed. Private wrapper
+  cleanup removes exactly the launcher's separator, preserving spaces, CRLF,
+  blank lines and literal placeholders (`test/shell-timeout.test.ts`).
 - **Keep occupancy, work and money separate.** Hosts replace message tokens but
   add step costs; Run-wide generation inflated tok/s. Use checkpoint occupancy,
   retain stale markers, and keep raw counters distinct from synthetic billing
@@ -370,7 +376,9 @@ These are failure lessons shared by both hosts, not a replacement for
   include Bun editor types (`scripts/strip-copied-coverage.ts`).
 - **Keep one current policy across docs and prompts.** A rebase can add review
   rules; reviewer patches still need whole-path validation. Changelog fixes
-  compare with the release, not an intermediate PR state. Concurrent Unreleased
+  compare with the release, not an intermediate PR state. A dated version
+  heading is not proof of publication: retain entries in the maintainer-designated
+  upcoming release instead of moving them to Unreleased. Concurrent Unreleased
   insertions can conflict despite independent code; compare the union of entries
   after each dependency merge. Keep AGENTS.md to
   current invariants and source pointers; merge incident rationale here or in
