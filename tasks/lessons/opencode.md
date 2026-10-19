@@ -38,7 +38,9 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Preserve semantics, not names.** Similar tools can differ in merge behavior,
   required fields or execution language. Normalize before validation; a file
   tool once accepted a shell command and silently returned a listing
-  (`test/tools.test.ts`).
+  (`test/tools.test.ts`). Rebuilt file-tool arguments must still carry
+  `command`, or the misplaced-shell refusal never sees it and the model is told
+  only that `pattern` is missing (`mapCursorArgsToOpencode`).
 - **Translate from permitted capabilities.** Patch substitution and Task routing
   failed when fixed tool names outlived a model/catalog change. Read the current
   turn, preserving native operations when permitted (`remapEditToolsForCatalog`,
@@ -121,6 +123,13 @@ These are failure lessons shared by both hosts, not a replacement for
   close the actual stream so its session ref is released. Test child-process
   exit with idle and blocked requests, including end then destroy
   (`test/session-exit.test.ts`, `test/node-http2-drain.mjs`).
+  That CANCEL also fires `aborted` on Node and Bun while the request side is
+  open, so every ordinary turn-end close logged "aborted by remote" and sent a
+  self-verify run chasing a nonexistent server reset. Bun 1.3 (OpenCode 2.0's
+  runtime) also emits `error` for it while the response is open; a test run on
+  a newer Bun missed that. Stream events do not say who closed; check the
+  local-close flag, and run transport checks on the host's runtime too
+  (`test/run-close-trace.test.ts`).
 - **The shared session can reject an otherwise valid Run.** Unsent sibling DATA
   exceeded the runtime's default 10 MB memory accounting and refused new Runs
   with `ENHANCE_YOUR_CALM`; Node could also reject one large upload. Verify the
@@ -251,7 +260,38 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Approval must reach the host's next turn.** Flipping only Cursor mode did
   not start implementation. Queue the native switch after successful delivery
   and a terminal Run; serialize callbacks so an older one cannot erase a newer
-  request (`test/switch-mode.test.ts`).
+  request. An emulated CreatePlan approval kept pumping under the plan agent
+  and asked again before reaching that boundary. Cancel the old Run just as
+  for plan entry, drain its terminal acknowledgment, and refuse late host
+  calls before starting build (`test/switch-mode.test.ts`,
+  `test/create-plan.test.ts`).
+- **Native execution does not imply a top-level function.** After a successful
+  SwitchMode lookup, PR #111 still insisted on a direct call and prohibited
+  CallDynamicTool. The captured Run advertised dynamic invocation, never raised
+  a switch interaction, and reported planning and images unavailable. Follow
+  the supplied route; discovery does not install a function. String assertions
+  had enforced the wrong contract; require an actual invocation, interaction,
+  handoff and displayed plan (`buildOpenCodeInteractionGuidance`,
+  `test/prompt-history.test.ts`, `docs/host-compat-acceptance.md`).
+- **A session edit deny outlasts plan approval.** The last session `edit` rule
+  on `*` is read from the session payload on both entrypoints. CreatePlan still
+  writes and shows the plan, then returns the not-approved error and does not
+  ask or switch agents. A plan-path allow does not clear `*`. A plan-agent
+  catalog that merely omits edit still asks (`sessionRulesDenyEdits`,
+  `resolveCreatePlanBridge`, `test/session-edits.test.ts`,
+  `test/create-plan.test.ts`, `test/plugin.test.ts`,
+  `test/plugin-opencode2.test.ts`). Read native 1.x `permission` rules as well
+  as 2.0 `permissions`; retry before evaluating and reuse that payload for the
+  plan path. A failed lookup is not an empty ruleset, and lifted rules must
+  clear a previous request's deny marker. A saved denied plan is still a
+  stateful replay barrier (`test/create-plan.test.ts`). Carry explicit deny
+  and no-deny guidance chronologically, including on held continuations:
+  merely clearing a boolean leaves an old checkpoint reminder authoritative
+  (`test/host-notes-run.test.ts`). Send no-deny guidance only when it replaces
+  a deny Cursor may hold: stating it on every request injected it after each
+  tool step of a session that never had a deny (`sessionEditsGuidance`). Place current permission guidance after all
+  carried notes too: queued or unacknowledged injections can restore an older
+  deny after restart; retain unrelated notes and the frozen baseline.
 - **Lifecycle interactions must not mutate state.** Hard SwitchMode rejection
   polluted the real turn; soft-ack it without changing mode. Do not let a title
   turn write a plan (`test/switch-mode.test.ts`).
@@ -335,6 +375,13 @@ These are failure lessons shared by both hosts, not a replacement for
   double-counted footer token created false validations. An aggregate cache
   ratio cannot locate a miss; compare identities, hashes and categories, and
   preserve zero counters ([runbook](../../docs/cache-log-runbook.md)).
+  A plan-handoff cancel ends its Run without TurnEnded, so it logged no
+  diagnosis, and a self-verify run blamed its warm Run on the previous Run's
+  `coldReason`. Its final checkpoint reports `used_tokens=0`; the next Run
+  decoded that as prior occupancy and showed no cached prefix. Emit the
+  diagnosis with counters unavailable, and treat a zero-token checkpoint as
+  missing occupancy (`test/switch-mode.test.ts`,
+  `test/checkpoint-occupancy-run.test.ts`).
 
 ## Persistence and process lifetime
 

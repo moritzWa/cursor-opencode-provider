@@ -2,6 +2,7 @@ import {
   CURSOR_PROVIDER_ID,
   CURSOR_COMPACTION_OPTION,
   CURSOR_HOST_AGENT_OPTION,
+  CURSOR_SESSION_EDITS_DENIED_OPTION,
 } from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
@@ -45,6 +46,7 @@ import { markCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
+import { loadSessionForPermissions, sessionRulesDenyEdits } from "./protocol/session-edits.js"
 import {
   cancelHostAgentModeSwitch,
   hostAgentSwitchPromptText,
@@ -201,6 +203,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }
     }
 
+    // Set once the host event stream is open; a switch waits on it below.
+    let hostEventsObserved = false
     if (typeof ctx.session.switchAgent === "function") {
       const switchAgent = ctx.session.switchAgent
       const continueTurn =
@@ -215,10 +219,28 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             || normalizeSwitchModeId(targetModeID) === "spec"
             ? "plan"
             : "build"
-          await switchAgent({ sessionID, agent })
+          // OpenCode answers a plan/build switch with a synthetic note from an
+          // event subscriber. Continuing before that note is enqueued lets it
+          // miss the first step's promotion, so the host writes its per-request
+          // copy too and both land at the next step. Wait for the host's note.
+          const reaction = continueTurn && hostEventsObserved
+            ? waitForHostSwitchReaction(sessionID, HOST_SWITCH_REACTION_TIMEOUT_MS)
+            : undefined
+          try {
+            await switchAgent({ sessionID, agent })
+          } catch (error) {
+            reaction?.cancel()
+            throw error
+          }
           // switchAgent only publishes AgentSelected and leaves the session idle.
           // Continue under the new agent the same way OpenCode 1.x promptAsync does.
           if (continueTurn) {
+            if (reaction) {
+              trace(
+                `host-agent-mode: ${await reaction.reacted ? "host enqueued its" : "no host"} switch note ` +
+                  `sessionID=${sessionID} agent=${agent}`,
+              )
+            }
             await continueTurn({
               sessionID,
               text: hostAgentSwitchPromptText(agent),
@@ -475,9 +497,11 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       try {
         const info = await ctx.session.get({ sessionID })
         markSessionDirectory(sessionID, info.location.directory)
+        return info
       } catch (error) {
         // Best effort — falls back to the static workspaceRoot above.
         trace(`session directory: session.get failed sessionID=${sessionID}: ${String(error)}`)
+        return undefined
       }
     }
 
@@ -487,6 +511,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         markCompactionAndOptions(event, event.agent === "compaction")
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
+        delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
         if (event.agent !== "compaction") {
           const activeMode = getActiveCursorMode(event.sessionID)
           if (event.agent === "plan") {
@@ -500,7 +525,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             setActiveCursorMode(event.sessionID, "agent")
           }
         }
-        await rememberSessionDirectory(event.sessionID)
+        const info = await loadSessionForPermissions(() => ctx.session.get({ sessionID: event.sessionID }))
+        markSessionDirectory(event.sessionID, info.location.directory)
+        event.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = sessionRulesDenyEdits(info.permissions)
       }),
     )
 
@@ -633,7 +660,11 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       credentialGeneration++
     }
 
-    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, releasePermissionCalls)
+    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, () => {
+      hostEventsObserved = false
+      releasePermissionCalls()
+    })
+    hostEventsObserved = !!unsubscribe
 
     return async () => {
       clearInterval(retry)
@@ -665,6 +696,33 @@ async function saveOpenTurnsForShutdown(): Promise<void> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** Upper bound on waiting for the host's note after a native agent switch. */
+const HOST_SWITCH_REACTION_TIMEOUT_MS = 1_000
+
+/** Native agent switches waiting for the host's next synthetic inbox item, per session. */
+const switchReactionWaiters = new Map<string, Set<() => void>>()
+
+function waitForHostSwitchReaction(
+  sessionID: string,
+  timeoutMs: number,
+): { reacted: Promise<boolean>; cancel(): void } {
+  let settle!: (reacted: boolean) => void
+  const reacted = new Promise<boolean>((resolve) => { settle = resolve })
+  const waiters = switchReactionWaiters.get(sessionID) ?? new Set<() => void>()
+  switchReactionWaiters.set(sessionID, waiters)
+  const done = (value: boolean) => {
+    clearTimeout(timer)
+    waiters.delete(onReaction)
+    if (waiters.size === 0 && switchReactionWaiters.get(sessionID) === waiters) switchReactionWaiters.delete(sessionID)
+    settle(value)
+  }
+  const onReaction = () => done(true)
+  const timer = setTimeout(() => done(false), timeoutMs)
+  timer.unref?.()
+  waiters.add(onReaction)
+  return { reacted, cancel: () => done(false) }
 }
 
 function subscribeSessionActivity(
@@ -751,6 +809,9 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
     case "session.inbox.enqueued": {
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
+      if (typeof id === "string" && payload?.item?.type === "synthetic") {
+        for (const reacted of [...(switchReactionWaiters.get(id) ?? [])]) reacted()
+      }
       const steer = inboxSteer(id, payload?.inboxID, payload?.item)
       if (!steer) break
       if (payload.item.delivery === "steer") announceInboxSteer(steer)

@@ -251,11 +251,29 @@ and [acceptance checks](host-compat-acceptance.md#opencode-2-early-steers-and-st
 
 ## Planning and prompt ownership
 
+Cursor tools use their advertised invocation route. A supplied top-level
+function is called directly; a SwitchMode, CreatePlan or GenerateImage listed
+in a dynamic namespace is discovered and invoked through GetDynamicTools /
+CallDynamicTool with its namespace, tool name and arguments. Discovery alone
+does not invoke the tool or install a new top-level function.
+
+An approved CreatePlan review ends the old plan Run before the host switches
+to its build agent and continues implementation. Declining leaves it in plan.
+
 OpenCode 2 owns its full system prompt and its vendor-maintained Plan agent. The provider forwards the host prompt verbatim as Cursor's always-apply system-instructions rule (Cursor does not follow a client-seeded `system` message); it does not copy or replace the 2.0 prompt templates. Provider-added guidance is limited to protocol facts the host cannot know, such as Cursor interaction bridging and the advertised direct tool catalog.
 
 MCP tools whose server did not set `"codemode": true` are on the direct catalog and are called by name. `execute` remains Code Mode for tools that are still absent from that list, including an explicit `"codemode": true` server and OpenCode's own Code Mode tools. Cursor calls `execute` with `{ code }` and uses the exact paths and signatures from the host Code Mode catalog (or its `search` function). OpenCode still applies its own tool availability and permission checks when `execute` runs.
 
-When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 2's `plan` primary agent after the current Cursor Run has safely ended. Approved non-plan targets select `build`. While the session runs the `plan` agent and no native `plan_exit` tool exists, a Cursor SwitchMode out of plan mode is declined with a pointer to CreatePlan, whose `question` prompt is the approval to start implementing (without `question`, the user switches agents). A user switching agents in the OpenCode UI follows the same state path because `session.hook("context")` carries the active agent into the provider.
+When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 2's `plan` primary agent after the current Cursor Run has safely ended. Approved non-plan targets select `build`. While the session runs the `plan` agent and no native `plan_exit` tool exists, a Cursor SwitchMode out of plan mode is declined with a pointer to CreatePlan, whose `question` prompt is the approval to start implementing (without `question`, the user switches agents). A user switching agents in the OpenCode UI follows the same state path because `session.hook("context")` carries the active agent into the provider. After its own switch the plugin waits briefly for OpenCode's plan-mode note before continuing the turn, so that note is written once.
+
+A session-wide edit deny keeps a saved plan from approving implementation or
+switching to build, even if edits to the plan file are allowed. Change that
+session rule in the client first. The plugin reads current `permissions` on
+each context request, retries a failed lookup once, and stops the request if
+the rules remain unreadable.
+Current rule reminders also reach held tool continuations. Lifting a deny
+supersedes its earlier reminder while preserving normal plan approval. Without
+a deny to supersede, no rule reminder is sent.
 
 An OpenCode agent or system-prompt change keeps the sticky Cursor conversation, as Cursor CLI keeps its conversation across mode flips. The conversation's first system context stays frozen as the system-instructions rule, so the prompt cache survives; the new agent and the changed host instructions arrive as a Mid-Conversation System Message on the next user turn, which the model follows. The host agent and prompt hash are persisted with the checkpoint for diagnostics only. Ephemeral title/generation calls do not alter that identity.
 

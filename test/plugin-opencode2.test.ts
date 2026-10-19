@@ -596,6 +596,7 @@ function fakeContext(events: readonly unknown[] = []) {
 
   let activeConnection: any = undefined
   const sessionLocations = new Map<string, string>()
+  const sessionPermissions = new Map<string, unknown>()
 
   const ctx: any = {
     app: { name: "opencode", version: "2.0", channel: "latest" },
@@ -621,7 +622,12 @@ function fakeContext(events: readonly unknown[] = []) {
       get: async ({ sessionID }: { sessionID: string }) => {
         const directory = sessionLocations.get(sessionID)
         if (!directory) throw new Error(`no fake location for session ${sessionID}`)
-        return { id: sessionID, location: { directory } }
+        const permissions = sessionPermissions.get(sessionID)
+        return {
+          id: sessionID,
+          location: { directory },
+          ...(permissions !== undefined ? { permissions } : {}),
+        }
       },
       switchAgent: async () => {},
       synthetic: async () => ({}),
@@ -646,7 +652,7 @@ function fakeContext(events: readonly unknown[] = []) {
     transform: transformDomain("tool").transform,
   }
 
-  return { ctx, registered, disposed, hooks, transforms, sessionLocations, reloads, inventory }
+  return { ctx, registered, disposed, hooks, transforms, sessionLocations, sessionPermissions, reloads, inventory }
 }
 
 describe("opencode2 setup", () => {
@@ -1300,6 +1306,55 @@ describe("opencode2 setup", () => {
     expect(getActiveCursorMode("s-plan-agent")).toBe("chat")
   })
 
+  test("the session context sets the edit-deny option from session permissions", async () => {
+    const { ctx, hooks, sessionLocations, sessionPermissions } = fakeContext()
+    sessionLocations.set("s-deny", "/proj")
+    sessionLocations.set("s-allow", "/proj")
+    sessionLocations.set("s-plain", "/proj")
+    sessionPermissions.set("s-deny", [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "/plans/*", effect: "allow" },
+    ])
+    sessionPermissions.set("s-allow", [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "*", effect: "allow" },
+    ])
+    await setupPlugin(ctx)
+
+    const denied: any = { sessionID: "s-deny", agent: "plan", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(denied)
+    expect(denied.options.opencodeSessionEditsDenied).toBe(true)
+
+    sessionPermissions.set("s-deny", [{ action: "edit", resource: "*", effect: "allow" }])
+    await hooks.get("session.context")!(denied)
+    expect(denied.options.opencodeSessionEditsDenied).toBe(false)
+
+    const allowed: any = { sessionID: "s-allow", agent: "build", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(allowed)
+    expect(allowed.options.opencodeSessionEditsDenied).toBe(false)
+
+    const plain: any = { sessionID: "s-plain", agent: "build", model: { providerID: "cursor" }, options: {} }
+    await hooks.get("session.context")!(plain)
+    expect(plain.options.opencodeSessionEditsDenied).toBe(false)
+    expect(plain.options.opencodeHostAgent).toBe("build")
+  })
+
+  test("session context retries permission lookup and fails when the rules cannot be read", async () => {
+    const { ctx, hooks } = fakeContext()
+    let reads = 0
+    ctx.session.get = async () => {
+      if (++reads === 1) throw new Error("not ready")
+      return { id: "s-retry", location: { directory: "/proj" }, permissions: [{ action: "edit", resource: "*", effect: "deny" }] }
+    }
+    await setupPlugin(ctx)
+    const event = { sessionID: "s-retry", agent: "plan", options: {} as Record<string, unknown> }
+    await hooks.get("session.context")!(event)
+    expect(reads).toBe(2)
+    expect(event.options.opencodeSessionEditsDenied).toBe(true)
+    ctx.session.get = async () => { throw new Error("session unavailable") }
+    await expect(hooks.get("session.context")!(event)).rejects.toThrow("session unavailable")
+  })
+
   test("the session hook records the session's real directory, not the daemon cwd", async () => {
     clearSessionDirectories()
     const { ctx, hooks, sessionLocations } = fakeContext()
@@ -1457,13 +1512,14 @@ describe("opencode2 setup", () => {
     expect(getSessionDirectory("s-other")).toBeUndefined()
   })
 
-  test("a failed session lookup does not throw and leaves the directory unset", async () => {
+  test("a failed permission lookup stops session context and leaves the directory unset", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
-    await hook({ sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" } })
+    await expect(hook({ sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" } }))
+      .rejects.toThrow("no fake location")
 
     expect(getSessionDirectory("s-unknown")).toBeUndefined()
   })
@@ -1507,6 +1563,70 @@ describe("opencode2 setup", () => {
 
     await cleanup()
     expect(queueHostAgentModeSwitch({ sessionID: "s-mode", targetModeID: "plan" })).toBe(false)
+  })
+
+  // A host event stream the test feeds while the plugin runs.
+  function liveEvents() {
+    const queue: unknown[] = []
+    let wake: (() => void) | undefined
+    return {
+      subscribe: ({ signal }: { signal?: AbortSignal } = {}) => (async function* () {
+        const aborted = new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }))
+        while (!signal?.aborted) {
+          while (queue.length) yield queue.shift()
+          await Promise.race([new Promise<void>((resolve) => { wake = resolve }), aborted])
+        }
+      })(),
+      push(event: unknown) {
+        queue.push(event)
+        wake?.()
+      },
+    }
+  }
+
+  test("continues a native switch after the host enqueues its switch note", async () => {
+    const { ctx } = fakeContext()
+    const events = liveEvents()
+    ctx.event.subscribe = events.subscribe
+    const order: string[] = []
+    ctx.session.switchAgent = async ({ sessionID, agent }: { sessionID: string; agent: string }) => {
+      order.push(`switch:${agent}`)
+      // OpenCode's plan agent enqueues its note from an event subscriber, after the switch returns.
+      setTimeout(() => {
+        order.push("host-note")
+        events.push({
+          type: "session.inbox.enqueued",
+          data: { sessionID, inboxID: "msg_note", item: { type: "synthetic", delivery: "steer", payload: { text: "note" } } },
+        })
+      }, 30)
+    }
+    ctx.session.synthetic = async () => {
+      order.push("continue")
+      return {}
+    }
+    await setupPlugin(ctx)
+
+    expect(queueHostAgentModeSwitch({ sessionID: "s-note", targetModeID: "plan", cursorSessionID: "run" })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-note", { cursorSessionID: "run", terminal: true })).toBe(true)
+    expect(order).toEqual(["switch:plan", "host-note", "continue"])
+  })
+
+  test("continues a native switch when the host enqueues no note", async () => {
+    const { ctx } = fakeContext()
+    ctx.event.subscribe = liveEvents().subscribe
+    const continued: number[] = []
+    ctx.session.switchAgent = async () => {}
+    ctx.session.synthetic = async () => {
+      continued.push(Date.now())
+      return {}
+    }
+    await setupPlugin(ctx)
+
+    const started = Date.now()
+    expect(queueHostAgentModeSwitch({ sessionID: "s-quiet", targetModeID: "agent", cursorSessionID: "run" })).toBe(true)
+    expect(await flushHostAgentModeSwitch("s-quiet", { cursorSessionID: "run", terminal: true })).toBe(true)
+    expect(continued).toHaveLength(1)
+    expect(continued[0]! - started).toBeLessThan(3_000)
   })
 
   test("disposing an older setup keeps the switch and Plan directory of a newer one", async () => {

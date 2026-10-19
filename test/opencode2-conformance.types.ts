@@ -140,11 +140,12 @@ void (() =>
 void (async () => {
   const info = await ctx.session.get({ sessionID: "s" })
   const directory: string = info.location.directory
+  const permissions = info.permissions
   const loc: string = ctx.location.directory
   await ctx.session.switchAgent({ sessionID: "s", agent: "build" })
   await ctx.session.synthetic({ sessionID: "s", text: "go" })
   await ctx.session.prompt({ sessionID: "s", text: "go" })
-  void [directory, loc]
+  void [directory, permissions, loc]
 })
 
 void (() =>

@@ -1621,6 +1621,12 @@ function shellStreamResultMetadata(raw: Record<string, unknown>): Record<string,
   }
 }
 
+/** Rebuilt file-tool args drop unknown keys; a shell command must survive that. */
+function copyShellCommand(args: Record<string, unknown>, cleaned: Record<string, unknown>): void {
+  const command = str(cleaned.command)
+  if (command) args.command = command
+}
+
 /**
  * Remap Cursor exec / MCP arg shapes onto OpenCode's Effect Schema keys.
  * Without this, OpenCode rejects calls with InvalidArgumentsError
@@ -1645,7 +1651,9 @@ export function mapCursorArgsToOpencode(
   // Native ls_args → OpenCode read (directory listing via read).
   if (execVariant === "ls_args") {
     const filePath = str(cleaned.path) ?? str(cleaned.filePath)
-    return { toolName: "read", args: filePath ? { [dialect.filePathKey]: filePath } : {} }
+    const args: Record<string, unknown> = filePath ? { [dialect.filePathKey]: filePath } : {}
+    copyShellCommand(args, cleaned)
+    return { toolName: "read", args }
   }
 
   // F11: Cursor native delete_args → OpenCode bash. No delete builtin exists, so
@@ -1669,6 +1677,7 @@ export function mapCursorArgsToOpencode(
       if (offset !== undefined && offset > 0) args.offset = offset
       const limit = num(cleaned.limit)
       if (limit !== undefined && limit > 0) args.limit = limit
+      copyShellCommand(args, cleaned)
       return { toolName: "read", args }
     }
     case "write": {
@@ -1685,6 +1694,7 @@ export function mapCursorArgsToOpencode(
         if (content === undefined) {
           // Binary. Surface the raw bytes to the caller instead of a lossy
           // decode; `binaryWritePayload` picks them up after parsing.
+          copyShellCommand(args, cleaned)
           return { toolName: "write", args, binaryBytes: bytes }
         }
       } else {
@@ -1695,6 +1705,7 @@ export function mapCursorArgsToOpencode(
           ?? stringValue(cleaned.text)
       }
       if (content !== undefined) args.content = content
+      copyShellCommand(args, cleaned)
       return { toolName: "write", args }
     }
     case "edit": {
@@ -1702,7 +1713,9 @@ export function mapCursorArgsToOpencode(
       // accepts that generic shape; rebuilding only OpenCode's targeted fields
       // would silently turn a valid call into `{}`.
       if (typeof cleaned.input === "string") {
-        return { toolName: "edit", args: { input: cleaned.input } }
+        const args: Record<string, unknown> = { input: cleaned.input }
+        copyShellCommand(args, cleaned)
+        return { toolName: "edit", args }
       }
       const args: Record<string, unknown> = {}
       const filePath = str(cleaned.filePath) ?? str(cleaned.path) ?? str(cleaned.file_path)
@@ -1712,6 +1725,7 @@ export function mapCursorArgsToOpencode(
       const newString = stringValue(cleaned.newString) ?? stringValue(cleaned.new_string)
       if (newString !== undefined) args.newString = newString
       if (typeof cleaned.replaceAll === "boolean") args.replaceAll = cleaned.replaceAll
+      copyShellCommand(args, cleaned)
       return { toolName: "edit", args }
     }
     case "bash":
@@ -1743,14 +1757,18 @@ export function mapCursorArgsToOpencode(
       // (e.g. "**/*") when the model is really listing files. OpenCode's grep
       // requires a non-empty string pattern — remap to glob instead of
       // forwarding a call that will fail and loop.
-      if (!pattern) {
+      // A shell command is not a file listing. Inventing `**/*` here would run
+      // glob and hide the command from the misplaced-shell refusal.
+      if (!pattern && !str(cleaned.command)) {
         const args: Record<string, unknown> = { pattern: include ?? "**/*" }
         if (path) args.path = path
         return { toolName: "glob", args }
       }
-      const args: Record<string, unknown> = { pattern }
+      const args: Record<string, unknown> = {}
+      if (pattern) args.pattern = pattern
       if (path) args.path = path
-      if (include) args.include = include
+      if (include && pattern) args.include = include
+      copyShellCommand(args, cleaned)
       return { toolName: "grep", args }
     }
     case "glob": {
@@ -1759,6 +1777,7 @@ export function mapCursorArgsToOpencode(
       if (pattern) args.pattern = pattern
       const path = str(cleaned.path) ?? str(cleaned.target_directory) ?? str(cleaned.targetDirectory)
       if (path) args.path = path
+      copyShellCommand(args, cleaned)
       return { toolName: "glob", args }
     }
     case "skill": {

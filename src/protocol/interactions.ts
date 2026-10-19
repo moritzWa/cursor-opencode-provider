@@ -15,8 +15,9 @@ import {
   CURSOR_PLAN_STAGE_TOOL,
   type CreatePlanBridge,
   type DecodedCreatePlanQuery,
-  decodeCreatePlanQuery,
   createPlanApprovalQuestionInput,
+  createPlanSessionEditsDeniedReason,
+  decodeCreatePlanQuery,
   renderPlanReviewMessage,
   resolveCreatePlanBridge,
   writeOpencodePlanFile,
@@ -114,6 +115,12 @@ export type HandledInteraction = {
    * instead. Nothing was written, so its display must not be mirrored as a plan.
    */
   deferredCreatePlanToolCallId?: string
+  /**
+   * Plan text for the assistant transcript when the plan was written without a
+   * host review tool. A session edit deny uses this: the user still sees the
+   * plan, and Cursor receives the not-approved error.
+   */
+  planReview?: string
   /** Present when an image generation was approved: the target to expect. */
   generateImage?: DecodedGenerateImageQuery
 }
@@ -161,6 +168,8 @@ export type HandleInteractionQueryOptions = {
    * handler and keeping the host's plan review from running twice.
    */
   activeCursorModeId?: string
+  /** The session's last `edit` rule on `*` is deny. */
+  sessionEditsDenied?: boolean
 }
 
 export class UnsupportedInteractionQueryError extends Error {
@@ -379,6 +388,7 @@ function handleSwitchModeQuery(
     advertised: options.advertisedTools ?? [],
     ...(options.activeCursorModeId ? { activeModeId: options.activeCursorModeId } : {}),
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
+    ...(options.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
   })
   if (bridge.kind === "reject") return reject(bridge.reason)
 
@@ -508,6 +518,7 @@ function handleCreatePlanQuery(
     ...(options.hostAgent ? { hostAgent: options.hostAgent } : {}),
     planModeActive: options.planModeActive === true,
     ...(options.hostPlanFile ? { hostPlanFile: options.hostPlanFile } : {}),
+    ...(options.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
   })
 
   // The host's plan agent records and reviews the plan; write nothing here.
@@ -548,6 +559,29 @@ function handleCreatePlanQuery(
       outcome: "bridged",
       createPlan: { ...decoded, bridge, toolName: CURSOR_PLAN_STAGE_TOOL },
       reply: undefined,
+    }
+  }
+
+  // The session rule still denies edits. Keep the plan and show it, and tell
+  // Cursor execution was not approved. Do not ask: the answer cannot lift it.
+  if (bridge.kind === "hold") {
+    const workspaceRoot = options.workspaceRoot?.trim()
+    if (!workspaceRoot) {
+      return reply({
+        error: { error: "CreatePlan requires a workspace root to write the plan file" },
+        plan_uri: "",
+      })
+    }
+    const written = writeOpencodePlanFile(decoded.args, workspaceRoot, Date.now(), options.hostPlanFile)
+    if (!written.ok) {
+      return reply({ error: { error: written.error }, plan_uri: "" })
+    }
+    return {
+      ...reply({
+        error: { error: createPlanSessionEditsDeniedReason(written.planPath) },
+        plan_uri: "",
+      }),
+      planReview: renderPlanReviewMessage(written.markdown, written.planPath),
     }
   }
 

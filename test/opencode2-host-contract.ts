@@ -202,6 +202,11 @@ export type HostPluginContext = {
     readonly get: (input: { sessionID: string }) => Promise<{
       readonly id: string
       readonly location: { readonly directory: string }
+      readonly permissions?: readonly {
+        readonly action: string
+        readonly resource: string
+        readonly effect: "allow" | "deny" | "ask"
+      }[]
     }>
     readonly switchAgent: (input: { sessionID: string; agent: string }) => Promise<void>
     readonly synthetic: (input: {

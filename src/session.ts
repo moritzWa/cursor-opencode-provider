@@ -267,6 +267,8 @@ export type CursorSession = {
   stoppedWithSessionId?: string
   /** Host primary agent whose prompt/permissions this Run was seeded with. */
   hostAgent?: string
+  /** The session's last `edit` rule on `*` was deny when this request started. */
+  sessionEditsDenied?: boolean
   /** Stable host-system + provider-guidance identity for restart validation. */
   stableSystemPromptHash?: string
   /** Fresh turn resumed from a stored checkpoint; a blob miss may reseed it. */

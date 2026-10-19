@@ -1,4 +1,5 @@
-import { describe, expect, it, beforeEach, afterEach } from "bun:test"
+import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
+import * as debug from "../src/debug.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
 import {
@@ -19,10 +20,14 @@ import {
   takeHostPlanAgentNote,
   PLAN_EXIT_BY_USER_REASON,
   PLAN_EXIT_VIA_CREATE_PLAN_REASON,
+  SESSION_EDITS_DENIED_REMINDER,
+  SESSION_EDITS_DENIED_SWITCH_REASON,
+  SWITCH_MODE_RESULT_FIELD,
 } from "../src/protocol/switch-mode.js"
 import { parseDisplayToolCall, resolveBridgedOpenCodeToolCall } from "../src/protocol/tool-call-bridge.js"
-import { pump } from "../src/language-model.js"
+import { deliverContinuationResults, pump } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import { sessionFixture } from "./session-fixture.js"
 import {
   createPromptHostAgentModeSwitch,
   flushHostAgentModeSwitch,
@@ -164,6 +169,111 @@ describe("resolveSwitchModeBridge", () => {
     expect(
       resolveSwitchModeBridge("  ", { allowTools: true, advertised: ["plan_enter"] }).kind,
     ).toBe("reject")
+  })
+
+  it("rejects leaving plan while a session edit deny is set, on both catalogs", () => {
+    for (const advertised of [
+      ["question", "bash", "edit", "write", "apply_patch", "plan_exit"],
+      ["question", "shell", "edit", "write", "patch", "plan_exit"],
+    ]) {
+      for (const target of ["agent", "build", "edit"]) {
+        expect(resolveSwitchModeBridge(target, {
+          allowTools: true,
+          advertised,
+          hostAgent: "plan",
+          activeModeId: "plan",
+          sessionEditsDenied: true,
+        })).toEqual({ kind: "reject", reason: SESSION_EDITS_DENIED_SWITCH_REASON })
+      }
+      expect(resolveSwitchModeBridge("plan", {
+        allowTools: true,
+        advertised,
+        sessionEditsDenied: true,
+      })).toEqual({ kind: "approve" })
+    }
+    expect(resolveSwitchModeBridge("agent", {
+      allowTools: false,
+      advertised: ["plan_exit"],
+      sessionEditsDenied: true,
+    })).toEqual({ kind: "ack" })
+  })
+})
+
+describe("session edit deny reminders and switch delivery", () => {
+  beforeEach(() => {
+    resetActiveCursorModesForTests()
+    resetHostAgentModeSwitchForTests()
+  })
+
+  it("adds the deny sentence to the active mode reminder and when no mode is recorded", () => {
+    setActiveCursorMode("ses-deny", "plan")
+    const reminder = takeActiveCursorModeReminder("ses-deny", {
+      sessionEditsDenied: true,
+      advertisedTools: ["question", "edit"],
+    })!
+    expect(reminder).toContain("Plan mode is active")
+    expect(reminder).toContain(SESSION_EDITS_DENIED_REMINDER)
+    expect(takeActiveCursorModeReminder(undefined, { sessionEditsDenied: true })).toContain(SESSION_EDITS_DENIED_REMINDER)
+    expect(takeActiveCursorModeReminder(undefined)).toBeUndefined()
+  })
+
+  it.each([
+    ["agent", true],
+    ["plan", true],
+    ["agent", false],
+  ] as const)("delivers a mode approval for %s with session edits denied=%s", async (target, denied) => {
+    setActiveCursorMode("switch-oc-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = sessionFixture({
+      sessionId: "switch-session",
+      conversationId: "switch-conversation",
+      openCodeSessionId: "switch-oc-session",
+      stream: {
+        write(data: Uint8Array) { writes.push(data); return true },
+        end() {},
+        destroy() {},
+        onTerminal: () => () => {},
+        isClosed: () => false,
+        frames: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }) }),
+      },
+      frames: { next: async () => ({ done: true, value: undefined }) },
+      pending: new Map(),
+      blobs: new Map(),
+      toolDescriptors: [],
+      displayToolCalls: new Map(),
+      requestContext: { env: { workspace_paths: ["/workspace"] } },
+      usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
+      allowTools: true,
+      pumpActive: true,
+      heartbeat: null,
+      nextBridgedExecId: 900_000,
+      billing: { key: "run:test", prefixTokens: 0 },
+    })
+    sessionManager.registerPending(900_000, session, SWITCH_MODE_RESULT_FIELD, "plan_exit", false, {
+      interactionId: 4,
+      switchModeTarget: target,
+      switchModeBridgeKind: "native",
+    })
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    await deliverContinuationResults(session, [{
+      toolCallId: "switch-call",
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "plan_exit",
+      output: "approved",
+    }], { sessionEditsDenied: denied })
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.switch_mode_request_response
+    if (denied && target === "agent") {
+      expect(result.rejected.reason).toBe(SESSION_EDITS_DENIED_SWITCH_REASON)
+      expect(getActiveCursorMode("switch-oc-session")).toBe("plan")
+    } else {
+      expect(result.approved).toBeDefined()
+      expect(getActiveCursorMode("switch-oc-session")).toBe(target)
+    }
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
   })
 })
 
@@ -472,7 +582,15 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
   it("accepts the server's explicit cancellation only for its own plan handoff", async () => {
     setHostAgentModeSwitch(() => {}, { resumesTurn: true })
     const terminal = { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }
+    const traced: string[] = []
+    const traces = spyOn(debug, "trace").mockImplementation((line) => { traced.push(line) })
     const { session, parts } = await runSwitchMode([switchModePayload(), terminal], ["read"])
+      .finally(() => traces.mockRestore())
+    // The cancelled Run still records its continuity, without TurnEnded counters.
+    const diagnosis = traced.filter((line) => line.startsWith("cache diagnosis:"))
+    expect(diagnosis).toHaveLength(1)
+    expect(diagnosis[0]).toContain(" switchModeInTurn=true ")
+    expect(diagnosis[0]).toContain(" turnEnded=unavailable rawInput=unavailable ")
     expect(session.closed).toBe(true)
     expect(parts.at(-1)?.finishReason.unified).toBe("stop")
     expect(parts.at(-1)?.providerMetadata.cursor.occupancyOnly).toBe(true)

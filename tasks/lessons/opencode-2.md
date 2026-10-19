@@ -86,6 +86,12 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   could postpone a host steer until the background job finished. Inject eligible
   plain text into the actively pumping Run, with backpressure and admission
   rechecks (`src/host-steer.ts`, `test/early-steer.test.ts`).
+- **A switch's host note arrives after `switchAgent` returns.** The plan
+  agent enqueues its reminder from an event subscriber; continuing at once let
+  the first step start without it, so the host's per-request check wrote a
+  second copy and both reached history and Cursor. Wait (bounded) for the
+  session's next synthetic inbox item before continuing
+  (`test/plugin-opencode2.test.ts`).
 - **Delivery receipts must survive with the checkpoint.** Restart/retry repeated
   answered copies when only conversation state survived. Hydrate receipts even
   before a no-Run dedup outcome (`test/early-steer.test.ts`).

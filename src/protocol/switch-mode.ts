@@ -80,6 +80,23 @@ export const PLAN_EXIT_VIA_CREATE_PLAN_REASON =
   "Leave plan mode by recording the finished plan with Cursor CreatePlan: the user is then " +
   "asked whether to switch to the build agent and start implementing. Do not implement before they approve."
 
+/**
+ * Leaving plan would select the host build agent. A session edit deny survives
+ * that switch, so the user changes the rule in the client instead.
+ */
+export const SESSION_EDITS_DENIED_SWITCH_REASON =
+  "The session's edit rule still denies edits, so this mode switch cannot start implementation. "
+  + "The user changes that rule in the client. Do not implement, and do not write files through the shell."
+
+/** Chronological reminder while that rule is set. It is not part of the frozen baseline. */
+export const SESSION_EDITS_DENIED_REMINDER =
+  "Execution remains blocked by the session's edit rule. This supersedes any instruction to implement. "
+  + "Do not implement, and do not write files through the shell. The user changes that rule in the client."
+
+export const SESSION_EDITS_ALLOWED_REMINDER =
+  "The session has no global edit deny. This supersedes earlier session-edit-deny reminders only; "
+  + "follow the current agent's permissions and required plan approval."
+
 export type SwitchModeHostTool = "plan_enter" | "plan_exit"
 
 /**
@@ -178,6 +195,8 @@ export function resolveSwitchModeBridge(
     activeModeId?: string
     /** Host primary agent of this Run, when the host reported it. */
     hostAgent?: string
+    /** The session's last `edit` rule on `*` is deny. Leaving plan cannot lift it. */
+    sessionEditsDenied?: boolean
   },
 ): SwitchModeBridge {
   const mapped = mapSwitchModeTarget(targetModeId)
@@ -186,6 +205,13 @@ export function resolveSwitchModeBridge(
   // Lifecycle turn: soft-ack on the wire, no session mutation. A hard reject
   // would enter the transcript and make the real turn narrate a blocked switch.
   if (!options.allowTools) return { kind: "ack" }
+
+  // Any non-plan target selects the host build agent. Approving it, including
+  // a same-mode or native plan_exit approval, would start implementation the
+  // session rule still forbids.
+  if (options.sessionEditsDenied && mapped.toolName === "plan_exit") {
+    return { kind: "reject", reason: SESSION_EDITS_DENIED_SWITCH_REASON }
+  }
 
   // Already in the target mode: nothing to approve. Cursor's own IDE handler
   // auto-approves here too, and without this a model that asks to leave plan
@@ -623,11 +649,17 @@ export function takeActiveCursorModeReminder(
     advertisedTools?: ReadonlySet<string> | Iterable<string>
     /** Host primary agent of this request; when known it, not the catalog, says whether planning ended. */
     hostAgent?: string
+    /** The session's last `edit` rule on `*` is deny. Appended, never frozen into the baseline. */
+    sessionEditsDenied?: boolean
   } = {},
 ): string | undefined {
-  if (!sessionKey) return undefined
+  if (!sessionKey) {
+    return withSessionEditsDenied(undefined, options.sessionEditsDenied)
+  }
   const state = activeCursorModeBySession.get(sessionKey)
-  if (!state) return undefined
+  if (!state) {
+    return withSessionEditsDenied(undefined, options.sessionEditsDenied)
+  }
 
   const advertised = options.advertisedTools
     ? options.advertisedTools instanceof Set
@@ -639,7 +671,7 @@ export function takeActiveCursorModeReminder(
   if (isPlanMode && state.bridgedPlanEntered && advertised && !options.hostAgent) {
     if (advertised.has("plan_enter")) {
       activeCursorModeBySession.delete(sessionKey)
-      return cursorModeSystemReminder("agent", { firstTurn: true })
+      return withSessionEditsDenied(cursorModeSystemReminder("agent", { firstTurn: true }), options.sessionEditsDenied)
     }
   }
 
@@ -654,5 +686,13 @@ export function takeActiveCursorModeReminder(
       : {}),
   })
   if (state.firstTurn) state.firstTurn = false
-  return reminder
+  return withSessionEditsDenied(reminder, options.sessionEditsDenied)
+}
+
+function withSessionEditsDenied(reminder: string | undefined, denied: boolean | undefined): string | undefined {
+  if (denied === undefined) return reminder
+  const permission = denied ? SESSION_EDITS_DENIED_REMINDER : SESSION_EDITS_ALLOWED_REMINDER
+  if (!reminder) return wrapReminder(permission)
+  if (reminder.includes(permission)) return reminder
+  return reminder.replace(/\n<\/system_reminder>\s*$/, `\n\n${permission}\n</system_reminder>`)
 }

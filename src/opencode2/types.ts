@@ -334,10 +334,19 @@ export type SessionHooks = {
   readonly "model.request": SessionModelRequest
 }
 
-/** Only the `location.directory` field we actually read. */
+/** Fields this plugin reads from `session.get`. */
 export type SessionInfo = {
   readonly id: string
   readonly location: { readonly directory: string }
+  /**
+   * Rules evaluated after the agent catalog. The last rule whose action matches
+   * `edit` and whose resource is `*` decides whether edits stay denied.
+   */
+  readonly permissions?: readonly {
+    readonly action: string
+    readonly resource: string
+    readonly effect: "allow" | "deny" | "ask"
+  }[]
 }
 
 export type SessionDomain = {

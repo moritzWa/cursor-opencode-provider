@@ -157,6 +157,17 @@ export function queueHostAgentModeSwitch(input: HostAgentModeSwitchInput): boole
 }
 
 /**
+ * True while this Run owns a switch that starts a replacement host turn.
+ * Both entering plan and approving its execution must end the old Run first.
+ */
+export function isHostAgentHandoffPending(sessionID: string | undefined, cursorSessionID: string): boolean {
+  if (activeSwitch()?.options.resumesTurn !== true) return false
+  const key = sessionID?.trim()
+  const state = key ? pending.get(key) : undefined
+  return !!state && (!state.cursorSessionID || state.cursorSessionID === cursorSessionID)
+}
+
+/**
  * True while an approved switch into the host `plan` agent waits for its Run to
  * end and will itself start the plan-agent turn that continues the work.
  */

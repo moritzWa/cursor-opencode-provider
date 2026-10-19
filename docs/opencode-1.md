@@ -100,6 +100,26 @@ without a variant retains Cursor's declared default effort for that tier.
 Saved 500k variants on the base/Fast entries remain valid after upgrading;
 reselect the dedicated 500k entry to use its full host context budget.
 
+## Planning and session edit rules
+
+Cursor tools use the route advertised for the current turn. Call a supplied
+top-level SwitchMode/CreatePlan function directly; when listed in a dynamic
+namespace, discover its schema and invoke it through CallDynamicTool with the
+discovered namespace, tool name and arguments. Discovery is not a mode switch.
+
+When the provider owns the native agent handoff, approval ends the plan Run
+before starting the build turn; declining keeps the session in plan.
+
+CreatePlan saves and shows the plan before asking whether to implement. A
+session-wide edit deny keeps the plan saved without an implementation approval
+or a build-agent handoff; allowing only the plan file does not lift that deny.
+Change the session rule in the client before approving implementation. The
+classic plugin reads native `permission` rules, retries a failed session lookup
+once, and stops the request if the rules remain unreadable.
+Rule changes reach held tool continuations too; lifting a deny replaces its
+earlier reminder without bypassing the normal plan review. Without a deny to
+supersede, no rule reminder is sent.
+
 ## Task attachments
 
 Cursor Task attachments reach the native `task` prompt as exact, quoted file

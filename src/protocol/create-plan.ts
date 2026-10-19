@@ -152,6 +152,9 @@ export type CursorPlanStageInput = {
  *             carried out yet: an approved switch into it is still pending (it
  *             applies after this Run), or its plan file is unknown. Nothing is
  *             written; the error tells the model which host workflow follows.
+ * - `hold`    the session's edit rule still denies edits. The plan is written
+ *             and shown, and Cursor receives the not-approved error. Nothing
+ *             asks the user or switches agents: an answer cannot lift the rule.
  *
  * The plan is always persisted before any review: writing needs no approval,
  * executing does, and only the host asks for it.
@@ -160,6 +163,7 @@ export type CreatePlanBridge =
   | { kind: "stage" }
   | { kind: "ack" }
   | { kind: "approve" }
+  | { kind: "hold" }
   | { kind: "defer"; reason: string }
   | { kind: "exit"; planPath: string }
 
@@ -179,6 +183,14 @@ export const CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON =
 export const CREATE_PLAN_NOT_APPROVED_REASON =
   "The user did not approve executing this plan. Keep planning: refine the plan and "
   + "propose it again when it is ready."
+
+/** Cursor-visible reason when a session edit deny still blocks execution. */
+export function createPlanSessionEditsDeniedReason(planPath: string): string {
+  const where = planPath.trim() || "the saved plan"
+  return `The plan is saved at ${where}. Execution remains blocked by the session's edit rule. `
+    + "Do not implement, and do not write files through the shell. End this turn. "
+    + "The user changes that rule in the client."
+}
 
 /** Upstream `PlanExitTool` wording, with the plan the provider just wrote. */
 export function createPlanApprovalQuestion(planLabel: string): string {
@@ -205,6 +217,11 @@ export function resolveCreatePlanBridge(options: {
   planModeActive?: boolean
   /** The host's own plan file for this session, when the host defines one. */
   hostPlanFile?: string
+  /**
+   * The session's last `edit` rule on `*` is deny. An approval cannot lift it,
+   * so the plan is saved without asking or switching agents.
+   */
+  sessionEditsDenied?: boolean
 }): CreatePlanBridge {
   // A lifecycle turn (title generation, compaction) runs alongside the real one
   // and must not write a second plan file or raise a second prompt.
@@ -213,6 +230,10 @@ export function resolveCreatePlanBridge(options: {
     return { kind: "defer", reason: CREATE_PLAN_HOST_PLAN_PENDING_REASON }
   }
   if (options.canStage) return { kind: "stage" }
+  // After the host stage and a pending plan-agent handoff. A Yes, a plan_exit
+  // review, and the no-question success ack would all tell Cursor execution
+  // may start. The session rule is still in force, so none of those apply.
+  if (options.sessionEditsDenied) return { kind: "hold" }
 
   const names =
     options.advertised instanceof Set ? options.advertised : new Set(options.advertised)

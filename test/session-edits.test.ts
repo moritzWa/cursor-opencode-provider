@@ -1,0 +1,96 @@
+import { beforeEach, describe, expect, it } from "bun:test"
+import {
+  notPermittedThisTurnReason,
+  permissionsFromSession,
+  resetSessionEditsGuidanceForTests,
+  sessionEditsGuidance,
+  sessionRulesDenyEdits,
+  SHELL_NOT_FOR_FILE_WRITES,
+} from "../src/protocol/session-edits.js"
+
+const denyStar = { action: "edit", resource: "*", effect: "deny" as const }
+const allowPlan = { action: "edit", resource: "/plans/*", effect: "allow" as const }
+const allowStar = { action: "edit", resource: "*", effect: "allow" as const }
+
+describe("sessionRulesDenyEdits", () => {
+  it("uses the last edit rule on * and ignores a later plan-path allow", () => {
+    expect(sessionRulesDenyEdits([denyStar, allowPlan])).toBe(true)
+    expect(sessionRulesDenyEdits([denyStar, allowPlan, allowStar])).toBe(false)
+    expect(sessionRulesDenyEdits([{ action: "*", resource: "*", effect: "deny" }])).toBe(true)
+    expect(sessionRulesDenyEdits([{ action: "edit", resource: "*", effect: "ask" }])).toBe(false)
+    expect(sessionRulesDenyEdits([{ action: "write", resource: "*", effect: "deny" }])).toBe(false)
+    expect(sessionRulesDenyEdits(undefined)).toBe(false)
+    expect(sessionRulesDenyEdits([])).toBe(false)
+  })
+
+  it("reads permissions from a bare session and from a wrapped classic session", () => {
+    const rules = [denyStar, allowPlan]
+    expect(sessionRulesDenyEdits(permissionsFromSession({ permissions: rules }))).toBe(true)
+    expect(sessionRulesDenyEdits(permissionsFromSession({ data: { permissions: rules } }))).toBe(true)
+    expect(sessionRulesDenyEdits(permissionsFromSession({ data: { slug: "quiet-owl" } }))).toBe(false)
+    expect(sessionRulesDenyEdits(permissionsFromSession(undefined))).toBe(false)
+  })
+
+  it("reads native 1.x permission rules without treating plan-file access as a global allow", () => {
+    const permission = [
+      { permission: "edit", pattern: "*", action: "deny" },
+      { permission: "edit", pattern: "/plans/*", action: "allow" },
+    ]
+    for (const session of [{ permission }, { data: { permission } }]) {
+      expect(sessionRulesDenyEdits(permissionsFromSession(session))).toBe(true)
+    }
+    permission.push({ permission: "edit", pattern: "*", action: "allow" })
+    expect(sessionRulesDenyEdits(permissionsFromSession({ permission }))).toBe(false)
+  })
+
+  it("matches the host's action wildcards and ignores malformed rules", () => {
+    for (const action of ["e?it", "e*", "edit *", "**"]) {
+      expect(sessionRulesDenyEdits([{ action, resource: "*", effect: "deny" }])).toBe(true)
+    }
+    expect(sessionRulesDenyEdits([{ action: "EDIT", resource: "*", effect: "deny" }])).toBe(process.platform === "win32")
+    expect(sessionRulesDenyEdits([null, {}, { resource: "*", effect: "deny" }, { action: "edit", resource: "*", effect: "invalid" }])).toBe(false)
+  })
+})
+
+describe("notPermittedThisTurnReason", () => {
+  it("tells both majors' mutation tools not to write through the shell", () => {
+    for (const tool of ["edit", "write", "apply_patch", "patch"]) {
+      const reason = notPermittedThisTurnReason(tool, ["read", "bash", "shell"])
+      expect(reason).toContain(`'${tool}' is not permitted`)
+      expect(reason).toContain(SHELL_NOT_FOR_FILE_WRITES)
+    }
+    const shell = notPermittedThisTurnReason("bash", ["read"])
+    expect(shell).not.toContain(SHELL_NOT_FOR_FILE_WRITES)
+    expect(shell).toContain("Permitted tools: read")
+  })
+})
+
+describe("sessionEditsGuidance", () => {
+  beforeEach(() => resetSessionEditsGuidanceForTests())
+  const fresh = { carriesEarlierState: false }
+  const carried = { carriesEarlierState: true }
+
+  it("states nothing when the host reported no edit state", () => {
+    expect(sessionEditsGuidance("conv", undefined, carried)).toBeUndefined()
+  })
+
+  it("states every deny, and no deny once after it", () => {
+    expect(sessionEditsGuidance("conv", true, fresh)).toBe(true)
+    expect(sessionEditsGuidance("conv", true, carried)).toBe(true)
+    expect(sessionEditsGuidance("conv", false, carried)).toBe(false)
+    expect(sessionEditsGuidance("conv", false, carried)).toBeUndefined()
+  })
+
+  it("states no deny for an unknown state only when earlier state reaches Cursor", () => {
+    expect(sessionEditsGuidance("fresh", false, fresh)).toBeUndefined()
+    expect(sessionEditsGuidance("fresh", false, carried)).toBeUndefined()
+    expect(sessionEditsGuidance("resumed", false, carried)).toBe(false)
+    expect(sessionEditsGuidance("resumed", false, carried)).toBeUndefined()
+  })
+
+  it("keeps conversations apart", () => {
+    expect(sessionEditsGuidance("a", true, fresh)).toBe(true)
+    expect(sessionEditsGuidance("b", false, fresh)).toBeUndefined()
+    expect(sessionEditsGuidance("a", false, carried)).toBe(false)
+  })
+})
