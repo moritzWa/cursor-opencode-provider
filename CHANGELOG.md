@@ -4,17 +4,22 @@
 
 ### Fixed
 
+- Declining, refining, or dismissing plan execution ends the current turn and keeps the plan agent; late tool requests cannot continue the self-test or start implementation ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
+- OpenCode 2 image saves and optional todo tools assert native permissions for the executing session and agent, including path exceptions and rejection; missing permission APIs fail closed. Image saves recheck their target after approval to prevent directory redirection while waiting
+- Existing-file edit prerequisites require an authorized native read before supplying complete contents; large-file edits retain their complete source without bypassing read permissions
+- Cursor's private Git diff exec directs the model to the native permission-checked shell instead of running Git inside the provider
+- Debug logs recognize Cursor's appended user-message updates after context injection while preserving replay protection
 - A shell command sent to `glob`, `grep`, `read`, `write`, or `edit` is refused as a misplaced command instead of being dropped and reported as a missing `pattern` or path
 - A CreatePlan approval shows the saved plan in the transcript immediately above the question, including when the model already streamed text or reasoning
 - SwitchMode, CreatePlan and GenerateImage follow Cursor's advertised direct or dynamic invocation route, so successful discovery no longer leads to an invented direct call or a false unavailable skip ([#110](https://github.com/oakimov/cursor-opencode-provider/issues/110))
 - A session edit deny keeps a saved plan from approving implementation on OpenCode 1.x and 2.0, including after a retried session lookup. Lifting the deny restores normal approval; unreadable session rules stop the request. Refusals tell Cursor not to write through the shell ([#110](https://github.com/oakimov/cursor-opencode-provider/issues/110))
 - Cursor interactions use the current permitted tools even when the cached catalog retains a removed tool; saving a denied plan prevents replay after a dropped stream ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
-- Current session permissions supersede deferred permission reminders after a restart or queued injection, so lifting a deny restores normal plan review ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
+- Current session permissions supersede deferred permission reminders after a restart or queued injection, including when an earlier request already lifted the deny; failed or duplicate deliveries do not consume that correction ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
 - Approving a plan ends the old plan Run before the native build turn starts, preventing duplicate approval prompts and tool execution under the old agent ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
 - The debug log no longer reports a Run the provider closed itself as "aborted by remote" or, on OpenCode 2.0's Bun runtime, as an `NGHTTP2_CANCEL` stream error
 - The "no global edit deny" note reaches Cursor only when it replaces a deny reminder, instead of after every tool step
-- On OpenCode 2.0, a Cursor-initiated plan or build switch no longer leaves two copies of OpenCode's plan-mode reminder in the session
-- The turn after a plan-mode switch keeps the previous context as its cached prefix instead of reporting it all as uncached input; the cancelled Run before it now logs a cache diagnosis
+- On OpenCode 2.0, a Cursor-initiated plan or build switch waits for its matching plan-mode reminder, ignoring unrelated background notices, to prevent duplicate reminders; selecting the current agent keeps the running turn
+- The turn after a plan-mode switch keeps the previous context as its cached prefix, including after a restart, instead of reporting it all as uncached input; the cancelled Run before it now logs a cache diagnosis
 
 ## [0.8.3] - 2026-10-18
 

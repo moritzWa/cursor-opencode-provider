@@ -988,7 +988,7 @@ describe("CreatePlan execution approval over a held-open Run", () => {
 
   it.each([false, true])("ends the approved plan Run before the resuming build turn (canceled=%s)", async canceled => {
     const writes: Uint8Array[] = []
-    const session = planSession([], writes, ["question", "write"])
+    const session = planSession([], writes, ["question", "write", "todowrite"])
     session.hostAgent = "plan"
     sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
       interactionId: 42, createPlanBridgeKind: "approve",
@@ -1002,6 +1002,15 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     }], { hostAgent: "plan" })
     const frames: Frame[] = [
       // Work generated before cancellation arrives must never reach the host.
+      ...["tool_call_started", "tool_call_completed"].map(kind => ({ flags: 0, payload: encodeMessage("AgentServerMessage", {
+        interaction_update: { [kind]: {
+          call_id: "late-plan-display",
+          tool_call: { create_plan_tool_call: { args: {
+            name: "Late plan", plan: "Work under the next agent.",
+            todos: [{ id: "late", content: "Must not mirror", status: 1 }],
+          } } },
+        } },
+      }) })),
       { flags: 0, payload: encodeMessage("AgentServerMessage", {
         exec_server_message: { id: 7, write_args: { path: "proof.txt", file_text: "too early" } },
       }) },
@@ -1029,7 +1038,75 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     expect(switched).toEqual(["agent"])
   })
 
-  it("keeps planning when the user answers No", async () => {
+  for (const bridge of ["approve", "exit", "stage"] as const) {
+    for (const canceled of [false, true]) {
+      it(`stops the turn after a declined ${bridge} review (canceled=${canceled})`, async () => {
+        setActiveCursorMode("create-plan-opencode-session", "plan")
+        const writes: Uint8Array[] = []
+        const session = planSession([], writes, ["question", "write", "shell", "cursor_image_save"])
+        session.hostAgent = "plan"
+        sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+          interactionId: 42, createPlanBridgeKind: bridge,
+          createPlanQuestion: "Approve this plan?", planUri: "file:///plans/review.md",
+        })
+        await deliverContinuationResults(session, [{
+          toolCallId: "declined-review", sessionId: session.sessionId, execId: 900_000,
+          toolName: "question", output: JSON.stringify({ answers: [["No"]] }),
+          ...(bridge === "stage" ? { error: "Plan refinement requested." } : {}),
+        }], { hostAgent: "plan" })
+        const projectDir = path.join(workspace, "runtime")
+        const spill = path.join(projectDir, "agent-tools", "12345678-1234-1234-1234-123456789abc.txt")
+        session.requestContext.env = { workspace_paths: [workspace], project_folder: projectDir }
+        const frames: Frame[] = [
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 9, write_args: { path: spill, file_text: "must-not-spill" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 10, git_diff_request: { cwd: workspace } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            interaction_update: { text_delta: { text: "Continuing the self-test" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 7, shell_args: { command: "echo must-not-run" } },
+          }) },
+          { flags: 0, payload: encodeMessage("AgentServerMessage", {
+            exec_server_message: { id: 8, write_args: { path: "after-decline.txt", file_text: "must-not-write" } },
+          }) },
+          canceled
+            ? { flags: 2, payload: new TextEncoder().encode('{"error":{"code":"canceled"}}') }
+            : { flags: 0, payload: encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }) },
+        ]
+        session.frames = { next: async () => frames.length ? { done: false, value: frames.shift()! } : { done: true, value: undefined } }
+        session.reopenWithUserMessage = async () => { throw new Error("A declined turn must not continue itself") }
+        const parts: Array<{ type: string; delta?: string; finishReason?: { unified: string } }> = []
+        try {
+          await pump(session, {
+            enqueue(part: unknown) { parts.push(part as typeof parts[number]) }, error() {},
+          } as ReadableStreamDefaultController<never>, { textId: "text", reasoningId: "reasoning" })
+          expect(decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response
+            .create_plan_request_response.result.error).toBeDefined()
+          expect(decodeMessage<any>("AgentClientMessage", writes[1]!).conversation_action
+            .cancel_action.reason).toBe("plan_execution_declined")
+          expect(parts.some(part => part.type === "tool-call" || part.type === "text-delta")).toBe(false)
+          expect(parts.at(-1)?.finishReason?.unified).toBe("stop")
+          expect(session.closed).toBe(true)
+          expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+          expect(fs.existsSync(path.join(workspace, "after-decline.txt"))).toBe(false)
+          expect(fs.existsSync(spill)).toBe(false)
+          const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+          expect(replies.find(reply => reply.exec_client_message?.id === 9)
+            ?.exec_client_message.write_result.error.error).toContain("End this turn")
+          expect(replies.find(reply => reply.exec_client_control_message?.throw?.id === 10)
+            ?.exec_client_control_message.throw.error).toContain("End this turn")
+        } finally {
+          sessionManager.close(session, "ordinary-cleanup")
+        }
+      })
+    }
+  }
+
+  it("keeps the plan agent selected when the user answers No", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
     const question = JSON.parse(toolCall.input).questions[0].question as string

@@ -25,11 +25,10 @@ export type ImageSaveToolContext = {
   worktree: string
   directory: string
   /**
-   * Classic OpenCode 1.x `ToolContext.ask`. A host whose tool context has no
-   * permission prompt (OpenCode 2.0's public `ToolContext`) passes `null`
-   * explicitly: the commit then writes after containment, gated only by the
-   * tool's catalog permission. A missing `ask` is refused, never treated as
-   * permission.
+   * Classic OpenCode supplies ToolContext.ask; OpenCode 2 adapts the public
+   * plugin permission.assert API. Native entrypoints require that callback.
+   * Explicit null preserves the public API for callers that own authorization;
+   * an omitted callback is refused, never treated as permission.
    */
   ask: ((input: {
     permission: string
@@ -146,10 +145,8 @@ export async function executeCursorImageSave(
   }
 
   const workspace = ctx.worktree || ctx.directory
-  const contained = resolveContainedImagePath(
-    image.path,
-    [image.projectDir, workspace].filter((root): root is string => !!root),
-  )
+  const allowedRoots = [image.projectDir, workspace].filter((root): root is string => !!root)
+  const contained = resolveContainedImagePath(image.path, allowedRoots)
   if ("error" in contained) {
     trace(`image save: refused path=${JSON.stringify(image.path)} reason=${contained.error}`)
     throw new Error(`Refusing to save the generated image: ${contained.error}.`)
@@ -199,6 +196,13 @@ export async function executeCursorImageSave(
     const reason = "this host did not provide a permission prompt for the write"
     trace(`image save: permission refused path=${JSON.stringify(contained.path)} reason=${reason}`)
     throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} ${reason}`)
+  }
+
+  // Permission may wait on the user. Re-resolve afterward so a directory
+  // replaced during that wait cannot redirect the authorized write.
+  const current = resolveContainedImagePath(image.path, allowedRoots)
+  if ("error" in current || current.path !== contained.path) {
+    throw new Error(`${IMAGE_PERMISSION_DENIED_PREFIX} The image target changed while permission was pending.`)
   }
 
   // Cursor writes generated images into an `assets/` subdirectory that will not

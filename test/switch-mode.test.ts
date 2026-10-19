@@ -672,6 +672,13 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     sessionManager.close(session, "ordinary-cleanup")
   })
 
+  it("ends the turn after a declined review instead of asking for immediate refinement", () => {
+    const reminder = cursorModeSystemReminder("plan", { planExitAdvertised: false, questionAdvertised: true })
+    expect(reminder).toContain("end this turn without further tool calls")
+    expect(reminder).toContain("wait for a new user message")
+    expect(reminder).not.toContain("If they decline, refine the plan and record it again")
+  })
+
   it("discards a queued native-agent switch when its owning Run was superseded", async () => {
     const switched: string[] = []
     setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })

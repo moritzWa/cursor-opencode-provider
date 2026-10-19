@@ -26,6 +26,7 @@ import {
   getCheckpoint,
   resetCheckpointsForTests,
   setCheckpoint,
+  checkpointTokenDetails,
 } from "../src/protocol/checkpoint.js"
 import {
   getConversationBlob,
@@ -124,6 +125,32 @@ describe("conversation restart persistence", () => {
 
   afterAll(async () => {
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })))
+  })
+
+  it("persists measured occupancy independently of the zero-token resume checkpoint", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_occupancy_restart"
+    const conversationId = "conversation-occupancy-restart"
+    // Independently specified protobuf #5: used_tokens=42, max_tokens=256.
+    const measured = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+    const terminal = Uint8Array.of(0x2a, 5, 8, 0, 16, 0x80, 2)
+    restoreConversationBinding(sessionKey, conversationId)
+    setCheckpoint(conversationId, measured)
+    setCheckpoint(conversationId, terminal)
+    await persistConversationState(root, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    const file = conversationCacheFilePath(root, sessionKey)
+    const raw = gunzipSync(await readFile(file))
+    // Private cache field #18 (wire type 2) holds only the measured field #5.
+    expect(raw.includes(Buffer.from([0x92, 1, measured.length, ...measured]))).toBe(true)
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect(getCheckpoint(conversationId)).toEqual(terminal)
+    expect(checkpointTokenDetails(conversationId, terminal)?.usedTokens).toBe(42)
+
+    // Wrong wire type for #18 invalidates the snapshot rather than trusting it.
+    await writeFile(file, gzipSync(Buffer.concat([raw, Buffer.from([0x90, 1, 1])])))
+    clearMemory()
+    expect((await loadPersistedConversation(root, sessionKey)).status).toBe("invalid")
   })
 
   it("restores the complete resumable state after process memory is cleared", async () => {

@@ -277,7 +277,7 @@ internal model calls can process uncached text more than once.
 
 | Field | Interpretation |
 |---|---|
-| `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. A checkpoint that reports `usedTokens=0` (the one that ends a Run cancelled for a plan handoff) is replaced by the conversation's last measured occupancy in this process. |
+| `priorContext` | Cursor `usedTokens` decoded from the checkpoint supplied at Run start. For a checkpoint reporting `usedTokens=0` after a cancelled plan handoff, usage retains the conversation's last measured occupancy, saved separately in the restart snapshot. The Run still sends the original checkpoint bytes. |
 | `turnEnded=unavailable` | The Run ended without TurnEnded, so every `raw*` field reads `unavailable` and `rawReadVsPriorContext=n/a`. Continuity and context fields still describe the Run. A plan-handoff cancellation is the common case. |
 | `currentContext` | Latest known checkpoint `usedTokens` at Run end. |
 | `contextDelta` | Current minus prior occupancy. Negative values are possible after summarization/compaction; positive values include new user/tool/output context. |

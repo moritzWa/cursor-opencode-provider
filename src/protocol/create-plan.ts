@@ -181,8 +181,8 @@ export const CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON =
 
 /** Cursor-visible reason when the user wants the plan revised instead of run. */
 export const CREATE_PLAN_NOT_APPROVED_REASON =
-  "The user did not approve executing this plan. Keep planning: refine the plan and "
-  + "propose it again when it is ready."
+  "The user did not approve executing this plan. End this turn without further tool calls. "
+  + "Stay in plan mode and wait for the user's next message before refining or proposing it again."
 
 /** Cursor-visible reason when a session edit deny still blocks execution. */
 export function createPlanSessionEditsDeniedReason(planPath: string): string {
@@ -273,7 +273,7 @@ export function createPlanApprovalQuestionInput(planLabel: string): OpencodeQues
           },
           {
             label: CREATE_PLAN_APPROVAL_NO,
-            description: "Stay with plan agent to continue refining the plan",
+            description: "Stay in plan mode and end this turn without implementing",
           },
         ],
       },

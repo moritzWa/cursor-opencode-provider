@@ -215,16 +215,13 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             : undefined
       disposeHostAgentModeSwitch = setHostAgentModeSwitch(
         async ({ sessionID, targetModeID }) => {
-          const agent = normalizeSwitchModeId(targetModeID) === "plan"
-            || normalizeSwitchModeId(targetModeID) === "spec"
-            ? "plan"
-            : "build"
+          const agent = hostAgentForMode(targetModeID)
           // OpenCode answers a plan/build switch with a synthetic note from an
           // event subscriber. Continuing before that note is enqueued lets it
           // miss the first step's promotion, so the host writes its per-request
           // copy too and both land at the next step. Wait for the host's note.
           const reaction = continueTurn && hostEventsObserved
-            ? waitForHostSwitchReaction(sessionID, HOST_SWITCH_REACTION_TIMEOUT_MS)
+            ? waitForHostSwitchReaction(sessionID, agent, HOST_SWITCH_REACTION_TIMEOUT_MS)
             : undefined
           try {
             await switchAgent({ sessionID, agent })
@@ -247,7 +244,10 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             })
           }
         },
-        continueTurn ? { resumesTurn: true } : {},
+        {
+          ...(continueTurn ? { resumesTurn: true } : {}),
+          accepts: ({ hostAgent, targetModeID }) => hostAgent !== hostAgentForMode(targetModeID),
+        },
       )
     }
 
@@ -400,7 +400,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         // (`CURSOR_OPENCODE2_TODOS=1`/`true` force-enables). When on, register
         // them as direct catalog tools (`codemode: false` + output schema) if
         // the host does not already own those names. When off, register none.
-        registerTodoTools(draft)
+        registerTodoTools(draft, ctx)
         registerCursorImageSaveTool(draft, ctx)
         // MCP tools default into Code Mode. Move every server that did not
         // explicitly opt in onto the direct catalog so this provider can
@@ -701,27 +701,34 @@ async function saveOpenTurnsForShutdown(): Promise<void> {
 /** Upper bound on waiting for the host's note after a native agent switch. */
 const HOST_SWITCH_REACTION_TIMEOUT_MS = 1_000
 
-/** Native agent switches waiting for the host's next synthetic inbox item, per session. */
-const switchReactionWaiters = new Map<string, Set<() => void>>()
+function hostAgentForMode(targetModeID: string): "plan" | "build" {
+  const mode = normalizeSwitchModeId(targetModeID)
+  return mode === "plan" || mode === "spec" ? "plan" : "build"
+}
+
+/** Native agent switches waiting for the matching OpenCode plan-mode reminder. */
+type SwitchReactionWaiter = { agent: "plan" | "build"; reacted: () => void }
+const switchReactionWaiters = new Map<string, Set<SwitchReactionWaiter>>()
 
 function waitForHostSwitchReaction(
   sessionID: string,
+  agent: "plan" | "build",
   timeoutMs: number,
 ): { reacted: Promise<boolean>; cancel(): void } {
   let settle!: (reacted: boolean) => void
   const reacted = new Promise<boolean>((resolve) => { settle = resolve })
-  const waiters = switchReactionWaiters.get(sessionID) ?? new Set<() => void>()
+  const waiters = switchReactionWaiters.get(sessionID) ?? new Set<SwitchReactionWaiter>()
   switchReactionWaiters.set(sessionID, waiters)
   const done = (value: boolean) => {
     clearTimeout(timer)
-    waiters.delete(onReaction)
+    waiters.delete(waiter)
     if (waiters.size === 0 && switchReactionWaiters.get(sessionID) === waiters) switchReactionWaiters.delete(sessionID)
     settle(value)
   }
-  const onReaction = () => done(true)
+  const waiter: SwitchReactionWaiter = { agent, reacted: () => done(true) }
   const timer = setTimeout(() => done(false), timeoutMs)
   timer.unref?.()
-  waiters.add(onReaction)
+  waiters.add(waiter)
   return { reacted, cancel: () => done(false) }
 }
 
@@ -810,7 +817,13 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
       const id = payload?.sessionID
       if (id) sessionActivity.recordActivity(id)
       if (typeof id === "string" && payload?.item?.type === "synthetic") {
-        for (const reacted of [...(switchReactionWaiters.get(id) ?? [])]) reacted()
+        const text = payload.item.payload?.text
+        // OpenCode's Plan plugin owns these reminders. Background notices and
+        // an older reminder for the opposite mode do not acknowledge this switch.
+        if (typeof text === "string") for (const waiter of [...(switchReactionWaiters.get(id) ?? [])]) {
+          const prefix = waiter.agent === "plan" ? "You are in Plan mode." : "You are NO LONGER in Plan mode."
+          if (text.startsWith(`<system-reminder>\n${prefix}`)) waiter.reacted()
+        }
       }
       const steer = inboxSteer(id, payload?.inboxID, payload?.item)
       if (!steer) break

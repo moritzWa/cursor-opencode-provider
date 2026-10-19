@@ -121,7 +121,19 @@ export type HostIntegrationEditor = {
   }
 }
 
+/** Public permission domain, matching packages/plugin/src/permission.ts. */
+export type HostPermissionAssertInput = {
+  readonly sessionID: string
+  readonly agent?: string
+  readonly action: string
+  readonly resources: readonly string[]
+  readonly save?: readonly string[]
+  readonly metadata?: Record<string, unknown>
+  readonly source?: { readonly type: "tool"; readonly messageID: string; readonly id: string }
+}
+
 export type HostPluginContext = {
+  readonly permission: { readonly assert: (input: HostPermissionAssertInput) => Promise<void> }
   readonly aisdk: {
     readonly hook: HostHooks<{
       sdk: {

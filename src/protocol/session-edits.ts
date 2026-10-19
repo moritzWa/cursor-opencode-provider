@@ -81,26 +81,38 @@ export async function loadSessionForPermissions<T>(getSession: () => Promise<T>)
   }
 }
 
-/** Edit guidance Cursor last received per conversation: `true` deny, `false` no deny. */
+/** Edit state at the last successfully written request/continuation: true deny, false no deny. */
 const editGuidanceByConversation = new Map<string, boolean>()
 
 /**
- * The session-edit state to state in this request, or `undefined` for none.
+ * Current edit guidance to send, or `undefined` when none is needed.
  * A deny is stated every time. The no-deny note only supersedes a deny Cursor
  * may hold: one this process sent, or, when this process has sent nothing to
- * the conversation, one inside a checkpoint or carried notes from before.
+ * the conversation, one inside a checkpoint. Carried notes may reintroduce
+ * an older deny regardless of what this process last sent.
  */
 export function sessionEditsGuidance(
   conversationId: string,
   denied: boolean | undefined,
-  options: { carriesEarlierState: boolean },
+  options: { carriesEarlierState: boolean; carriesEditDeny?: boolean },
 ): boolean | undefined {
   if (denied === undefined) return undefined
   const previous = editGuidanceByConversation.get(conversationId)
-  editGuidanceByConversation.set(conversationId, denied)
   if (denied) return true
-  if (previous === false || (previous === undefined && !options.carriesEarlierState)) return undefined
+  if (!options.carriesEditDeny
+    && (previous === false || (previous === undefined && !options.carriesEarlierState))) return undefined
   return false
+}
+
+/** Record only after the request or continuation carrying this state was written. */
+export function recordSessionEditsGuidance(conversationId: string, denied: boolean | undefined): void {
+  if (denied === undefined) return
+  editGuidanceByConversation.delete(conversationId)
+  editGuidanceByConversation.set(conversationId, denied)
+  // An evicted conversation safely restates its current state on checkpoint reuse.
+  if (editGuidanceByConversation.size > 256) {
+    editGuidanceByConversation.delete(editGuidanceByConversation.keys().next().value!)
+  }
 }
 
 export function resetSessionEditsGuidanceForTests(): void {

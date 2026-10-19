@@ -358,6 +358,26 @@ describe("committing a staged image", () => {
     expect(fs.existsSync(target)).toBe(false)
   })
 
+  it.each(["outside", "inside"])("refuses a target redirected %s its root while approval is pending", async destination => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-approval-"))
+    const assets = path.join(projectDir, "assets")
+    const redirected = destination === "outside" ? outside : path.join(projectDir, "redirected")
+    fs.mkdirSync(assets)
+    if (destination === "inside") fs.mkdirSync(redirected)
+    const target = path.join(assets, "image.png")
+    try {
+      await expect(executeCursorImageSave({ image_id: stage(target) }, {
+        worktree: workspace, directory: workspace,
+        ask: async request => {
+          if (request.permission !== "edit") return
+          fs.rmdirSync(assets)
+          fs.symlinkSync(redirected, assets)
+        },
+      })).rejects.toThrow("target changed")
+      expect(fs.existsSync(path.join(redirected, "image.png"))).toBe(false)
+    } finally { fs.rmSync(outside, { recursive: true, force: true }) }
+  })
+
   it("creates the assets directory chain, which never exists on a first generation", async () => {
     const { ctx } = askRecorder()
     expect(fs.readdirSync(projectDir)).toHaveLength(0)

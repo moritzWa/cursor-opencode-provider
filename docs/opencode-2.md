@@ -156,12 +156,12 @@ A prompt sent before those servers finish connecting will not see their tools. O
 |---|---|
 | `config` hook registers provider + models | `ctx.provider.transform` + `editor.add` + `reload()` |
 | `auth` hook (OAuth + API key) | `ctx.integration.transform` + `/connect` |
-| `tool` hook (`custom_websearch`, `cursor_image_save`) | `ctx.tool.transform` registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema) so generated images can be committed. `todowrite`/`todoread` only when `CURSOR_OPENCODE2_TODOS=1` (or `true`) and the host catalog omits them. Off by default. OpenCode 2's native `websearch` tool owns permission checks and uses the provider registered through `ctx.websearch.transform`. The public 2.0 `ToolContext` has no permission-request method, so this entrypoint does not advertise a direct web-search fallback; image save uses catalog `edit` gating plus containment when `ask` is absent. |
+| `tool` hook (`custom_websearch`, `cursor_image_save`) | `ctx.tool.transform` registers handle-only `cursor_image_save` (`codemode: false`, `permission: "edit"`, output schema) so generated images can be committed. `todowrite`/`todoread` only when `CURSOR_OPENCODE2_TODOS=1` (or `true`) and the host catalog omits them. Off by default. OpenCode 2's native `websearch` tool owns permission checks and uses the provider registered through `ctx.websearch.transform`. Plugin tools call the public `ctx.permission.assert` with the executing session, agent, tool source and actual resource before accessing data or saving an image. Image saves assert `external_directory` and `edit`; optional todos assert their own actions. Missing permission APIs fail closed. Web search keeps its native executor. |
 | `event` hook (session activity) | `ctx.event.subscribe` |
 | `tool.execute.before` / `.after` | `ctx.tool.hook(...)` |
 | Post-approval `shell.env` injects the timeout wrapper for bash/zsh | `ctx.shell.hook("create.before")` installs a same-basename executable adapter. The command stays unchanged for the host's later permission scan; the payload uses the actual selected shell. |
 | `chat.params` flags compaction turns and names the current agent | `session.hook("context")` / `"compaction"` sets `options.opencodeCompaction`, `options.opencodeHostAgent`, and the session marker |
-| `plan_enter` / `plan_exit` | OpenCode 2's primary `plan` / `build` agents are selected through `session.switchAgent`. Cursor mode entry is applied after its Run reaches a safe terminal boundary. CreatePlan records the plan in the Plan directory, shows it, and asks through `question` whether to switch to `build` and start implementing; Yes selects `build` and continues the turn. |
+| `plan_enter` / `plan_exit` | OpenCode 2's primary `plan` / `build` agents are selected through `session.switchAgent`. Cursor mode entry is applied after its Run reaches a safe terminal boundary. CreatePlan records the plan in the Plan directory, shows it, and asks through `question` whether to switch to `build` and start implementing; Yes ends the plan Run before selecting `build` and continuing. No, refinement or dismissal ends the current turn, keeps `plan`, and requires a new user message before further work. |
 | Host `todowrite` builtin | OpenCode 2 dropped host todo tools. Plugin-owned `todowrite`/`todoread` stay **off** unless `CURSOR_OPENCODE2_TODOS=1` (or `true`). When enabled they register as **direct** catalog tools (`codemode: false` + `output` schema, in-memory per session) unless `editor.get`/`list` already owns those names. With the flag unset, no provider todo tools are registered. Cursor TodoWrite/TodoRead mirror into them only when they are advertised. OpenCode 1.x still uses the host builtin and is not gated. |
 | Host `task` tool | Native Cursor Task remaps onto advertised `task`, or onto OpenCode 2 `subagent` (`agent` / `sessionID` / `background`) when `task` is absent |
 | — | `credential.switched` clears the token cache and reloads models |
@@ -259,6 +259,8 @@ does not invoke the tool or install a new top-level function.
 
 An approved CreatePlan review ends the old plan Run before the host switches
 to its build agent and continues implementation. Declining leaves it in plan.
+Selecting the already active native agent keeps the current Run and adds no
+continuation turn.
 
 OpenCode 2 owns its full system prompt and its vendor-maintained Plan agent. The provider forwards the host prompt verbatim as Cursor's always-apply system-instructions rule (Cursor does not follow a client-seeded `system` message); it does not copy or replace the 2.0 prompt templates. Provider-added guidance is limited to protocol facts the host cannot know, such as Cursor interaction bridging and the advertised direct tool catalog.
 
@@ -272,8 +274,9 @@ session rule in the client first. The plugin reads current `permissions` on
 each context request, retries a failed lookup once, and stops the request if
 the rules remain unreadable.
 Current rule reminders also reach held tool continuations. Lifting a deny
-supersedes its earlier reminder while preserving normal plan approval. Without
-a deny to supersede, no rule reminder is sent.
+supersedes its earlier reminder while preserving normal plan approval, including
+when a deferred note restores an older deny. Ordinary tool steps without a deny
+to supersede send no rule reminder.
 
 An OpenCode agent or system-prompt change keeps the sticky Cursor conversation, as Cursor CLI keeps its conversation across mode flips. The conversation's first system context stays frozen as the system-instructions rule, so the prompt cache survives; the new agent and the changed host instructions arrive as a Mid-Conversation System Message on the next user turn, which the model follows. The host agent and prompt hash are persisted with the checkpoint for diagnostics only. Ephemeral title/generation calls do not alter that identity.
 

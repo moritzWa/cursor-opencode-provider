@@ -825,8 +825,8 @@ const MAX_EDIT_SOURCE_BYTES = 50 * 1024 * 1024
  * for an edit whose read becomes its own host call.
  *
  * - `empty`: no target. The provider answers an empty file; creation continues.
- * - `complete`: a readable regular file within Cursor's edit limit whose real
- *   path is inside the workspace. The provider answers its complete content.
+ * - `host-complete`: a regular workspace file within Cursor's edit limit.
+ *   OpenCode authorizes its read before the provider supplies complete content.
  * - `external`: an existing target not proven inside the workspace by real
  *   path, including through a symlink rooted in it. OpenCode's
  *   permission-aware `read` answers; once authorized, the continuation
@@ -834,7 +834,7 @@ const MAX_EDIT_SOURCE_BYTES = 50 * 1024 * 1024
  * - `host`: any other existing target (not a regular file, too large,
  *   unreadable, or not stat-able). OpenCode's `read` answers as is.
  */
-export type CursorEditReadAnswer = "empty" | "complete" | "external" | "host"
+export type CursorEditReadAnswer = "empty" | "host-complete" | "external" | "host"
 
 export function cursorEditReadAnswer(absolutePath: string, workspaceRoot: string): CursorEditReadAnswer {
   try {
@@ -853,8 +853,7 @@ export function cursorEditReadAnswer(absolutePath: string, workspaceRoot: string
   try {
     const stat = fs.statSync(absolutePath)
     if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return "host"
-    fs.closeSync(fs.openSync(absolutePath, "r"))
-    return "complete"
+    return "host-complete"
   } catch {
     return "host"
   }
@@ -868,28 +867,46 @@ export function cursorEditReadAnswer(absolutePath: string, workspaceRoot: string
  */
 export function cursorEditReadReachesHost(absolutePath: string, workspaceRoot: string): boolean {
   const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
-  if (answer !== "external" && answer !== "host") return false
+  if (answer !== "external" && answer !== "host-complete" && answer !== "host") return false
   return classifyMissingReadTarget(absolutePath) === undefined
 }
 
+/** File identity captured before the exact native read is emitted. */
+export type EditReadIdentity = { realPath: string; dev: number; ino: number }
+
+export function editReadIdentity(sourcePath: string): EditReadIdentity | undefined {
+  try {
+    const realPath = fs.realpathSync(sourcePath)
+    const stat = fs.statSync(realPath)
+    if (!stat.isFile()) return undefined
+    return { realPath, dev: stat.dev, ino: stat.ino }
+  } catch { return undefined }
+}
+
 /**
- * Complete the private read inside Cursor's legacy edit transaction without
- * routing it through OpenCode's user-facing `read` tool. The latter caps every
- * result at 50 KB, while Cursor's editor needs the complete file to calculate
- * the correlated whole-file `write_args` that follows.
+ * Upgrade a successful host-authorized read inside Cursor's legacy edit
+ * transaction. The host may cap its result at 50 KB, while Cursor's editor
+ * needs the complete file to calculate the correlated whole-file write.
  *
- * The caller is responsible for proving that `filePath` is the same regular
- * file named by an active `edit_tool_call` and is contained by the workspace.
+ * The caller must prove an active edit owns this exact, successfully authorized
+ * read. Never call this after a denied or failed read.
  */
 export function buildCompleteEditReadMessages(
   execId: number,
   sourcePath: string,
   resultPath = sourcePath,
+  authorizedIdentity?: EditReadIdentity,
 ): Uint8Array[] | undefined {
+  let fd: number | undefined
   try {
-    const stat = fs.statSync(sourcePath)
-    if (!stat.isFile() || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
-    const content = fs.readFileSync(sourcePath, "utf8")
+    const current = editReadIdentity(sourcePath)
+    if (!current || (authorizedIdentity && (current.realPath !== authorizedIdentity.realPath
+      || current.dev !== authorizedIdentity.dev || current.ino !== authorizedIdentity.ino))) return undefined
+    fd = fs.openSync(current.realPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile() || stat.dev !== current.dev || stat.ino !== current.ino
+      || stat.size > MAX_EDIT_SOURCE_BYTES) return undefined
+    const content = fs.readFileSync(fd, "utf8")
     return [
       encodeMessage("AgentClientMessage", {
         exec_client_message: {
@@ -911,6 +928,8 @@ export function buildCompleteEditReadMessages(
     ]
   } catch {
     return undefined
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
   }
 }
 

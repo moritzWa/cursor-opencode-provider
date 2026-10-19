@@ -3,6 +3,7 @@ import {
   notPermittedThisTurnReason,
   permissionsFromSession,
   resetSessionEditsGuidanceForTests,
+  recordSessionEditsGuidance,
   sessionEditsGuidance,
   sessionRulesDenyEdits,
   SHELL_NOT_FOR_FILE_WRITES,
@@ -69,28 +70,49 @@ describe("sessionEditsGuidance", () => {
   beforeEach(() => resetSessionEditsGuidanceForTests())
   const fresh = { carriesEarlierState: false }
   const carried = { carriesEarlierState: true }
+  const sent = (id: string, denied: boolean, state: typeof fresh) => {
+    const guidance = sessionEditsGuidance(id, denied, state)
+    recordSessionEditsGuidance(id, denied)
+    return guidance
+  }
 
   it("states nothing when the host reported no edit state", () => {
     expect(sessionEditsGuidance("conv", undefined, carried)).toBeUndefined()
   })
 
   it("states every deny, and no deny once after it", () => {
-    expect(sessionEditsGuidance("conv", true, fresh)).toBe(true)
-    expect(sessionEditsGuidance("conv", true, carried)).toBe(true)
-    expect(sessionEditsGuidance("conv", false, carried)).toBe(false)
+    expect(sent("conv", true, fresh)).toBe(true)
+    expect(sent("conv", true, carried)).toBe(true)
+    expect(sent("conv", false, carried)).toBe(false)
     expect(sessionEditsGuidance("conv", false, carried)).toBeUndefined()
   })
 
   it("states no deny for an unknown state only when earlier state reaches Cursor", () => {
-    expect(sessionEditsGuidance("fresh", false, fresh)).toBeUndefined()
+    expect(sent("fresh", false, fresh)).toBeUndefined()
     expect(sessionEditsGuidance("fresh", false, carried)).toBeUndefined()
-    expect(sessionEditsGuidance("resumed", false, carried)).toBe(false)
+    expect(sent("resumed", false, carried)).toBe(false)
     expect(sessionEditsGuidance("resumed", false, carried)).toBeUndefined()
   })
 
   it("keeps conversations apart", () => {
-    expect(sessionEditsGuidance("a", true, fresh)).toBe(true)
-    expect(sessionEditsGuidance("b", false, fresh)).toBeUndefined()
+    expect(sent("a", true, fresh)).toBe(true)
+    expect(sent("b", false, fresh)).toBeUndefined()
     expect(sessionEditsGuidance("a", false, carried)).toBe(false)
+  })
+
+  it("does not consume a correction before it is sent", () => {
+    sent("conv", true, fresh)
+    expect(sessionEditsGuidance("conv", false, carried)).toBe(false)
+    expect(sessionEditsGuidance("conv", false, carried)).toBe(false)
+    recordSessionEditsGuidance("conv", false)
+    expect(sessionEditsGuidance("conv", false, carried)).toBeUndefined()
+    expect(sessionEditsGuidance("conv", false, { ...carried, carriesEditDeny: true })).toBe(false)
+  })
+
+  it("bounds retained states and safely restates evicted checkpoint state", () => {
+    recordSessionEditsGuidance("absent", undefined)
+    for (let i = 0; i <= 256; i++) recordSessionEditsGuidance(`conv-${i}`, false)
+    expect(sessionEditsGuidance("conv-0", false, carried)).toBe(false)
+    expect(sessionEditsGuidance("conv-256", false, carried)).toBeUndefined()
   })
 })

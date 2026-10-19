@@ -4,6 +4,8 @@ import {
   getCheckpoint,
   clearCheckpoint,
   checkpointTokenDetails,
+  getCheckpointOccupancy,
+  restoreCheckpointOccupancy,
   resetCheckpointsForTests,
 } from "../src/protocol/checkpoint.js"
 import { buildRunRequest } from "../src/protocol/request.js"
@@ -50,6 +52,20 @@ describe("checkpoint token details", () => {
   const withTokens = (usedTokens: number) => encodeMessage("ConversationStateStructure", {
     root_prompt_messages_json: [`state-${usedTokens}`],
     token_details: { used_tokens: usedTokens, max_tokens: 256_000 },
+  })
+
+  it("stores only the measured token field and ignores invalid restored metadata", () => {
+    // Independent wire: opaque field #1, then #5 { used_tokens: 42, max_tokens: 256 }.
+    const tokens = Uint8Array.from([0x2a, 5, 8, 42, 16, 0x80, 2])
+    setCheckpoint("conv", Uint8Array.from([10, 1, 120, ...tokens]))
+    expect(getCheckpointOccupancy("conv")).toEqual(tokens)
+    for (const invalid of [Uint8Array.of(0x28, 1), Uint8Array.of(0x2a, 2, 8, 0)]) {
+      restoreCheckpointOccupancy("conv", invalid)
+      expect(getCheckpointOccupancy("conv")).toEqual(tokens)
+    }
+    resetCheckpointsForTests()
+    restoreCheckpointOccupancy("conv", tokens)
+    expect(checkpointTokenDetails("conv", withTokens(0))).toEqual({ usedTokens: 42, maxTokens: 256 })
   })
 
   it("reads the occupancy of the checkpoint being sent", () => {

@@ -133,7 +133,7 @@ async function finishOf(
   }
 }
 
-it("keeps the measured prior occupancy when the sent checkpoint reports zero tokens", async () => {
+it.each([false, true])("keeps measured occupancy on a zero-token checkpoint (restart=%s)", async restart => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-checkpoint-occupancy-"))
   try {
     const models = mapAvailableModelsResponse({ models: [{ name: "occupancy-fixture" }] })
@@ -148,6 +148,14 @@ it("keeps the measured prior occupancy when the sent checkpoint reports zero tok
     )
     const first = [{ role: "user", content: [{ type: "text", text: "first" }] }]
     await finishOf(model, first)
+    if (restart) {
+      await settleRunSavesForTests()
+      sessionManager.dispose()
+      resetTurnStateForTests()
+      resetConversationBindingsForTests()
+      resetConversationPersistenceForTests()
+      resetCheckpointsForTests()
+    }
     const second = await finishOf(model, [
       ...first,
       { role: "assistant", content: [{ type: "text", text: "ok" }] },

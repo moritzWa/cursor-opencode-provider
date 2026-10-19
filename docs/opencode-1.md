@@ -108,7 +108,9 @@ namespace, discover its schema and invoke it through CallDynamicTool with the
 discovered namespace, tool name and arguments. Discovery is not a mode switch.
 
 When the provider owns the native agent handoff, approval ends the plan Run
-before starting the build turn; declining keeps the session in plan.
+before starting the build turn. Declining, refining, or dismissing the review
+ends the current turn and keeps the session in plan; a new user message is
+required before any further work, including self-test images or scoring.
 
 CreatePlan saves and shows the plan before asking whether to implement. A
 session-wide edit deny keeps the plan saved without an implementation approval
@@ -117,8 +119,9 @@ Change the session rule in the client before approving implementation. The
 classic plugin reads native `permission` rules, retries a failed session lookup
 once, and stops the request if the rules remain unreadable.
 Rule changes reach held tool continuations too; lifting a deny replaces its
-earlier reminder without bypassing the normal plan review. Without a deny to
-supersede, no rule reminder is sent.
+earlier reminder without bypassing the normal plan review, including when a
+deferred note restores an older deny. Ordinary tool steps without a deny to
+supersede send no rule reminder.
 
 ## Task attachments
 

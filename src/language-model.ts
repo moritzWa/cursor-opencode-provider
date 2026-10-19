@@ -92,6 +92,7 @@ import {
   remapEditToolsForCatalog,
   hostToolForCursorEdit,
   cursorEditReadAnswer,
+  editReadIdentity,
   cursorEditReadReachesHost,
   buildCompleteEditReadMessages,
   rejectPartialReadMutation,
@@ -106,7 +107,7 @@ import {
   type ParsedExecRequest,
 } from "./protocol/tools.js"
 import { hostPatchTool, isHostPatchTool } from "./protocol/apply-patch.js"
-import { buildGitDiffExecMessages } from "./protocol/git-diff.js"
+import { buildGitDiffUnavailableMessages } from "./protocol/git-diff.js"
 import { runtimeExecMessages, runtimeRootFromContext } from "./runtime-files.js"
 import { createManagedTerminal } from "./terminal-runner.js"
 import { cursorExecVariantByRequestField, describeCursorExecVariant } from "./protocol/exec-variants.js"
@@ -151,6 +152,7 @@ import {
   isBridgedCursorPlanModeActive,
   isCursorPlanModeActive,
   SESSION_EDITS_DENIED_SWITCH_REASON,
+  SESSION_EDITS_DENIED_REMINDER,
   setActiveCursorMode,
   switchModeRejectedResult,
   switchModeResultFromToolOutput,
@@ -170,6 +172,7 @@ import {
   notPermittedThisTurnReason,
   resetSessionEditsGuidanceForTests,
   sessionEditsGuidance,
+  recordSessionEditsGuidance,
 } from "./protocol/session-edits.js"
 import { hostPlanFileFor } from "./host-plan-file.js"
 import {
@@ -1920,26 +1923,6 @@ async function startSession(
     && !cursorTools.some((tool) => tool.name === CURSOR_PLAN_STAGE_TOOL)
   // Mode reminders are chronological Mid-Conversation updates (V2), including on
   // checkpoint Turns — never folded into the frozen system baseline.
-  const editGuidance = isCompaction || lifecycle
-    ? undefined
-    : sessionEditsGuidance(conversationId, sessionEditsDenied, {
-        carriesEarlierState: startedWithCheckpoint || (!!sessionKey && undeliveredHostNotesBySession.has(sessionKey)),
-      })
-  const modeReminder = isCompaction || lifecycle
-    ? undefined
-    : nativePlanPromptOwnsMode
-      ? takeActiveCursorModeReminder(undefined, { sessionEditsDenied: editGuidance })
-      : takeActiveCursorModeReminder(sessionKey, {
-          advertisedTools: cursorTools.map((tool) => tool.name),
-          ...(hostAgent ? { hostAgent } : {}),
-          sessionEditsDenied: editGuidance,
-        })
-  const hostPlanAgentNote = isCompaction || lifecycle
-    ? undefined
-    : takeHostPlanAgentNote(sessionKey, conversationId, hostAgent, cursorTools, {
-        ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
-        server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
-      })
   const history = extractPromptHistory(prompt, {
     liveTurnStart: liveTurn?.start,
     preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable && !unfinishedPriorRun,
@@ -1958,6 +1941,28 @@ async function startSession(
     seedHistory: history,
     liveTurnStart: liveTurn?.start,
   })
+  const editGuidance = isCompaction || lifecycle
+    ? undefined
+    : sessionEditsGuidance(conversationId, sessionEditsDenied, {
+        carriesEarlierState: startedWithCheckpoint,
+        carriesEditDeny: userTurnHostNotes.carriedNotes.some(batch =>
+          batch.notes.some(note => note.includes(SESSION_EDITS_DENIED_REMINDER))),
+      })
+  const modeReminder = isCompaction || lifecycle
+    ? undefined
+    : nativePlanPromptOwnsMode
+      ? takeActiveCursorModeReminder(undefined, { sessionEditsDenied: editGuidance })
+      : takeActiveCursorModeReminder(sessionKey, {
+          advertisedTools: cursorTools.map((tool) => tool.name),
+          ...(hostAgent ? { hostAgent } : {}),
+          sessionEditsDenied: editGuidance,
+        })
+  const hostPlanAgentNote = isCompaction || lifecycle
+    ? undefined
+    : takeHostPlanAgentNote(sessionKey, conversationId, hostAgent, cursorTools, {
+        ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
+        server: resolveToolServerIdentity("plan_exit", "opencode", knownMcpServers).server,
+      })
   const oneShotReminders = [
     hostPlanAgentNote,
     ...userTurnHostNotes.reminders,
@@ -2220,6 +2225,7 @@ async function startSession(
     requestedAt: startOptions?.requestedAt ?? Date.now(),
   })
   userTurnHostNotes.sent()
+  if (!isCompaction && !lifecycle && !resuming) recordSessionEditsGuidance(conversationId, sessionEditsDenied)
   const historyImages = sessionKey && !ephemeralRun ? runHistoryImages(heldImages) : undefined
   if (historyImages) noteHistoryImagesSent(historyImages, imageExtraction.hashes, lastFrameArrival())
 
@@ -3267,7 +3273,7 @@ function buildAskQuestionContinuationFrame(
  * Turn the host's plan-approval outcome into the CreatePlan reply Cursor is
  * still blocking on. One contract across every channel: `success` means the
  * user approved execution, `error` means the plan was written but not accepted,
- * so the model keeps planning instead of starting work.
+ * and the owning turn ends without starting work.
  *
  * A host plan-stage tool reports that outcome as tool success/failure; the
  * host `plan_exit` review approves by moving the session out of `plan`. The
@@ -3525,18 +3531,26 @@ async function deliverContinuationResultsNow(
         const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
         const correlatedEditCallId = pending.resultMetadata?.correlatedEditCallId
         const requestedPath = pending.resultMetadata?.path
+        const savedIdentity = pending.resultMetadata?.correlatedEditReadIdentity
+        const identity = savedIdentity && typeof savedIdentity === "object"
+          && "realPath" in savedIdentity && typeof savedIdentity.realPath === "string"
+          && "dev" in savedIdentity && typeof savedIdentity.dev === "number"
+          && "ino" in savedIdentity && typeof savedIdentity.ino === "number"
+          ? { realPath: savedIdentity.realPath, dev: savedIdentity.dev, ino: savedIdentity.ino }
+          : undefined
         const correlatedEdit =
-          !r.error
+          !r.error && !r.refusal && !r.interrupted
           && pending.resultField === "read_result"
           && pending.toolName === "read"
           && typeof correlatedEditCallId === "string"
           && typeof requestedPath === "string"
+          && identity
             ? session.editToolCalls?.get(correlatedEditCallId)
             : undefined
         if (correlatedEdit) {
           const absolutePath = path.resolve(workspaceRoot, requestedPath as string)
           if (absolutePath === path.resolve(workspaceRoot, correlatedEdit.path)) {
-            frames = buildCompleteEditReadMessages(r.execId, absolutePath, requestedPath as string) ?? []
+            frames = buildCompleteEditReadMessages(r.execId, absolutePath, requestedPath as string, identity) ?? []
             if (frames.length > 0) {
               correlatedEdit.completeRead = true
               trace(
@@ -3660,6 +3674,10 @@ async function deliverContinuationResultsNow(
         bridgedPlanEntered: normalized === "plan" || normalized === "spec",
       })
     }
+    if (deliveredCreatePlan && !deliveredCreatePlan.approved) {
+      session.planReviewDeclined = true
+      trace("create_plan: execution not approved; ending the owning turn")
+    }
     if (deliveredCreatePlan?.approved) {
       setActiveCursorMode(session.openCodeSessionId, "agent")
       if (deliveredCreatePlan.emulated && session.openCodeSessionId) {
@@ -3719,9 +3737,13 @@ async function deliverContinuationResultsNow(
         `frames=${outcome.framesWritten} outLen=${r.output.length}`,
     )
   }
-  // A held Run's conversation already has a checkpoint.
-  const editGuidance = sessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied, {
+  // A declined review ends this turn. Do not inject another instruction that
+  // could cause Cursor to start a subsequent step before its cancellation.
+  if (session.planReviewDeclined) return session
+  // A held Run may already contain earlier permission guidance.
+  const editGuidance = deliveredResults === 0 ? undefined : sessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied, {
     carriesEarlierState: true,
+    carriesEditDeny: stepNotes.some(note => note.includes(SESSION_EDITS_DENIED_REMINDER)),
   })
   if (editGuidance !== undefined) {
     const reminder = takeActiveCursorModeReminder(undefined, { sessionEditsDenied: editGuidance })
@@ -3735,6 +3757,7 @@ async function deliverContinuationResultsNow(
       return undefined
     }
   }
+  if (deliveredResults > 0) recordSessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied)
   return session
 }
 
@@ -4358,7 +4381,7 @@ export async function pump(
   let progressContinuationAttempts = 0
   let emittedHostTools = 0
   const earlyRows = new EarlyToolRows()
-  let planHandoffCancellationRequested = false
+  let planTurnCancellationRequested = false
   const replaySafety = new AttemptReplaySafety(session.sessionId, session.replaySafety ??= {})
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
@@ -4550,10 +4573,9 @@ export async function pump(
    * 50 KB, so forwarding this private prerequisite read teaches Cursor's editor
    * that a large file ends at the cap and produces a destructive replacement.
    *
-   * Answer a correlated workspace-file read directly up to Cursor's own 50 MB
-   * edit limit. Missing targets remain empty-file successes so creation can
-   * continue. External and otherwise ineligible reads retain OpenCode's normal
-   * permission-aware path.
+   * Send existing targets through OpenCode's read executor, then upgrade a
+   * successful correlated result to complete content up to Cursor's 50 MB edit
+   * limit. Missing targets remain empty-file successes so creation can continue.
    */
   const recoverCorrelatedEditRead = async (
     parsed: ParsedExecRequest,
@@ -4584,40 +4606,15 @@ export async function pump(
     if (absolutePath !== resolvePath(editPath)) return false
 
     const answer = cursorEditReadAnswer(absolutePath, workspaceRoot)
-    if (answer === "external") {
+    if (answer === "external" || answer === "host-complete") {
       parsed.resultMetadata = {
         ...parsed.resultMetadata,
         correlatedEditCallId: displayCallId,
+        correlatedEditReadIdentity: editReadIdentity(absolutePath),
       }
       return false
     }
     if (answer === "host") return false
-
-    if (answer === "complete") {
-      try {
-        const frames = buildCompleteEditReadMessages(parsed.id, absolutePath, requestedPath)
-        if (!frames) return false
-        for (const frame of frames) {
-          await writeWithBackpressure(session.stream, frame, "complete edit read reply")
-        }
-        const editCall = session.editToolCalls?.get(displayCallId)
-        if (editCall) editCall.completeRead = true
-        trace(
-          `exec: correlated edit read completed directly id=${parsed.id} ` +
-            `path=${JSON.stringify(requestedPath)}; awaiting write_args`,
-        )
-        return true
-      } catch (error) {
-        // Once reply bytes are buffered, falling back to a host read would
-        // answer the same exec again. Transport failures terminate the attempt.
-        rethrowTransportWriteFailure(error)
-        parsed.resultMetadata = {
-          ...parsed.resultMetadata,
-          correlatedEditCallId: displayCallId,
-        }
-        return false
-      }
-    }
 
     // "empty": a missing target.
     try {
@@ -5022,16 +5019,20 @@ export async function pump(
 
     let next: IteratorResult<Frame>
     try {
-      if (!planHandoffCancellationRequested && session.pending.size === 0
-        && isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)) {
+      if (!planTurnCancellationRequested && (session.planReviewDeclined
+        || (session.pending.size === 0 && isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)))) {
         // Approval is delivered before cancellation. The replacement agent
         // starts only after Cursor acknowledges the old Run's termination.
         session.heartbeatCancel?.()
         await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
-          conversation_action: { cancel_action: { reason: "host_plan_agent_handoff" } },
+          conversation_action: { cancel_action: {
+            reason: session.planReviewDeclined ? "plan_execution_declined" : "host_plan_agent_handoff",
+          } },
         }), "plan agent handoff")
-        planHandoffCancellationRequested = true
-        trace("host-agent-mode: cancelling Run for plan handoff")
+        planTurnCancellationRequested = true
+        trace(session.planReviewDeclined
+          ? "create_plan: cancelling Run after execution was declined"
+          : "host-agent-mode: cancelling Run for plan handoff")
       }
       if (session.parallelStep && shouldHoldParallelStep(session.parallelStep)) {
         const step = session.parallelStep
@@ -5099,12 +5100,15 @@ export async function pump(
         ? connectFrameError(payload)
         : new CursorRunInterruptedError()
       if (finishInterruptedTools("remote-error", failure)) return
-      if (planHandoffCancellationRequested && failure.origin === "server" && failure.code === "canceled"
-        && session.pending.size === 0 && isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)) {
+      if (planTurnCancellationRequested && failure.origin === "server" && failure.code === "canceled"
+        && (session.planReviewDeclined
+          || (session.pending.size === 0 && isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)))) {
         // Cancellation is an explicit terminal acknowledgment, not TurnEnded.
         // Preserve its final checkpoint without inventing aggregate billing.
         await persistTerminalCheckpoint(session)
-        trace("host-agent-mode: Run cancellation acknowledged for plan handoff")
+        trace(session.planReviewDeclined
+          ? "create_plan: Run cancellation acknowledged after execution was declined"
+          : "host-agent-mode: Run cancellation acknowledged for plan handoff")
         emitFinish(undefined, { unified: "stop", raw: undefined })
         // The Run still ends here; record its continuity without TurnEnded counters.
         trace(formatCursorCacheDiagnostics(
@@ -5228,7 +5232,7 @@ export async function pump(
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         noteRunImageCheckpoint(session, bytes, frame)
         const tokenDetails = decodeConversationTokenDetails(bytes)
-        if (tokenDetails && !(planHandoffCancellationRequested && tokenDetails.usedTokens === 0
+        if (tokenDetails && !(planTurnCancellationRequested && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
           cacheDiagnostics.tokenDetailUpdates++
           session.tokenDetails = tokenDetails
@@ -5253,9 +5257,9 @@ export async function pump(
       }
     }
 
-    if (iu?.text_delta) {
+    if (iu?.text_delta && !session.planReviewDeclined) {
       emitText(((iu.text_delta as Record<string, unknown>).text as string) ?? "")
-    } else if (iu?.thinking_delta) {
+    } else if (iu?.thinking_delta && !session.planReviewDeclined) {
       emitReasoning(((iu.thinking_delta as Record<string, unknown>).text as string) ?? "")
     } else if (iu?.turn_ended) {
       if (emittedHostTools > 0) {
@@ -5270,7 +5274,9 @@ export async function pump(
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       endingTurns.add(session)
       keepUndeliveredHostNotes(session)
-      const steers = settleEarlySteers(session.openCodeSessionId, session.sessionId)
+      const steers = session.planReviewDeclined
+        ? { answered: 0, undelivered: [], leftToHost: 0 }
+        : settleEarlySteers(session.openCodeSessionId, session.sessionId)
       if (steers.answered && session.openCodeSessionId) {
         trace(`steer: the model answered ${steers.answered} early steer(s) in this turn`)
         rememberSteerAnsweringRun(session.openCodeSessionId, session)
@@ -5303,6 +5309,7 @@ export async function pump(
       }
       if (
         typeof session.reopenWithUserMessage === "function"
+        && !session.planReviewDeclined
         && !isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)
         // A steer Cursor did not take runs as OpenCode's next step; a nudge would delay it.
         && steers.leftToHost === 0
@@ -5399,7 +5406,7 @@ export async function pump(
         session.displayToolCalls.delete(callId)
         const toolCall =
           (completed.tool_call as Record<string, unknown> | undefined) ?? stored
-        if (!session.allowTools || planHandoffCancellationRequested) {
+        if (!session.allowTools || planTurnCancellationRequested) {
           trace(`display tool_call_completed: SKIPPED (tools unavailable or agent handoff) callId=${callId}`)
           disposeParallelCall(callId)
           if (closeIfParallelStepComplete()) return
@@ -5593,13 +5600,10 @@ export async function pump(
           failRunProtocol("Cursor read_mcp_resource reply failed", RUN_REPLY_FAILED)
         }
       } else if (esm.git_diff_request) {
-        const request = (esm.git_diff_request ?? {}) as Record<string, unknown>
         try {
-          const frames = await buildGitDiffExecMessages({
-            execId: esmId,
-            request,
-            workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
-          })
+          const frames = buildGitDiffUnavailableMessages(esmId, session.planReviewDeclined
+            ? CREATE_PLAN_NOT_APPROVED_REASON
+            : undefined)
           for (const frame of frames) {
             await writeWithBackpressure(session.stream, frame, `git_diff reply id=${esmId}`)
           }
@@ -5611,6 +5615,19 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        if (planTurnCancellationRequested) {
+          const parsed = parseExecServerMessage(esm, session.hostToolDialect)
+          if (parsed) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
+            if (!await rejectExec(parsed, session.planReviewDeclined
+              ? CREATE_PLAN_NOT_APPROVED_REASON
+              : "The host agent is switching. End this turn; the next agent continues the work.",
+              session.planReviewDeclined ? "plan execution declined" : "agent handoff")) return
+            disposeParallelCall(displayCallId)
+            continue
+          }
+        }
         // Task prerequisites take precedence over the runtime-file reader:
         // even a terminal/catalog attachment must keep its Task's display owner.
         if (session.allowTools && esm.read_args) {
@@ -5633,14 +5650,6 @@ export async function pump(
         }
         const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (parsed) {
-          if (planHandoffCancellationRequested) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
-            if (!await rejectExec(parsed, "The host agent is switching. End this turn; the next agent continues the work.", "agent handoff")) return
-            disposeParallelCall(displayCallId)
-            if (closeIfParallelStepComplete()) return
-            continue
-          }
           // The model can reach the same internal file through an advertised
           // canonical read over MCP. It still must not ask the host to approve
           // access to provider-owned cache metadata.
@@ -5695,6 +5704,14 @@ export async function pump(
           const editCall = displayCallId
             ? session.editToolCalls?.get(displayCallId)
             : undefined
+          if (editCall && [...session.pending.values()].some(pending =>
+            pending.resultMetadata?.correlatedEditCallId === displayCallId)) {
+            if (!await rejectExec(parsed, "Wait for the host-authorized edit read before sending its replacement.",
+              "edit read authorization pending")) return
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
+            continue
+          }
           // A complete correlated edit read is trusted provenance: unlike an
           // ordinary capped read it cannot have appended our warning marker,
           // and the source itself may legitimately contain the marker text.
@@ -6035,13 +6052,13 @@ export async function pump(
       const handled = (() => {
         try {
           return handleInteractionQuery(interactionQuery, payload, {
-            canBridgeAskQuestion: session.allowTools && !planHandoffCancellationRequested && interactionToolNames.has("question"),
-            allowTools: session.allowTools && !planHandoffCancellationRequested,
+            canBridgeAskQuestion: session.allowTools && !planTurnCancellationRequested && interactionToolNames.has("question"),
+            allowTools: session.allowTools && !planTurnCancellationRequested,
             advertisedTools: interactionToolNames,
             canSaveGeneratedImage:
-              session.allowTools && !planHandoffCancellationRequested && interactionToolNames.has(CURSOR_IMAGE_SAVE_TOOL),
+              session.allowTools && !planTurnCancellationRequested && interactionToolNames.has(CURSOR_IMAGE_SAVE_TOOL),
             canBridgeCreatePlan:
-              session.allowTools && !planHandoffCancellationRequested
+              session.allowTools && !planTurnCancellationRequested
               && isBridgedCursorPlanModeActive(session.openCodeSessionId)
               && interactionToolNames.has(CURSOR_PLAN_STAGE_TOOL)
               && interactionToolNames.has("write"),
@@ -6327,7 +6344,7 @@ export async function pump(
       announced
       && !earlyRows.seen(announced.callId)
       && shouldOpenEarlyRow({
-        allowTools: session.allowTools && !planHandoffCancellationRequested,
+        allowTools: session.allowTools && !planTurnCancellationRequested,
         hostInterrupted: !!session.hostInterrupted,
         holdingParallelStep: !!session.parallelStep && shouldHoldParallelStep(session.parallelStep),
         emittedHostTools,
@@ -6817,6 +6834,7 @@ export function buildOpenCodeInteractionGuidance(
       : names.has("question")
         ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). The provider records the plan and uses the host's plan review when advertised, otherwise the OpenCode `question` tool asks whether to start implementing. Wait for execution approval. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool."
         : "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). The provider records the plan where the host keeps plans, and the host decides when it is executed (without a host review, the user switches to the build agent). Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool.",
+    "- A declined, refined, or dismissed execution review ends the current turn: make no further tool calls, including self-test, image, scoring or cleanup calls. Keep the plan agent and wait for a new human message; an ordinary question result is not that message.",
     planEntryHandoff
       ? "- Planning sequence: call native SwitchMode to enter plan, then STOP and end that turn. Only the following host plan-agent turn may call native CreatePlan. Do not discover tools, investigate, or record a plan between the approved switch and the end of its turn. Once that following turn starts, record the first plan as soon as its shape is clear."
       : "- When the task needs a user-approved plan, record the first version with native CreatePlan as soon as its shape is clear and the advertised planning prerequisites are satisfied. Refining afterward is expected; do not wait for investigation to finish.",

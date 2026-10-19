@@ -218,6 +218,8 @@ export type CursorSession = {
   resumeCheckpointAfterFrame?: number
   /** Stateful replay barriers survive host tool-step boundaries on this Run. */
   replaySafety?: ReplaySafetyState
+  /** A delivered plan review did not approve execution; terminate this Run without continuing. */
+  planReviewDeclined?: boolean
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */

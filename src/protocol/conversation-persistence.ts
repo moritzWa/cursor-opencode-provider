@@ -23,6 +23,8 @@ export type PersistedConversation = {
   conversationId: string
   updatedAt: number
   checkpoint?: Uint8Array
+  /** Last measured occupancy, as a token-details-only checkpoint; separate from resumable state. */
+  occupancyCheckpoint?: Uint8Array
   blobs: ConversationBlobSnapshot[]
   requestContext: Record<string, unknown>
   toolCatalog: OpencodeToolDef[]
@@ -184,6 +186,7 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
   return {
     ...value,
     checkpoint: value.checkpoint ? Uint8Array.from(value.checkpoint) : undefined,
+    ...(value.occupancyCheckpoint ? { occupancyCheckpoint: Uint8Array.from(value.occupancyCheckpoint) } : {}),
     blobs: value.blobs.map((blob) => ({ id: blob.id, data: Uint8Array.from(blob.data) })),
     requestContext: structuredClone(value.requestContext),
     toolCatalog: structuredClone(value.toolCatalog),
@@ -200,7 +203,8 @@ function cloneConversation(value: PersistedConversation): PersistedConversation 
  * updated_at=4, checkpoint=5, blobs=6, request_context=7, tool_catalog=8,
  * post_compaction_rebase=9, host_agent=10, system_prompt_hash=11,
  * turn_provenance_json=12, host_note=13, early_steers_json=14,
- * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17.
+ * lost_request_json=15, sent_image_hashes=16 (repeated), sent_images_checkpoint_sha256=17,
+ * occupancy_checkpoint=18 (token-details-only checkpoint, never Run state).
  * Blob: id=1, data=2. Tool: name=1, description=2,
  * input_schema_json=3, source_name=4.
  *
@@ -330,6 +334,7 @@ function encodeCacheFile(value: PersistedConversation): {
     for (const hash of value.sentImageHashes) writer.uint32(fieldTag(16, 2)).string(hash)
     writer.uint32(fieldTag(17, 2)).string(value.sentImagesCheckpoint)
   }
+  if (value.occupancyCheckpoint?.length) writer.uint32(fieldTag(18, 2)).bytes(value.occupancyCheckpoint)
   return { protobufBytes: writer.finish(), requestContextBytes: requestContext.length }
 }
 
@@ -340,6 +345,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
   let conversationId: string | undefined
   let updatedAt: number | undefined
   let checkpoint: Uint8Array | undefined
+  let occupancyCheckpoint: Uint8Array | undefined
   const blobs: ConversationBlobSnapshot[] = []
   let requestContextBytes: Uint8Array | undefined
   const toolCatalog: OpencodeToolDef[] = []
@@ -424,6 +430,10 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
         if (wireType !== 2) throw new Error("invalid sent images checkpoint")
         sentImagesCheckpoint = reader.string()
         break
+      case 18:
+        if (wireType !== 2) throw new Error("invalid occupancy checkpoint")
+        occupancyCheckpoint = Uint8Array.from(reader.bytes())
+        break
       default:
         reader.skipType(wireType)
     }
@@ -442,6 +452,7 @@ function decodeProtobuf(data: Uint8Array): PersistedConversation {
     conversationId,
     updatedAt,
     checkpoint,
+    ...(occupancyCheckpoint ? { occupancyCheckpoint } : {}),
     blobs,
     requestContext,
     toolCatalog,

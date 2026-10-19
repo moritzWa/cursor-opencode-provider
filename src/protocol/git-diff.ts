@@ -405,3 +405,9 @@ export async function buildGitDiffExecMessages(input: {
     }),
   ]
 }
+
+/** Private exec #44 has no native permission seam; use the advertised shell executor instead. */
+export function buildGitDiffUnavailableMessages(execId: number, reason?: string): Uint8Array[] {
+  return throwAndClose(execId, reason ?? "git_diff requires native host permission checks. "
+    + "Use the advertised shell tool to run git diff; do not retry this private exec.")
+}

@@ -77,7 +77,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Use independent wire evidence.** The extracted proto lagged live frame
   members, request/result field numbers differ, and local round trips hid schema
   errors. Consult the shipped descriptors and canonical fixtures
-  (`src/protocol/exec-variants.ts`, `test/exec-variants.test.ts`).
+  (`src/protocol/exec-variants.ts`, `test/exec-variants.test.ts`). Recognizing a
+  member does not make it control traffic: `user_message_appended` after context
+  injection changes conversation state and must retain its replay barrier
+  (`test/replay-safety.test.ts`, `test/run-interruption.test.ts`).
 - **Apply protobuf defaults deliberately.** Omitted scalars may mean zero;
   omission assertions need sparse decoding. Fragmented varints also need a
   streaming prefix parser (`test/conversation-maintenance.test.ts`).
@@ -251,9 +254,15 @@ These are failure lessons shared by both hosts, not a replacement for
 
 ## Planning and file mutations
 
-- **Gate the unavoidable transition.** The model wrote a plan and stopped
-  without volunteering SwitchMode. Attach approval to CreatePlan; refinement
-  and dismissal must not return execution success (`test/create-plan.test.ts`).
+- **Gate the unavoidable transition and stop on refusal.** The model wrote a
+  plan and stopped without volunteering SwitchMode. Attach approval to
+  CreatePlan. A No answer is ordinary question data in native OpenCode, so a
+  failed CreatePlan reply alone let the model continue its self-test. Cancel
+  and drain the owning Run after an unapproved review; suppress late output,
+  refuse every new exec before runtime metadata handling, and require a fresh
+  user message. Keep the plan agent and already authorized background jobs.
+  Self-verification must score post-refusal tool calls as failure, even when
+  implementation itself did not start (`test/create-plan.test.ts`).
 - **Show the plan before asking.** Putting the full plan in the question dock
   hid the conversation. Render it in the assistant transcript and match the
   exact prompt echoed by the answer (`test/create-plan.test.ts`).
@@ -290,8 +299,11 @@ These are failure lessons shared by both hosts, not a replacement for
   (`test/host-notes-run.test.ts`). Send no-deny guidance only when it replaces
   a deny Cursor may hold: stating it on every request injected it after each
   tool step of a session that never had a deny (`sessionEditsGuidance`). Place current permission guidance after all
-  carried notes too: queued or unacknowledged injections can restore an older
-  deny after restart; retain unrelated notes and the frozen baseline.
+  carried notes too, even when this process already recorded no deny: queued
+  or unacknowledged injections can restore an older deny. Record suppression
+  state only after writing a real delivery, never on a skipped duplicate or
+  failed upload; bound the remembered states. Retain unrelated notes and the
+  frozen baseline (`test/host-notes-run.test.ts`, `test/session-edits.test.ts`).
 - **Lifecycle interactions must not mutate state.** Hard SwitchMode rejection
   polluted the real turn; soft-ack it without changing mode. Do not let a title
   turn write a plan (`test/switch-mode.test.ts`).
@@ -301,7 +313,7 @@ These are failure lessons shared by both hosts, not a replacement for
 - **A private edit read needs complete content.** Cursor's streamed edit is a
   read/whole-file-write handshake; a capped preview corrupted its replacement.
   Preserve correlation and edit intent, including edit-only turns and missing
-  targets; external reads need exact host authorization first
+  targets; all existing-file reads need exact host authorization first
   (`test/parallel-pump.test.ts`, `test/apply-patch.test.ts`).
 - **Test bytes after the actual patch parser.** Stripping an empty payload line
   lost blank lines; endings differed by major and by direct/native route.
@@ -315,8 +327,10 @@ These are failure lessons shared by both hosts, not a replacement for
   `encoding_hint` removed legitimate content. GenerateImage's display data is a
   preview; only its binary write exec commits bytes. Some remote generations
   omit the approval query entirely, so the save tool's edit gate and containment
-  remain essential. Default project assets intentionally stay outside the git
-  worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
+  remain essential. Re-resolve the exact target after the permission wait:
+  a directory swapped to a symlink during approval otherwise redirects the
+  authorized write, even to another path within an allowed root. Default
+  project assets intentionally stay outside the git worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
 
 ## Context, caching and accounting
 
@@ -380,8 +394,11 @@ These are failure lessons shared by both hosts, not a replacement for
   `coldReason`. Its final checkpoint reports `used_tokens=0`; the next Run
   decoded that as prior occupancy and showed no cached prefix. Emit the
   diagnosis with counters unavailable, and treat a zero-token checkpoint as
-  missing occupancy (`test/switch-mode.test.ts`,
-  `test/checkpoint-occupancy-run.test.ts`).
+  missing occupancy. Persist the last measured token field separately from
+  the zero-token resume checkpoint: an in-memory fallback alone loses the
+  cached prefix after restart. Preserve the original Run state bytes and
+  discard the fallback with its conversation (`test/switch-mode.test.ts`,
+  `test/checkpoint-occupancy-run.test.ts`, `test/conversation-persistence.test.ts`).
 
 ## Persistence and process lifetime
 

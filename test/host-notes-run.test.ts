@@ -174,6 +174,32 @@ function endTurn(run: FakeRun, text: string): void {
 }
 
 describe("seeded Runs through a full provider Run", () => {
+  it.each([false, true])("supersedes a carried deny without reacting to unrelated notes (carriedDeny=%s)", async carriedDeny => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-replayed-permissions-"))
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const sessionKey = "ses_replayed_permissions"
+      const options = { cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: false } }
+      onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
+      const prompt: Prompt = [{ role: "user", content: [{ type: "text", text: "Review the plan." }] }]
+      await collect(model, prompt, sessionKey, undefined, options)
+      const stale = takeActiveCursorModeReminder(undefined, { sessionEditsDenied: true })!
+      restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([...(carriedDeny ? [stale] : []), "Keep the independent note."]))
+      await collect(model, [...prompt,
+        { role: "assistant", content: [{ type: "text", text: "Done." }] },
+        { role: "user", content: [{ type: "text", text: "Review again." }] },
+      ], sessionKey, undefined, options)
+      const request = runs[1]!.received.find(message => message.run_request)!.run_request
+      const text = request.action.user_message_action.user_message.text as string
+      expect(text).toContain("Keep the independent note.")
+      if (carriedDeny) {
+        expect(text.indexOf("The session has no global edit deny"))
+          .toBeGreaterThan(text.lastIndexOf("Execution remains blocked by the session's edit rule"))
+      } else expect(text).not.toContain("The session has no global edit deny")
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+
   it.each([false, true])("places current permission after carried stale notes (checkpoint=%s)", async checkpoint => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-carried-permissions-"))
     cacheHttp2SessionForTests(ORIGIN, client)
