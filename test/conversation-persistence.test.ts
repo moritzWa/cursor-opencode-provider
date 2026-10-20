@@ -47,6 +47,7 @@ import {
   snapshotHeldHistoryImagesForTests,
 } from "../src/protocol/sent-history-images.js"
 import { CONVERSATION_CACHE_TTL_MS } from "../src/shared.js"
+import { recordSessionEditsGuidance, sessionEditsGuidance } from "../src/protocol/session-edits.js"
 import { encodeMessage } from "../src/protocol/messages.js"
 import {
   pump,
@@ -151,6 +152,37 @@ describe("conversation restart persistence", () => {
     await writeFile(file, gzipSync(Buffer.concat([raw, Buffer.from([0x90, 1, 1])])))
     clearMemory()
     expect((await loadPersistedConversation(root, sessionKey)).status).toBe("invalid")
+  })
+
+  it("persists whether a session edit deny was ever sent, so a restart adds no needless correction", async () => {
+    const root = await cacheRoot()
+    const requestContext = { rules_info_complete: true }
+    const checkpoint = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+    const save = async (sessionKey: string, conversationId: string, denied: boolean) => {
+      restoreConversationBinding(sessionKey, conversationId)
+      setCheckpoint(conversationId, checkpoint)
+      recordSessionEditsGuidance(conversationId, denied)
+      await persistConversationState(root, { sessionKey, conversationId, requestContext })
+      return gunzipSync(await readFile(conversationCacheFilePath(root, sessionKey)))
+    }
+    // Private cache field #19 (varint): tag 0x98 0x01, value 1.
+    const marker = Buffer.from([0x98, 1, 1])
+    expect((await save("ses_never_denied", "conv-never-denied", false)).includes(marker)).toBe(false)
+    expect((await save("ses_was_denied", "conv-was-denied", true)).includes(marker)).toBe(true)
+
+    clearMemory()
+    await hydrateConversationState(root, "ses_never_denied")
+    await hydrateConversationState(root, "ses_was_denied")
+    const carried = { carriesEarlierState: true }
+    expect(sessionEditsGuidance("conv-never-denied", false, carried)).toBeUndefined()
+    expect(sessionEditsGuidance("conv-was-denied", false, carried)).toBe(false)
+
+    // Wrong wire type for #19 invalidates the snapshot rather than trusting it.
+    const file = conversationCacheFilePath(root, "ses_was_denied")
+    const raw = gunzipSync(await readFile(file))
+    await writeFile(file, gzipSync(Buffer.concat([raw, Buffer.from([0x9a, 1, 0])])))
+    clearMemory()
+    expect((await loadPersistedConversation(root, "ses_was_denied")).status).toBe("invalid")
   })
 
   it("restores the complete resumable state after process memory is cleared", async () => {

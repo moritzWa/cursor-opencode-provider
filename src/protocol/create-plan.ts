@@ -20,6 +20,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { hostPlansDir } from "../context/paths.js"
+import { isHostPlanAgent } from "./cursor-mode.js"
 import { decodeMessageSparse } from "./messages.js"
 import { errorMessage } from "../debug.js"
 import {
@@ -237,12 +238,13 @@ export function resolveCreatePlanBridge(options: {
 
   const names =
     options.advertised instanceof Set ? options.advertised : new Set(options.advertised)
-  if (options.hostAgent === "plan" && names.has("plan_exit")) {
+  const hostPlanAgent = isHostPlanAgent(options.hostAgent)
+  if (hostPlanAgent && names.has("plan_exit")) {
     return options.hostPlanFile
       ? { kind: "exit", planPath: options.hostPlanFile }
       : { kind: "defer", reason: CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON }
   }
-  const planModeActive = options.planModeActive === true || options.hostAgent === "plan"
+  const planModeActive = options.planModeActive === true || hostPlanAgent
   if (planModeActive && names.has("question")) return { kind: "approve" }
   return { kind: "ack" }
 }

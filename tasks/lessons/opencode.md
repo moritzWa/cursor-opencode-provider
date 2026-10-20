@@ -260,8 +260,9 @@ These are failure lessons shared by both hosts, not a replacement for
   failed CreatePlan reply alone let the model continue its self-test. Cancel
   and drain the owning Run after an unapproved review; suppress late output,
   refuse every new exec before runtime metadata handling, and require a fresh
-  user message. Keep the plan agent and already authorized background jobs.
-  Self-verification must score post-refusal tool calls as failure, even when
+  user message. Keep the plan agent and already authorized background jobs;
+  carry host notes delivered beside the declined answer to the next user turn
+  instead of injecting them into the cancelled Run. Self-verification must score post-refusal tool calls as failure, even when
   implementation itself did not start (`test/create-plan.test.ts`).
 - **Show the plan before asking.** Putting the full plan in the question dock
   hid the conversation. Render it in the assistant transcript and match the
@@ -273,7 +274,16 @@ These are failure lessons shared by both hosts, not a replacement for
   and asked again before reaching that boundary. Cancel the old Run just as
   for plan entry, drain its terminal acknowledgment, and refuse late host
   calls before starting build (`test/switch-mode.test.ts`,
-  `test/create-plan.test.ts`).
+  `test/create-plan.test.ts`). A failed apply keeps the request but drops its
+  owner; an owner check that matched any Run then cancelled every later Run
+  before it streamed. Only the Run that queued a handoff owns it.
+- **A read-only mode is not "leaving plan".** Five copies of "plan/spec, else
+  build" sent Cursor's Ask targets to the build agent and refused them under a
+  session edit deny. Cursor CLI maps `chat`/`ask`/`search` to Ask. Mode ids,
+  their role, wire mode and reminder, and the host plan-agent name live only in
+  `src/protocol/cursor-mode.ts`; `followHostPlanAgent` is the one follower on
+  both generations. Keep the current agent for read-only modes, including on
+  the next plan-agent step (`test/switch-mode.test.ts`).
 - **Native execution does not imply a top-level function.** After a successful
   SwitchMode lookup, PR #111 still insisted on a direct call and prohibited
   CallDynamicTool. The captured Run advertised dynamic invocation, never raised
@@ -298,7 +308,11 @@ These are failure lessons shared by both hosts, not a replacement for
   merely clearing a boolean leaves an old checkpoint reminder authoritative
   (`test/host-notes-run.test.ts`). Send no-deny guidance only when it replaces
   a deny Cursor may hold: stating it on every request injected it after each
-  tool step of a session that never had a deny (`sessionEditsGuidance`). Place current permission guidance after all
+  tool step of a session that never had a deny (`sessionEditsGuidance`).
+  Persist whether a deny was ever sent: treating every restart as unknown
+  history repeated the no-deny note on each conversation. Compaction cannot
+  approve a plan, so its 2.0 session read stays best effort and must not abort
+  the compaction (`test/plugin-opencode2.test.ts`). Place current permission guidance after all
   carried notes too, even when this process already recorded no deny: queued
   or unacknowledged injections can restore an older deny. Record suppression
   state only after writing a real delivery, never on a skipped duplicate or

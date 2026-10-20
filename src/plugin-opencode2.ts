@@ -54,10 +54,8 @@ import {
 } from "./host-agent-mode.js"
 import {
   clearActiveCursorMode,
-  getActiveCursorMode,
-  normalizeSwitchModeId,
-  setActiveCursorMode,
 } from "./protocol/switch-mode.js"
+import { isHostPlanAgent, type HostPrimaryAgent } from "./protocol/cursor-mode.js"
 import { CursorPlugin } from "./plugin.js"
 import { nativeToolRefusal, preserveNativeToolResults, type ToolRefusal } from "./opencode2/tool-results.js"
 import type { CreateCursorOptions } from "./index.js"
@@ -214,8 +212,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
             ? ctx.session.prompt
             : undefined
       disposeHostAgentModeSwitch = setHostAgentModeSwitch(
-        async ({ sessionID, targetModeID }) => {
-          const agent = hostAgentForMode(targetModeID)
+        async ({ sessionID, agent }) => {
           // OpenCode answers a plan/build switch with a synthetic note from an
           // event subscriber. Continuing before that note is enqueued lets it
           // miss the first step's promotion, so the host writes its per-request
@@ -246,7 +243,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         },
         {
           ...(continueTurn ? { resumesTurn: true } : {}),
-          accepts: ({ hostAgent, targetModeID }) => hostAgent !== hostAgentForMode(targetModeID),
+          accepts: ({ hostAgent, agent }) => hostAgent !== agent,
         },
       )
     }
@@ -497,11 +494,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       try {
         const info = await ctx.session.get({ sessionID })
         markSessionDirectory(sessionID, info.location.directory)
-        return info
       } catch (error) {
         // Best effort — falls back to the static workspaceRoot above.
         trace(`session directory: session.get failed sessionID=${sessionID}: ${String(error)}`)
-        return undefined
       }
     }
 
@@ -512,18 +507,11 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
         delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
-        if (event.agent !== "compaction") {
-          const activeMode = getActiveCursorMode(event.sessionID)
-          if (event.agent === "plan") {
-            if (activeMode !== "plan" && activeMode !== "spec") {
-              setActiveCursorMode(event.sessionID, "plan")
-            }
-          } else if (activeMode === "plan" || activeMode === "spec") {
-            // A direct OpenCode UI switch away from Plan is authoritative. Do
-            // not overwrite other Cursor-only modes (chat/debug/etc.) merely
-            // because their closest native primary agent is `build`.
-            setActiveCursorMode(event.sessionID, "agent")
-          }
+        // Compaction cannot approve a plan; its session read stays best effort,
+        // like the classic plugin, which reads no rules for it.
+        if (event.agent === "compaction") {
+          await rememberSessionDirectory(event.sessionID)
+          return
         }
         const info = await loadSessionForPermissions(() => ctx.session.get({ sessionID: event.sessionID }))
         markSessionDirectory(event.sessionID, info.location.directory)
@@ -701,18 +689,13 @@ async function saveOpenTurnsForShutdown(): Promise<void> {
 /** Upper bound on waiting for the host's note after a native agent switch. */
 const HOST_SWITCH_REACTION_TIMEOUT_MS = 1_000
 
-function hostAgentForMode(targetModeID: string): "plan" | "build" {
-  const mode = normalizeSwitchModeId(targetModeID)
-  return mode === "plan" || mode === "spec" ? "plan" : "build"
-}
-
 /** Native agent switches waiting for the matching OpenCode plan-mode reminder. */
-type SwitchReactionWaiter = { agent: "plan" | "build"; reacted: () => void }
+type SwitchReactionWaiter = { agent: HostPrimaryAgent; reacted: () => void }
 const switchReactionWaiters = new Map<string, Set<SwitchReactionWaiter>>()
 
 function waitForHostSwitchReaction(
   sessionID: string,
-  agent: "plan" | "build",
+  agent: HostPrimaryAgent,
   timeoutMs: number,
 ): { reacted: Promise<boolean>; cancel(): void } {
   let settle!: (reacted: boolean) => void
@@ -821,7 +804,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
         // OpenCode's Plan plugin owns these reminders. Background notices and
         // an older reminder for the opposite mode do not acknowledge this switch.
         if (typeof text === "string") for (const waiter of [...(switchReactionWaiters.get(id) ?? [])]) {
-          const prefix = waiter.agent === "plan" ? "You are in Plan mode." : "You are NO LONGER in Plan mode."
+          const prefix = isHostPlanAgent(waiter.agent) ? "You are in Plan mode." : "You are NO LONGER in Plan mode."
           if (text.startsWith(`<system-reminder>\n${prefix}`)) waiter.reacted()
         }
       }

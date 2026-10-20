@@ -4,6 +4,8 @@ import {
   permissionsFromSession,
   resetSessionEditsGuidanceForTests,
   recordSessionEditsGuidance,
+  restoreSessionEditsDenySent,
+  sessionEditsDenySent,
   sessionEditsGuidance,
   sessionRulesDenyEdits,
   SHELL_NOT_FOR_FILE_WRITES,
@@ -114,5 +116,27 @@ describe("sessionEditsGuidance", () => {
     for (let i = 0; i <= 256; i++) recordSessionEditsGuidance(`conv-${i}`, false)
     expect(sessionEditsGuidance("conv-0", false, carried)).toBe(false)
     expect(sessionEditsGuidance("conv-256", false, carried)).toBeUndefined()
+    expect(sessionEditsDenySent("conv-0")).toBe(true)
+  })
+
+  it("after a restart, supersedes only a conversation that ever received a deny", () => {
+    restoreSessionEditsDenySent("never-denied", false)
+    expect(sessionEditsGuidance("never-denied", false, carried)).toBeUndefined()
+    restoreSessionEditsDenySent("was-denied", true)
+    expect(sent("was-denied", false, carried)).toBe(false)
+    expect(sessionEditsGuidance("was-denied", false, carried)).toBeUndefined()
+    expect(sessionEditsDenySent("was-denied")).toBe(true)
+    // A carried deny note still needs the correction.
+    expect(sessionEditsGuidance("never-denied", false, { ...carried, carriesEditDeny: true })).toBe(false)
+  })
+
+  it("keeps live state over a later snapshot restore and remembers a sent deny", () => {
+    expect(sent("live", true, fresh)).toBe(true)
+    restoreSessionEditsDenySent("live", false)
+    expect(sessionEditsDenySent("live")).toBe(true)
+    recordSessionEditsGuidance("live", false)
+    expect(sessionEditsDenySent("live")).toBe(true)
+    recordSessionEditsGuidance("clean", false)
+    expect(sessionEditsDenySent("clean")).toBe(false)
   })
 })

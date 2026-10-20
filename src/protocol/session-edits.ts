@@ -81,15 +81,21 @@ export async function loadSessionForPermissions<T>(getSession: () => Promise<T>)
   }
 }
 
-/** Edit state at the last successfully written request/continuation: true deny, false no deny. */
-const editGuidanceByConversation = new Map<string, boolean>()
+/**
+ * Per conversation: the edit state of the last successfully written
+ * request/continuation (`last`, absent when only restored from a snapshot),
+ * and whether any deny reminder was ever written to it (`denySent`).
+ */
+const editGuidanceByConversation = new Map<string, { last?: boolean; denySent: boolean }>()
+const MAX_EDIT_GUIDANCE_CONVERSATIONS = 256
 
 /**
  * Current edit guidance to send, or `undefined` when none is needed.
  * A deny is stated every time. The no-deny note only supersedes a deny Cursor
  * may hold: one this process sent, or, when this process has sent nothing to
- * the conversation, one inside a checkpoint. Carried notes may reintroduce
- * an older deny regardless of what this process last sent.
+ * the conversation, one inside a checkpoint that ever received a deny.
+ * Carried notes may reintroduce an older deny regardless of what this process
+ * last sent.
  */
 export function sessionEditsGuidance(
   conversationId: string,
@@ -97,20 +103,38 @@ export function sessionEditsGuidance(
   options: { carriesEarlierState: boolean; carriesEditDeny?: boolean },
 ): boolean | undefined {
   if (denied === undefined) return undefined
-  const previous = editGuidanceByConversation.get(conversationId)
   if (denied) return true
-  if (!options.carriesEditDeny
-    && (previous === false || (previous === undefined && !options.carriesEarlierState))) return undefined
-  return false
+  if (options.carriesEditDeny) return false
+  const state = editGuidanceByConversation.get(conversationId)
+  if (state?.last !== undefined) return state.last ? false : undefined
+  if (!options.carriesEarlierState) return undefined
+  // Unknown history (evicted, or never recorded nor restored) may hold a deny.
+  return state && !state.denySent ? undefined : false
 }
 
 /** Record only after the request or continuation carrying this state was written. */
 export function recordSessionEditsGuidance(conversationId: string, denied: boolean | undefined): void {
   if (denied === undefined) return
+  const denySent = denied || editGuidanceByConversation.get(conversationId)?.denySent === true
+  setEditGuidance(conversationId, { last: denied, denySent })
+}
+
+/** Snapshot value: an unknown conversation may hold a deny. */
+export function sessionEditsDenySent(conversationId: string): boolean {
+  return editGuidanceByConversation.get(conversationId)?.denySent ?? true
+}
+
+/** Restart snapshot marker; live state recorded by this process wins. */
+export function restoreSessionEditsDenySent(conversationId: string, denySent: boolean): void {
+  if (editGuidanceByConversation.has(conversationId)) return
+  setEditGuidance(conversationId, { denySent })
+}
+
+function setEditGuidance(conversationId: string, state: { last?: boolean; denySent: boolean }): void {
   editGuidanceByConversation.delete(conversationId)
-  editGuidanceByConversation.set(conversationId, denied)
+  editGuidanceByConversation.set(conversationId, state)
   // An evicted conversation safely restates its current state on checkpoint reuse.
-  if (editGuidanceByConversation.size > 256) {
+  if (editGuidanceByConversation.size > MAX_EDIT_GUIDANCE_CONVERSATIONS) {
     editGuidanceByConversation.delete(editGuidanceByConversation.keys().next().value!)
   }
 }

@@ -6,7 +6,6 @@ import {
   USER_REJECTED_REASON,
   cursorModeSystemReminder,
   decodeSwitchModeQuery,
-  cursorAgentModeWireValue,
   followHostPlanAgent,
   getActiveCursorMode,
   isBridgedCursorPlanModeActive,
@@ -24,6 +23,13 @@ import {
   SESSION_EDITS_DENIED_SWITCH_REASON,
   SWITCH_MODE_RESULT_FIELD,
 } from "../src/protocol/switch-mode.js"
+import {
+  cursorAgentModeWireValue,
+  cursorModeRole,
+  cursorModeSpec,
+  hostAgentForCursorMode,
+  isHostPlanAgent,
+} from "../src/protocol/cursor-mode.js"
 import { parseDisplayToolCall, resolveBridgedOpenCodeToolCall } from "../src/protocol/tool-call-bridge.js"
 import { deliverContinuationResults, pump } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
@@ -32,6 +38,7 @@ import {
   createPromptHostAgentModeSwitch,
   flushHostAgentModeSwitch,
   hostAgentSwitchPromptText,
+  isHostAgentHandoffPending,
   isHostPlanEntryPending,
   queueHostAgentModeSwitch,
   resetHostAgentModeSwitchForTests,
@@ -63,11 +70,21 @@ describe("mapSwitchModeTarget", () => {
     expect(mapSwitchModeTarget("SPEC")).toEqual({ ok: true, toolName: "plan_enter" })
   })
 
-  it("maps every non-plan target to plan_exit", () => {
+  it("maps a read-only Ask target to no host tool, as Cursor CLI maps chat/ask/search to Ask", () => {
+    for (const id of ["chat", "ask", "SEARCH"]) {
+      expect(mapSwitchModeTarget(id)).toEqual({ ok: true })
+      expect(cursorModeRole(id)).toBe("read-only")
+      expect(hostAgentForCursorMode(id)).toBeUndefined()
+    }
+    expect(hostAgentForCursorMode("spec")).toBe("plan")
+    expect(hostAgentForCursorMode("debug")).toBe("build")
+    expect(cursorModeRole(" ")).toBeUndefined()
+  })
+
+  it("maps every implementing target to plan_exit", () => {
     for (const id of [
       "agent",
       "build",
-      "chat",
       "debug",
       "edit",
       "background",
@@ -190,6 +207,17 @@ describe("resolveSwitchModeBridge", () => {
         advertised,
         sessionEditsDenied: true,
       })).toEqual({ kind: "approve" })
+      // A read-only mode keeps the plan agent and starts nothing, so neither
+      // the deny nor the host's plan exit stands in its way.
+      for (const target of ["chat", "ask", "search"]) {
+        expect(resolveSwitchModeBridge(target, {
+          allowTools: true,
+          advertised,
+          hostAgent: "plan",
+          activeModeId: "plan",
+          sessionEditsDenied: true,
+        })).toEqual({ kind: "approve" })
+      }
     }
     expect(resolveSwitchModeBridge("agent", {
       allowTools: false,
@@ -334,6 +362,13 @@ describe("cursorModeSystemReminder", () => {
     expect(reminder).toContain("<system_reminder>")
     expect(reminder).toContain("Ask mode is active")
     expect(reminder).toContain("</system_reminder>")
+  })
+
+  it("gives every read-only Ask id the Ask reminder, never permission to implement", () => {
+    for (const id of ["ask", "search"]) {
+      expect(cursorModeSystemReminder(id)).toBe(cursorModeSystemReminder("chat"))
+      expect(cursorModeSystemReminder(id)).not.toContain("may implement")
+    }
   })
 
   it("emits mode-specific first-turn guidance", () => {
@@ -736,6 +771,17 @@ describe("native-agent switch concurrency", () => {
     expect(attempts).toBe(2)
   })
 
+  it("does not make the Run after a failed switch cancel itself as the handoff owner", async () => {
+    setHostAgentModeSwitch(() => { throw new Error("host unavailable") }, { resumesTurn: true })
+    queueHostAgentModeSwitch({ sessionID: "orphan", targetModeID: "agent", cursorSessionID: "old" })
+    expect(isHostAgentHandoffPending("orphan", "old")).toBe(true)
+    expect(isHostAgentHandoffPending("orphan", "new")).toBe(false)
+    expect(await flushHostAgentModeSwitch("orphan", { terminal: true, cursorSessionID: "old" })).toBe(false)
+    // The request stays queued for a later terminal boundary, but no Run owns it.
+    expect(isHostAgentHandoffPending("orphan", "old")).toBe(false)
+    expect(isHostAgentHandoffPending("orphan", "new")).toBe(false)
+  })
+
   it("does not clear a replacement's Run ownership when the older callback fails", async () => {
     let reject!: (error: Error) => void
     const gate = new Promise<void>((_, rejectGate) => { reject = rejectGate })
@@ -775,6 +821,15 @@ describe("followHostPlanAgent", () => {
     expect(getActiveCursorMode("t")).toBe("plan")
   })
 
+  it("keeps a read-only mode approved under the plan agent until a transition into it", () => {
+    setActiveCursorMode("s", "ask")
+    expect(followHostPlanAgent("s", "plan", "plan")).toBeUndefined()
+    expect(getActiveCursorMode("s")).toBe("ask")
+    // The user's picker selects the plan agent from another agent: plan mode wins.
+    expect(followHostPlanAgent("s", "build", "plan")).toBe("entered")
+    expect(getActiveCursorMode("s")).toBe("plan")
+  })
+
   it("leaves other modes alone outside the host plan agent", () => {
     setActiveCursorMode("s", "plan")
     expect(followHostPlanAgent("s", "build", "build")).toBeUndefined()
@@ -801,6 +856,22 @@ describe("cursorAgentModeWireValue", () => {
     for (const mode of ["agent", "build", "spec", "triage", "project", "multitask", "", undefined]) {
       expect(cursorAgentModeWireValue(mode)).toBe(1)
     }
+  })
+})
+
+describe("cursor mode table", () => {
+  it("classifies every known mode once: role, wire mode and reminder agree", () => {
+    expect(cursorModeSpec("spec")).toEqual({ role: "plan", wire: 1, guidance: "plan" })
+    expect(cursorModeSpec("Debug")).toEqual({ role: "implement", wire: 4, guidance: "debug" })
+    expect(cursorModeSpec("unknown-mode")).toEqual({ role: "implement", wire: 1, guidance: "agent" })
+    expect(cursorModeSpec("")).toBeUndefined()
+    // Prototype keys are ordinary unknown modes.
+    expect(cursorModeSpec("constructor")?.guidance).toBe("agent")
+  })
+
+  it("names the host plan agent exactly", () => {
+    expect(isHostPlanAgent("plan")).toBe(true)
+    for (const agent of ["build", "Plan", "", undefined]) expect(isHostPlanAgent(agent)).toBe(false)
   })
 })
 
@@ -876,33 +947,42 @@ describe("OpenCode 1.x prompt-based host-agent switch", () => {
 
   it("enters the host plan agent with a synthetic plan turn", async () => {
     const { prompts, apply, accepts } = recorder(new Set(["build", "plan"]))
-    expect(accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "build" })).toBe(true)
-    expect(accepts({ sessionID: "s", targetModeID: "SPEC", hostAgent: "build" })).toBe(true)
-    await apply({ sessionID: "s", targetModeID: "spec", hostAgent: "build" })
+    expect(accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "build" })).toBe(true)
+    expect(accepts({ sessionID: "s", targetModeID: "SPEC", agent: "plan", hostAgent: "build" })).toBe(true)
+    await apply({ sessionID: "s", targetModeID: "spec", agent: "plan", hostAgent: "build" })
     expect(prompts).toEqual([{ sessionID: "s", agent: "plan", text: hostAgentSwitchPromptText("plan") }])
   })
 
   it("leaves the observed host plan agent for build", async () => {
     const { prompts, apply, accepts } = recorder()
-    expect(accepts({ sessionID: "s", targetModeID: "agent", hostAgent: "plan" })).toBe(true)
-    await apply({ sessionID: "s", targetModeID: "agent", hostAgent: "plan" })
+    expect(accepts({ sessionID: "s", targetModeID: "agent", agent: "build", hostAgent: "plan" })).toBe(true)
+    await apply({ sessionID: "s", targetModeID: "agent", agent: "build", hostAgent: "plan" })
     expect(prompts).toEqual([{ sessionID: "s", agent: "build", text: hostAgentSwitchPromptText("build") }])
   })
 
   it("accepts only a real transition of a host primary-agent session", () => {
     const { accepts } = recorder()
     // Already in the requested agent.
-    expect(accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "plan" })).toBe(false)
-    expect(accepts({ sessionID: "s", targetModeID: "agent", hostAgent: "build" })).toBe(false)
+    expect(accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "plan" })).toBe(false)
+    expect(accepts({ sessionID: "s", targetModeID: "agent", agent: "build", hostAgent: "build" })).toBe(false)
     // Unknown, subagent, or hidden internal sessions never get a user turn.
-    expect(accepts({ sessionID: "s", targetModeID: "plan" })).toBe(false)
-    expect(accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "summary" })).toBe(false)
-    expect(accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "explore" })).toBe(false)
+    expect(accepts({ sessionID: "s", targetModeID: "plan", agent: "plan" })).toBe(false)
+    expect(accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "summary" })).toBe(false)
+    expect(accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "explore" })).toBe(false)
     // A host without a plan agent, or whose agents are not known yet.
-    expect(recorder(new Set(["build"])).accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "build" }))
+    expect(recorder(new Set(["build"])).accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "build" }))
       .toBe(false)
     const unknownAgents = createPromptHostAgentModeSwitch(async () => {}, () => undefined)
-    expect(unknownAgents.accepts({ sessionID: "s", targetModeID: "plan", hostAgent: "build" })).toBe(false)
+    expect(unknownAgents.accepts({ sessionID: "s", targetModeID: "plan", agent: "plan", hostAgent: "build" })).toBe(false)
+  })
+
+  it("never queues a native switch for a read-only mode", () => {
+    const { apply, accepts } = recorder()
+    setHostAgentModeSwitch(apply, { resumesTurn: true, accepts })
+    for (const target of ["chat", "ask", "Search"]) {
+      expect(queueHostAgentModeSwitch({ sessionID: "s", targetModeID: target, hostAgent: "plan" })).toBe(false)
+    }
+    expect(isHostPlanEntryPending("s")).toBe(false)
   })
 
   it("does not queue (or defer CreatePlan for) a request the switch rejects", () => {

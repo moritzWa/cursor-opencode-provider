@@ -26,7 +26,13 @@ import {
   resetActiveCursorModesForTests,
   setActiveCursorMode,
 } from "../src/protocol/switch-mode.js"
-import { deliverContinuationResults, preparePriorSessionForFreshTurn, pump } from "../src/language-model.js"
+import {
+  deliverContinuationResults,
+  preparePriorSessionForFreshTurn,
+  pump,
+  releaseHostNoteInjectionsForTests,
+  resetTurnStateForTests,
+} from "../src/language-model.js"
 import { resetHostPlanFilesForTests, setHostPlanFile } from "../src/host-plan-file.js"
 import {
   flushHostAgentModeSwitch,
@@ -1127,6 +1133,32 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
     expect(switched).toEqual([])
     sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("keeps a declined review's host notes for the next user turn instead of injecting them", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["question", "write"])
+    session.hostAgent = "plan"
+    sessionManager.registerPending(900_000, session, "create_plan_request_response", "question", false, {
+      interactionId: 42, createPlanBridgeKind: "approve",
+      createPlanQuestion: "Approve this plan?", planUri: "file:///plans/review.md",
+    })
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: "declined-review", sessionId: session.sessionId, execId: 900_000,
+        toolName: "question", output: JSON.stringify({ answers: [["No"]] }),
+        notes: ["Background job finished."],
+      }], { hostAgent: "plan" })
+      expect(session.planReviewDeclined).toBe(true)
+      // Only the CreatePlan reply: no context injection into the declined Run.
+      expect(writes).toHaveLength(1)
+      expect(releaseHostNoteInjectionsForTests("create-plan-opencode-session").undelivered)
+        .toEqual(["Background job finished."])
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetTurnStateForTests()
+    }
   })
 
   it("saves the plan and does not ask or switch when session edits stay denied", async () => {

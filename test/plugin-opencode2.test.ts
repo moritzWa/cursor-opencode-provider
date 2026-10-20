@@ -1361,15 +1361,17 @@ describe("opencode2 setup", () => {
     }
     await hooks.get("session.context")!(event)
     expect(event.options.opencodeHostAgent).toBe("plan")
-    expect(getActiveCursorMode("s-plan-agent")).toBe("plan")
 
+    // The provider's `followHostPlanAgent` follows the agent on both
+    // generations; the hook only reports it and never changes the mode.
+    setActiveCursorMode("s-plan-agent", "debug")
+    await hooks.get("session.context")!(event)
+    expect(getActiveCursorMode("s-plan-agent")).toBe("debug")
     event.agent = "build"
+    setActiveCursorMode("s-plan-agent", "plan")
     await hooks.get("session.context")!(event)
-    expect(getActiveCursorMode("s-plan-agent")).toBe("agent")
-
-    setActiveCursorMode("s-plan-agent", "chat")
-    await hooks.get("session.context")!(event)
-    expect(getActiveCursorMode("s-plan-agent")).toBe("chat")
+    expect(event.options.opencodeHostAgent).toBe("build")
+    expect(getActiveCursorMode("s-plan-agent")).toBe("plan")
   })
 
   test("the session context sets the edit-deny option from session permissions", async () => {
@@ -1419,6 +1421,20 @@ describe("opencode2 setup", () => {
     expect(event.options.opencodeSessionEditsDenied).toBe(true)
     ctx.session.get = async () => { throw new Error("session unavailable") }
     await expect(hooks.get("session.context")!(event)).rejects.toThrow("session unavailable")
+  })
+
+  test("a compaction context survives an unreadable session and carries no edit-deny option", async () => {
+    const { ctx, hooks } = fakeContext()
+    ctx.session.get = async () => { throw new Error("session unavailable") }
+    await setupPlugin(ctx)
+    const event = {
+      sessionID: "s-compact",
+      agent: "compaction",
+      options: { opencodeSessionEditsDenied: true } as Record<string, unknown>,
+    }
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeCompaction).toBe(true)
+    expect(event.options.opencodeSessionEditsDenied).toBeUndefined()
   })
 
   test("the session hook records the session's real directory, not the daemon cwd", async () => {

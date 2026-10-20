@@ -190,7 +190,7 @@ A [decline without feedback bypasses the tool after hook](https://github.com/ano
 The permission and terminal-failure events release unstarted shell reservations
 immediately; running jobs retain their records.
 
-Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask`, so the 2.0 entrypoint still advertises the tool (`permission: "edit"` so agents that deny edits do not get it) and commits after containment; the id is opaque, so the model cannot write arbitrary files.
+Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.0. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.0 has no public `ask` on its tool context, so the 2.0 entrypoint advertises the tool with `permission: "edit"` (agents that deny edits do not get it) and, before writing, asserts `external_directory` and `edit` on the actual target through the plugin's `ctx.permission.assert`; without that API the save is refused. The id is opaque, so the model cannot write arbitrary files.
 
 ## Task attachments
 
@@ -255,7 +255,10 @@ Cursor tools use their advertised invocation route. A supplied top-level
 function is called directly; a SwitchMode, CreatePlan or GenerateImage listed
 in a dynamic namespace is discovered and invoked through GetDynamicTools /
 CallDynamicTool with its namespace, tool name and arguments. Discovery alone
-does not invoke the tool or install a new top-level function.
+does not invoke the tool or install a new top-level function. Each tool's
+route is chosen per turn: SwitchMode can be dynamic while the following plan
+turn supplies CreatePlan directly, so the model looks up a tool only in the
+turn that invokes it and never looks up a supplied function.
 
 An approved CreatePlan review ends the old plan Run before the host switches
 to its build agent and continues implementation. Declining leaves it in plan.
@@ -266,13 +269,14 @@ OpenCode 2 owns its full system prompt and its vendor-maintained Plan agent. The
 
 MCP tools whose server did not set `"codemode": true` are on the direct catalog and are called by name. `execute` remains Code Mode for tools that are still absent from that list, including an explicit `"codemode": true` server and OpenCode's own Code Mode tools. Cursor calls `execute` with `{ code }` and uses the exact paths and signatures from the host Code Mode catalog (or its `search` function). OpenCode still applies its own tool availability and permission checks when `execute` runs.
 
-When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 2's `plan` primary agent after the current Cursor Run has safely ended. Approved non-plan targets select `build`. While the session runs the `plan` agent and no native `plan_exit` tool exists, a Cursor SwitchMode out of plan mode is declined with a pointer to CreatePlan, whose `question` prompt is the approval to start implementing (without `question`, the user switches agents). A user switching agents in the OpenCode UI follows the same state path because `session.hook("context")` carries the active agent into the provider. After its own switch the plugin waits briefly for OpenCode's plan-mode note before continuing the turn, so that note is written once.
+When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 2's `plan` primary agent after the current Cursor Run has safely ended. Approved implementing targets select `build`. Cursor's read-only Ask targets (`chat`, `ask`, `search`) keep the current agent, so they are approved even under the `plan` agent or a session edit deny. While the session runs the `plan` agent and no native `plan_exit` tool exists, a Cursor SwitchMode out of plan mode is declined with a pointer to CreatePlan, whose `question` prompt is the approval to start implementing (without `question`, the user switches agents). A user switching agents in the OpenCode UI follows the same state path because `session.hook("context")` carries the active agent into the provider. After its own switch the plugin waits briefly for OpenCode's plan-mode note before continuing the turn, so that note is written once.
 
 A session-wide edit deny keeps a saved plan from approving implementation or
 switching to build, even if edits to the plan file are allowed. Change that
 session rule in the client first. The plugin reads current `permissions` on
 each context request, retries a failed lookup once, and stops the request if
-the rules remain unreadable.
+the rules remain unreadable. Compaction cannot approve a plan, so it reads no
+rules and is never stopped by an unreadable session.
 Current rule reminders also reach held tool continuations. Lifting a deny
 supersedes its earlier reminder while preserving normal plan approval, including
 when a deferred note restores an older deny. Ordinary tool steps without a deny

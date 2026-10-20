@@ -146,7 +146,6 @@ import {
 } from "./protocol/ask-question.js"
 import {
   SWITCH_MODE_RESULT_FIELD,
-  cursorAgentModeWireValue,
   followHostPlanAgent,
   getActiveCursorMode,
   isBridgedCursorPlanModeActive,
@@ -160,6 +159,12 @@ import {
   takeActiveCursorModeReminder,
   takeHostPlanAgentNote,
 } from "./protocol/switch-mode.js"
+import {
+  cursorAgentModeWireValue,
+  cursorModeRole,
+  hostAgentForCursorMode,
+  isHostPlanAgent,
+} from "./protocol/cursor-mode.js"
 import {
   CREATE_PLAN_NOT_APPROVED_REASON,
   CREATE_PLAN_RESULT_FIELD,
@@ -1918,8 +1923,8 @@ async function startSession(
   const activeMode = getActiveCursorMode(sessionKey)
   // The host plan agent's own prompt owns plan mode, unless a host plan-stage
   // tool takes the plan: then the provider's stage reminder says how to submit it.
-  const nativePlanPromptOwnsMode = hostAgent === "plan"
-    && (activeMode === "plan" || activeMode === "spec")
+  const nativePlanPromptOwnsMode = isHostPlanAgent(hostAgent)
+    && cursorModeRole(activeMode) === "plan"
     && !cursorTools.some((tool) => tool.name === CURSOR_PLAN_STAGE_TOOL)
   // Mode reminders are chronological Mid-Conversation updates (V2), including on
   // checkpoint Turns — never folded into the frozen system baseline.
@@ -3312,7 +3317,7 @@ function buildCreatePlanContinuationFrame(
         typeof metadata.createPlanQuestion === "string" ? metadata.createPlanQuestion : "",
       )
     : hostExit
-      ? result.error === undefined && !!deliveryHostAgent && deliveryHostAgent !== "plan"
+      ? result.error === undefined && !!deliveryHostAgent && !isHostPlanAgent(deliveryHostAgent)
       : result.error === undefined
   if (emulated) {
     trace(
@@ -3372,7 +3377,7 @@ function buildSwitchModeContinuationFrame(
   const target = "approved" in answer && typeof metadata.switchModeTarget === "string"
     ? metadata.switchModeTarget.trim()
     : ""
-  if (sessionEditsDenied && target && sessionEditsBlockMode(target)) {
+  if (sessionEditsDenied && hostAgentForCursorMode(target) === "build") {
     return {
       frame: buildSwitchModeInteractionReply(interactionId, switchModeRejectedResult(SESSION_EDITS_DENIED_SWITCH_REASON)),
     }
@@ -3407,15 +3412,6 @@ function sessionEditsDeniedFromCallOptions(callOptions: LanguageModelV3CallOptio
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const denied = providerOptions?.[CURSOR_SESSION_EDITS_DENIED_OPTION]
   return typeof denied === "boolean" ? denied : undefined
-}
-
-function normalizeModeId(targetModeId: string): string {
-  return targetModeId.trim().toLowerCase()
-}
-
-function sessionEditsBlockMode(targetModeId: string): boolean {
-  const mode = normalizeModeId(targetModeId)
-  return mode !== "plan" && mode !== "spec"
 }
 
 const continuationDeliveryChains = new WeakMap<CursorSession, Promise<CursorSession | undefined>>()
@@ -3669,9 +3665,8 @@ async function deliverContinuationResultsNow(
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
-      const normalized = deliveredSwitchMode.target.toLowerCase()
       setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
-        bridgedPlanEntered: normalized === "plan" || normalized === "spec",
+        bridgedPlanEntered: cursorModeRole(deliveredSwitchMode.target) === "plan",
       })
     }
     if (deliveredCreatePlan && !deliveredCreatePlan.approved) {
@@ -3738,8 +3733,15 @@ async function deliverContinuationResultsNow(
     )
   }
   // A declined review ends this turn. Do not inject another instruction that
-  // could cause Cursor to start a subsequent step before its cancellation.
-  if (session.planReviewDeclined) return session
+  // could cause Cursor to start a subsequent step before its cancellation;
+  // this step's host notes ride with the next user turn instead.
+  if (session.planReviewDeclined) {
+    if (deliveredResults > 0 && stepNotes.length > 0 && session.openCodeSessionId) {
+      appendUndeliveredHostNotes(session.openCodeSessionId, [{ notes: stepNotes, order: nextHostNoteOrder++ }])
+      trace(`continuation: plan review declined; kept ${stepNotes.length} host note(s) for the next user turn`)
+    }
+    return session
+  }
   // A held Run may already contain earlier permission guidance.
   const editGuidance = deliveredResults === 0 ? undefined : sessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied, {
     carriesEarlierState: true,
@@ -5274,6 +5276,9 @@ export async function pump(
       trace(`turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
       endingTurns.add(session)
       keepUndeliveredHostNotes(session)
+      // A declined turn ends like a host Stop: its steers stay unanswered, so the
+      // next user turn rebuilds them from host history (`needsHostHistory`)
+      // instead of a follow-up Run continuing the declined turn.
       const steers = session.planReviewDeclined
         ? { answered: 0, undelivered: [], leftToHost: 0 }
         : settleEarlySteers(session.openCodeSessionId, session.sessionId)
@@ -6045,8 +6050,9 @@ export async function pump(
       // SDK has no Cursor-specific UI callback, so answer immediately with the
       // policy from protocol/interactions.ts (AskQuestion bridge, CreatePlan
       // write under OpenCode defaults, GenerateImage approve when saveable).
+      // Like the exec gate, an empty permitted set does not restrict the catalog.
       const permittedInteractions = session.permittedToolNames
-      const interactionToolNames = permittedInteractions
+      const interactionToolNames = permittedInteractions && permittedInteractions.size > 0
         ? new Set([...advertisedToolNameSet].filter(name => permittedInteractions.has(name)))
         : advertisedToolNameSet
       const handled = (() => {
@@ -6828,7 +6834,7 @@ export function buildOpenCodeInteractionGuidance(
   // can advertise its own tools in a dynamic namespace; discovery then needs
   // an invocation through that namespace before an InteractionQuery can arrive.
   instructions.push(
-    "- Cursor-native tools, including SwitchMode, CreatePlan and GenerateImage, use the invocation route Cursor advertises this turn. Call a supplied top-level function directly with its schema. For a tool listed in a dynamic namespace, discover its schema with GetDynamicTools, then invoke it through CallDynamicTool using the discovered `namespace`, `toolName` and `arguments`. A returned schema does not install a new top-level function. Never invent a direct function call absent from the supplied definitions. A successful lookup confirms availability; invoke the tool and wait for its actual result instead of reporting it unavailable. SwitchMode requires `target_mode_id`.",
+    "- Cursor-native tools, including SwitchMode, CreatePlan and GenerateImage, use the invocation route Cursor advertises this turn. Routes are per tool and per turn: one tool's route says nothing about another's, and a mode switch can change them. Call a supplied top-level function directly with its schema and never look it up. Look up a tool only in the turn that invokes it. For a tool listed in a dynamic namespace, discover its schema with GetDynamicTools, then invoke it through CallDynamicTool using the discovered `namespace`, `toolName` and `arguments`. A returned schema does not install a new top-level function. Never invent a direct function call absent from the supplied definitions. A successful lookup confirms availability; invoke the tool and wait for its actual result instead of reporting it unavailable. SwitchMode requires `target_mode_id`.",
     names.has("cursor_plan_stage")
       ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until that tool returns success. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool."
       : names.has("question")

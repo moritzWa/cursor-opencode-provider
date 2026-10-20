@@ -117,7 +117,8 @@ session-wide edit deny keeps the plan saved without an implementation approval
 or a build-agent handoff; allowing only the plan file does not lift that deny.
 Change the session rule in the client before approving implementation. The
 classic plugin reads native `permission` rules, retries a failed session lookup
-once, and stops the request if the rules remain unreadable.
+once, and stops the request if the rules remain unreadable. Compaction reads no
+rules, because it cannot approve a plan.
 Rule changes reach held tool continuations too; lifting a deny replaces its
 earlier reminder without bypassing the normal plan review, including when a
 deferred note restores an older deny. Ordinary tool steps without a deny to
