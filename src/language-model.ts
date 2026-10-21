@@ -15,6 +15,7 @@ import {
   noteToolRequestsListedSeen,
   parallelStepCountMet,
   recordParallelStepEmission,
+  resetToolRequestsListedSeenForTests,
   resolveParallelStepCall,
   shouldGuardCloseParallelStep,
   shouldHoldParallelStep,
@@ -7646,6 +7647,7 @@ export function resolveTurnConversationReset(input: {
 
 export function resetTurnStateForTests(): void {
   resetRetryBudgetsForTests()
+  resetToolRequestsListedSeenForTests()
   toolCatalogBySession.clear()
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()

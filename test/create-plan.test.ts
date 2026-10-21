@@ -862,7 +862,10 @@ describe("deferred CreatePlan display", () => {
 })
 
 describe("CreatePlan execution approval over a held-open Run", () => {
-  afterEach(() => resetHostAgentModeSwitchForTests())
+  afterEach(() => {
+    resetHostAgentModeSwitchForTests()
+    resetTurnStateForTests()
+  })
 
   function startPlan() {
     fs.mkdirSync(path.join(workspace, ".git"))
