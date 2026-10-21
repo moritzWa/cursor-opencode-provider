@@ -274,9 +274,11 @@ When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 
 A session-wide edit deny keeps a saved plan from approving implementation or
 switching to build, even if edits to the plan file are allowed. Change that
 session rule in the client first. The plugin reads current `permissions` on
-each context request, retries a failed lookup once, and stops the request if
-the rules remain unreadable. Compaction cannot approve a plan, so it reads no
-rules and is never stopped by an unreadable session.
+each context request and retries a failed lookup once. If the rules remain
+unreadable, CreatePlan and implementing mode switches are blocked; ordinary
+requests and native tool permission checks remain usable. Unknown rules are
+never treated as an empty ruleset. Saving a plan under an edit deny ends that
+turn before queued tools can run. Compaction reads no rules.
 Current rule reminders also reach held tool continuations. Lifting a deny
 supersedes its earlier reminder while preserving normal plan approval, including
 when a deferred note restores an older deny. Ordinary tool steps without a deny

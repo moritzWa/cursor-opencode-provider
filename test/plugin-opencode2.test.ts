@@ -1407,7 +1407,7 @@ describe("opencode2 setup", () => {
     expect(plain.options.opencodeHostAgent).toBe("build")
   })
 
-  test("session context retries permission lookup and fails when the rules cannot be read", async () => {
+  test("session context retries permissions and marks unavailable evidence without aborting requests", async () => {
     const { ctx, hooks } = fakeContext()
     let reads = 0
     ctx.session.get = async () => {
@@ -1420,7 +1420,13 @@ describe("opencode2 setup", () => {
     expect(reads).toBe(2)
     expect(event.options.opencodeSessionEditsDenied).toBe(true)
     ctx.session.get = async () => { throw new Error("session unavailable") }
-    await expect(hooks.get("session.context")!(event)).rejects.toThrow("session unavailable")
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBe(true)
+    expect(event.options.opencodeSessionEditsDenied).toBeUndefined()
+    ctx.session.get = async () => ({ id: "s-retry", location: { directory: "/proj" }, permissions: [] })
+    await hooks.get("session.context")!(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBeUndefined()
+    expect(event.options.opencodeSessionEditsDenied).toBe(false)
   })
 
   test("a compaction context survives an unreadable session and carries no edit-deny option", async () => {
@@ -1594,14 +1600,15 @@ describe("opencode2 setup", () => {
     expect(getSessionDirectory("s-other")).toBeUndefined()
   })
 
-  test("a failed permission lookup stops session context and leaves the directory unset", async () => {
+  test("a failed permission lookup leaves ordinary context usable and the directory unset", async () => {
     clearSessionDirectories()
     const { ctx, hooks } = fakeContext()
     await setupPlugin(ctx)
 
     const hook = hooks.get("session.context")!
-    await expect(hook({ sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" } }))
-      .rejects.toThrow("no fake location")
+    const event = { sessionID: "s-unknown", agent: "build", model: { providerID: "cursor" }, options: {} as Record<string, unknown> }
+    await hook(event)
+    expect(event.options.opencodeSessionPermissionsUnavailable).toBe(true)
 
     expect(getSessionDirectory("s-unknown")).toBeUndefined()
   })

@@ -6,6 +6,7 @@ import {
   CURSOR_HOST_AGENT_OPTION,
   CURSOR_PROVIDER_ID,
   CURSOR_SESSION_EDITS_DENIED_OPTION,
+  CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
   CURSOR_WEBSITE_HOST,
 } from "./shared.js"
 import { cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled } from "./plugin-core.js"
@@ -424,6 +425,7 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
       // is rotated instead of resuming the prior agent's prompt.
       output.options[CURSOR_HOST_AGENT_OPTION] = hookInput.agent
       delete output.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
+      delete output.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
       // First Cursor request: the host now serves its API, so read its agents
       // before any Run can raise SwitchMode. Concurrent first requests share
       // the one read; later requests find it settled.
@@ -433,7 +435,11 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
       // present, say whether a session edit deny outlasts an agent switch.
       // The plan file is fixed per session, so it is resolved only once.
       if (hookInput.agent !== "compaction" && getSession) {
-        const loaded = await loadSessionForPermissions(() => getSession(hookInput.sessionID))
+        const loaded = await loadSessionForPermissions(() => getSession(hookInput.sessionID)).catch(() => undefined)
+        if (!loaded) {
+          output.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION] = true
+          return
+        }
         output.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = sessionRulesDenyEdits(permissionsFromSession(loaded))
         if (!isHostPlanFileResolved(hookInput.sessionID)) {
           await resolveHostPlanFile({

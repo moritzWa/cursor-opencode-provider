@@ -47,6 +47,7 @@ import {
   normalizeCursorModeId,
 } from "./cursor-mode.js"
 import { decodeMessageSparse } from "./messages.js"
+import { SESSION_PERMISSIONS_UNAVAILABLE_REASON } from "./session-edits.js"
 
 /**
  * `PendingExec.resultField` for a held-open SwitchMode InteractionQuery.
@@ -198,6 +199,7 @@ export function resolveSwitchModeBridge(
     hostAgent?: string
     /** The session's last `edit` rule on `*` is deny. Leaving plan cannot lift it. */
     sessionEditsDenied?: boolean
+    sessionPermissionsUnavailable?: boolean
   },
 ): SwitchModeBridge {
   const mapped = mapSwitchModeTarget(targetModeId)
@@ -210,6 +212,10 @@ export function resolveSwitchModeBridge(
   // A read-only mode keeps the current primary agent and starts nothing, so
   // neither the host's plan exit nor a session edit deny applies to it.
   if (!mapped.toolName) return { kind: "approve" }
+
+  if (options.sessionPermissionsUnavailable && mapped.toolName === "plan_exit") {
+    return { kind: "reject", reason: SESSION_PERMISSIONS_UNAVAILABLE_REASON }
+  }
 
   // An implementing target selects the host build agent. Approving it,
   // including a same-mode or native plan_exit approval, would start

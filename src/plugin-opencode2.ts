@@ -3,6 +3,7 @@ import {
   CURSOR_COMPACTION_OPTION,
   CURSOR_HOST_AGENT_OPTION,
   CURSOR_SESSION_EDITS_DENIED_OPTION,
+  CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
 } from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencode2PlanDir, opencodeGlobalCacheDir, setNativePlansDir } from "./context/paths.js"
@@ -507,13 +508,18 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
         delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
+        delete event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
         // Compaction cannot approve a plan; its session read stays best effort,
         // like the classic plugin, which reads no rules for it.
         if (event.agent === "compaction") {
           await rememberSessionDirectory(event.sessionID)
           return
         }
-        const info = await loadSessionForPermissions(() => ctx.session.get({ sessionID: event.sessionID }))
+        const info = await loadSessionForPermissions(() => ctx.session.get({ sessionID: event.sessionID })).catch(() => undefined)
+        if (!info) {
+          event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION] = true
+          return
+        }
         markSessionDirectory(event.sessionID, info.location.directory)
         event.options[CURSOR_SESSION_EDITS_DENIED_OPTION] = sessionRulesDenyEdits(info.permissions)
       }),
@@ -690,7 +696,7 @@ async function saveOpenTurnsForShutdown(): Promise<void> {
 const HOST_SWITCH_REACTION_TIMEOUT_MS = 1_000
 
 /** Native agent switches waiting for the matching OpenCode plan-mode reminder. */
-type SwitchReactionWaiter = { agent: HostPrimaryAgent; reacted: () => void }
+type SwitchReactionWaiter = { agent: HostPrimaryAgent; reacted: () => void; cancel: () => void }
 const switchReactionWaiters = new Map<string, Set<SwitchReactionWaiter>>()
 
 function waitForHostSwitchReaction(
@@ -708,11 +714,11 @@ function waitForHostSwitchReaction(
     if (waiters.size === 0 && switchReactionWaiters.get(sessionID) === waiters) switchReactionWaiters.delete(sessionID)
     settle(value)
   }
-  const waiter: SwitchReactionWaiter = { agent, reacted: () => done(true) }
+  const waiter: SwitchReactionWaiter = { agent, reacted: () => done(true), cancel: () => done(false) }
   const timer = setTimeout(() => done(false), timeoutMs)
   timer.unref?.()
   waiters.add(waiter)
-  return { reacted, cancel: () => done(false) }
+  return { reacted, cancel: waiter.cancel }
 }
 
 function subscribeSessionActivity(
@@ -777,6 +783,7 @@ function applySessionActivity(event: any, onCredentialSwitch?: () => void): void
         forgetEarlySteers(id)
         clearActiveCursorMode(id)
         cancelHostAgentModeSwitch(id)
+        for (const waiter of [...(switchReactionWaiters.get(id) ?? [])]) waiter.cancel()
       }
       break
     }

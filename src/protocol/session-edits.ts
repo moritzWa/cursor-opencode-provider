@@ -9,6 +9,10 @@
 /** Shared refusal clause for a mutation the session or this turn still forbids. */
 export const SHELL_NOT_FOR_FILE_WRITES = "Do not create or change files through the shell."
 
+export const SESSION_PERMISSIONS_UNAVAILABLE_REASON =
+  "OpenCode session permissions could not be read, so plan execution cannot be approved. "
+  + "End this turn without implementing or writing files through the shell. Retry on a new user message."
+
 const FILE_MUTATION_TOOLS = new Set(["edit", "write", "apply_patch", "patch"])
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -69,7 +73,7 @@ export async function loadSessionForPermissions<T>(getSession: () => Promise<T>)
   const read = async (): Promise<T> => {
     const session = await getSession()
     const response = asRecord(session)
-    if (!response || response.error != null) {
+    if (!response || response.error != null || ("data" in response && !asRecord(response.data))) {
       throw new Error("Could not read OpenCode session permissions")
     }
     return session

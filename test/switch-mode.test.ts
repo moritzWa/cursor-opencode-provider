@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
 import * as debug from "../src/debug.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
+import { SESSION_PERMISSIONS_UNAVAILABLE_REASON } from "../src/protocol/session-edits.js"
 import {
   USER_REJECTED_REASON,
   cursorModeSystemReminder,
@@ -246,10 +247,12 @@ describe("session edit deny reminders and switch delivery", () => {
   })
 
   it.each([
-    ["agent", true],
-    ["plan", true],
-    ["agent", false],
-  ] as const)("delivers a mode approval for %s with session edits denied=%s", async (target, denied) => {
+    ["agent", true, false],
+    ["plan", true, false],
+    ["agent", false, false],
+    ["agent", false, true],
+    ["plan", false, true],
+  ] as const)("delivers a mode approval for %s with edits denied=%s and permissions unavailable=%s", async (target, denied, unavailable) => {
     setActiveCursorMode("switch-oc-session", "plan")
     const writes: Uint8Array[] = []
     const session = sessionFixture({
@@ -290,12 +293,13 @@ describe("session edit deny reminders and switch delivery", () => {
       execId: 900_000,
       toolName: "plan_exit",
       output: "approved",
-    }], { sessionEditsDenied: denied })
+    }], { sessionEditsDenied: denied, sessionPermissionsUnavailable: unavailable })
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.switch_mode_request_response
-    if (denied && target === "agent") {
-      expect(result.rejected.reason).toBe(SESSION_EDITS_DENIED_SWITCH_REASON)
+    if ((denied || unavailable) && target === "agent") {
+      expect(result.rejected.reason).toBe(unavailable ? SESSION_PERMISSIONS_UNAVAILABLE_REASON : SESSION_EDITS_DENIED_SWITCH_REASON)
       expect(getActiveCursorMode("switch-oc-session")).toBe("plan")
+      expect(session.planReviewDeclined).toBe(true)
     } else {
       expect(result.approved).toBeDefined()
       expect(getActiveCursorMode("switch-oc-session")).toBe(target)
@@ -306,6 +310,23 @@ describe("session edit deny reminders and switch delivery", () => {
 })
 
 describe("decodeSwitchModeQuery", () => {
+  it("blocks only implementing switches when session permission evidence is unavailable", () => {
+    for (const target of ["plan", "spec", "ask", "chat", "agent", "build", "debug", "edit", "unknown"]) {
+      const payload = switchModePayload(switchModeArgs({ target_mode_id: target }))
+      const query = decodeMessage<{ interaction_query: Record<string, unknown> }>("AgentServerMessage", payload).interaction_query
+      const handled = handleInteractionQuery(query, payload, {
+        allowTools: true, advertisedTools: [], sessionPermissionsUnavailable: true,
+      })
+      if (["plan", "spec", "ask", "chat"].includes(target)) {
+        expect(handled.outcome).toBe("approved")
+        expect(handled.endTurn).toBeUndefined()
+      } else {
+        expect(handled.outcome).toBe("rejected")
+        expect(handled.endTurn).toBe(true)
+      }
+    }
+  })
+
   it("decodes target, explanation, and tool call id", () => {
     const query = encodeMessage("SwitchModeRequestQuery", {
       args: switchModeArgs({ target_mode_id: "chat", explanation: "inspect" }),

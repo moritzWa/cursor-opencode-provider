@@ -61,7 +61,8 @@ export function resolveContainedImagePath(
   const absolute = path.isAbsolute(target) ? path.resolve(target) : path.resolve(roots[0]!, target)
 
   // The file need not exist yet; its closest existing ancestor must still
-  // resolve inside an allowed root.
+  // resolve inside an allowed root. A dangling symlink at `probe` makes
+  // `realpathSync` throw ENOENT even though the link itself exists on disk.
   let probe = absolute
   let realProbe: string | undefined
   while (true) {
@@ -69,6 +70,9 @@ export function resolveContainedImagePath(
       realProbe = fs.realpathSync(probe)
       break
     } catch {
+      try {
+        if (fs.lstatSync(probe)) break
+      } catch { /* probe itself does not exist; inspect its parent */ }
       const parent = path.dirname(probe)
       if (parent === probe) break
       probe = parent
@@ -209,9 +213,15 @@ export async function executeCursorImageSave(
   // exist on a first generation, so the parent chain is created here — after
   // the permission, so a refusal leaves no directories behind.
   const directory = path.dirname(contained.path)
+  let fd: number | undefined
   try {
     fs.mkdirSync(directory, { recursive: true })
-    fs.writeFileSync(contained.path, image.data)
+    fd = fs.openSync(
+      contained.path,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW ?? 0),
+      0o666,
+    )
+    fs.writeFileSync(fd, image.data)
   } catch (error) {
     // Most often something already occupies a path component (EEXIST/ENOTDIR).
     // Say which path is blocked; the raw errno alone tells the model nothing.
@@ -221,6 +231,8 @@ export async function executeCursorImageSave(
       `Could not save the generated image to ${contained.path}: ${reason}. `
       + `Check that ${directory} is a writable directory.`,
     )
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
   }
   trace(
     `image save: wrote path=${JSON.stringify(contained.path)} ` +

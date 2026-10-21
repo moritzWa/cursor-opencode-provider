@@ -585,16 +585,21 @@ describe("CursorPlugin compaction marker", () => {
     resetHostPlanFilesForTests()
   })
 
-  it("does not approve from an unreadable session or cache its plan path as absent", async () => {
+  it("keeps ordinary requests usable with unreadable permissions without caching an absent plan", async () => {
     for (const get of [
       async () => { throw new Error("session unavailable") },
       async () => ({ error: { message: "session unavailable" } }),
     ]) {
       resetHostPlanFilesForTests()
       const plugin = await CursorPlugin({ directory: process.cwd(), client: { session: { get } } } as never)
-      await expect(plugin["chat.params"]!({
-        sessionID: "ses_failed", agent: "plan", model: { providerID: "cursor" },
-      } as never, { options: {} } as never)).rejects.toThrow()
+      for (const agent of ["build", "plan"]) {
+        const params = { options: {} as Record<string, unknown> }
+        await plugin["chat.params"]!({
+          sessionID: "ses_failed", agent, model: { providerID: "cursor" },
+        } as never, params as never)
+        expect(params.options.opencodeSessionPermissionsUnavailable).toBe(true)
+        expect(params.options[CURSOR_SESSION_EDITS_DENIED_OPTION]).toBeUndefined()
+      }
       expect(isHostPlanFileResolved("ses_failed")).toBe(false)
     }
   })

@@ -298,6 +298,10 @@ describe("containment across both write roots", () => {
       expect(resolveContainedImagePath(
         path.join(projectDir, "link", "a.png"), [projectDir, workspace],
       )).toEqual({ error: "target path resolves outside the workspace and project folder" })
+      const dangling = path.join(projectDir, "dangling.png")
+      fs.symlinkSync(path.join(outside, "escaped.png"), dangling)
+      expect(resolveContainedImagePath(dangling, [projectDir, workspace]))
+        .toEqual({ error: "target path could not be resolved" })
     } finally {
       fs.rmSync(outside, { recursive: true, force: true })
     }

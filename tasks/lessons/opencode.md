@@ -295,15 +295,25 @@ These are failure lessons shared by both hosts, not a replacement for
 - **A session edit deny outlasts plan approval.** The last session `edit` rule
   on `*` is read from the session payload on both entrypoints. CreatePlan still
   writes and shows the plan, then returns the not-approved error and does not
-  ask or switch agents. A plan-path allow does not clear `*`. A plan-agent
+  ask or switch agents. That immediate hold must arm the same cancellation and
+  terminal drain as a declined bridged review: a failed wire reply alone let
+  a subsequent shell exec write a file. Set the turn-ending state only after
+  reply delivery; refuse later calls in the step immediately, finish any
+  already-emitted parallel host tool call before sending `cancel_action`, and
+  gate direct `plan_exit` / `cursor_plan_stage` execs the same way
+  (`test/create-plan.test.ts`). A plan-path allow does not clear `*`. A plan-agent
   catalog that merely omits edit still asks (`sessionRulesDenyEdits`,
   `resolveCreatePlanBridge`, `test/session-edits.test.ts`,
   `test/create-plan.test.ts`, `test/plugin.test.ts`,
   `test/plugin-opencode2.test.ts`). Read native 1.x `permission` rules as well
   as 2.0 `permissions`; retry before evaluating and reuse that payload for the
-  plan path. A failed lookup is not an empty ruleset, and lifted rules must
-  clear a previous request's deny marker. A saved denied plan is still a
-  stateful replay barrier (`test/create-plan.test.ts`). Carry explicit deny
+  plan path. A failed lookup is not an empty ruleset: carry unknown evidence
+  to CreatePlan and implementing SwitchMode instead of aborting ordinary
+  requests. Recheck pending approvals too, and clear the unavailable marker
+  when a later lookup succeeds. Lifted rules must clear a previous request's
+  deny marker. A saved denied plan is still a
+  stateful replay barrier and must revoke any earlier checkpoint in the turn
+  (`test/create-plan.test.ts`). Carry explicit deny
   and no-deny guidance chronologically, including on held continuations:
   merely clearing a boolean leaves an old checkpoint reminder authoritative
   (`test/host-notes-run.test.ts`). Send no-deny guidance only when it replaces
@@ -341,8 +351,9 @@ These are failure lessons shared by both hosts, not a replacement for
   `encoding_hint` removed legitimate content. GenerateImage's display data is a
   preview; only its binary write exec commits bytes. Some remote generations
   omit the approval query entirely, so the save tool's edit gate and containment
-  remain essential. Re-resolve the exact target after the permission wait:
-  a directory swapped to a symlink during approval otherwise redirects the
+  remain essential. Re-resolve the exact target after the permission wait, and
+  reject dangling symlinks and write with `O_NOFOLLOW`:
+  a directory or target swapped to a symlink during approval otherwise redirects the
   authorized write, even to another path within an allowed root. Default
   project assets intentionally stay outside the git worktree (`test/generate-image.test.ts`, `src/image-save.ts`).
 

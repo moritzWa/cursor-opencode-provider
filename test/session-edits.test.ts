@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test"
 import {
+  loadSessionForPermissions,
   notPermittedThisTurnReason,
   permissionsFromSession,
   resetSessionEditsGuidanceForTests,
@@ -32,6 +33,15 @@ describe("sessionRulesDenyEdits", () => {
     expect(sessionRulesDenyEdits(permissionsFromSession({ data: { permissions: rules } }))).toBe(true)
     expect(sessionRulesDenyEdits(permissionsFromSession({ data: { slug: "quiet-owl" } }))).toBe(false)
     expect(sessionRulesDenyEdits(permissionsFromSession(undefined))).toBe(false)
+  })
+
+  it("rejects wrapped classic responses whose data payload is missing", async () => {
+    let calls = 0
+    await expect(loadSessionForPermissions(async () => {
+      calls++
+      return { data: undefined }
+    })).rejects.toThrow("Could not read OpenCode session permissions")
+    expect(calls).toBe(2)
   })
 
   it("reads native 1.x permission rules without treating plan-file access as a global allow", () => {

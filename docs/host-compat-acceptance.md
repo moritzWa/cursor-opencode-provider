@@ -49,11 +49,12 @@ Run on stock OpenCode 1.x and stock OpenCode 2.0 after the plan-approval checks 
 
 1. With no session edit rule, a plan-agent catalog that omits edit still asks whether to implement, and Yes switches to the build agent and uses the normal edit or patch tool.
 2. Set a session rule whose last `edit` match on `*` is deny, then allow edit only for the plan file. Ask for a plan.
-3. Verify the plan file is written and shown, no approval question is asked, no agent switch runs, and neither an edit tool nor the shell creates or changes a file.
+3. Verify the plan file is written and shown, no approval question is asked, no agent switch runs, and the owning Run cancels and drains before any queued tool can run. Include a queued shell command that would write a proof file; that file must not exist afterward.
 4. Replace that rule with `edit` `*` allow. A later plan approval ends the old plan Run, starts the native build turn, and uses the normal edit or patch tool there. No second approval prompt or host execution may come from the old plan Run. Decline must end the turn, leave the session in plan, and emit no further tools until a new human message.
 5. Ask the model to enter plan mode. When SwitchMode is dynamically listed, verify discovery is followed by CallDynamicTool using the advertised identity, then a real `switch_mode_request_query` and native plan-agent handoff. A lookup or narration is not execution or an unavailable refusal. Verify CreatePlan writes and displays the plan in the following plan turn; a supplied top-level function remains a valid route. Check the advertised route for GenerateImage too when image save is available.
 6. Change the session edit rule while a tool is held. Verify its result is delivered first, followed by current rule guidance, without replacing the Run. Lift a deny after a checkpoint: the next plan turn must supersede the deny reminder while retaining the conversation and frozen RequestContext. Repeat with a deferred deny after a no-deny turn, and after failed or duplicate delivery. Ordinary tool steps without a deny carry no rule reminder.
 7. Restart after a handoff's zero-token terminal checkpoint. Verify the next Run sends that checkpoint unchanged and retains its last measured occupancy as the cached prefix.
+8. Fail both session lookups. Text-only answers and read-only work must remain usable; CreatePlan and an implementing SwitchMode must fail closed and end the owning Run. A read-only mode or plan entry remains available. Repeat while a review is pending: a returned Yes must not approve execution using unknown rules. Restore the lookup and verify a later user turn reads the current rules again.
 
 ## Refusal and native permission matrix
 

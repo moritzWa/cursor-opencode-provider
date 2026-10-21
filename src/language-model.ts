@@ -178,6 +178,7 @@ import {
   resetSessionEditsGuidanceForTests,
   sessionEditsGuidance,
   recordSessionEditsGuidance,
+  SESSION_PERMISSIONS_UNAVAILABLE_REASON,
 } from "./protocol/session-edits.js"
 import { hostPlanFileFor } from "./host-plan-file.js"
 import {
@@ -303,6 +304,7 @@ import {
   CURSOR_HISTORY_REWRITE_OPTION,
   CURSOR_HOST_AGENT_OPTION,
   CURSOR_SESSION_EDITS_DENIED_OPTION,
+  CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
 } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
 import { resolveSessionWorkspaceRoot } from "./session-directory.js"
@@ -1031,6 +1033,7 @@ async function doStreamImpl(
   if (
     hasApprovedUncorrelatedPlanStageResult(prompt)
     && !sessionEditsDeniedFromCallOptions(callOptions)
+    && !sessionPermissionsUnavailableFromCallOptions(callOptions)
   ) {
     setActiveCursorMode(opencodeSessionKey(callOptions), "agent")
   }
@@ -1063,6 +1066,7 @@ async function doStreamImpl(
       session = await deliverContinuationResults(held, results, {
         hostAgent: hostAgentFromCallOptions(callOptions),
         sessionEditsDenied: sessionEditsDeniedFromCallOptions(callOptions),
+        sessionPermissionsUnavailable: sessionPermissionsUnavailableFromCallOptions(callOptions),
       })
       // Cancellation is not a failed delivery to rebase and upload again.
       if (signal?.aborted) throw cancelled()
@@ -1071,6 +1075,7 @@ async function doStreamImpl(
     }
     if (session) {
       session.sessionEditsDenied = sessionEditsDeniedFromCallOptions(callOptions) || undefined
+      session.sessionPermissionsUnavailable = sessionPermissionsUnavailableFromCallOptions(callOptions) || undefined
       await refreshHeldSessionToolCatalog(session, callOptions)
     }
     // The rebase below seeds from host history, which holds OpenCode's copy of any promoted steer.
@@ -1141,6 +1146,7 @@ async function doStreamImpl(
             toolResults: historicalResults,
             hostAgent: hostAgentFromCallOptions(callOptions),
             sessionEditsDenied: sessionEditsDeniedFromCallOptions(callOptions),
+            sessionPermissionsUnavailable: sessionPermissionsUnavailableFromCallOptions(callOptions),
           })
           unfinishedPrior = prepared !== "drained" && prepared !== "none"
           if (unfinishedPrior) trace(`fresh turn: prior preparation=${prepared} — rebasing from host history`)
@@ -1946,14 +1952,14 @@ async function startSession(
     seedHistory: history,
     liveTurnStart: liveTurn?.start,
   })
-  const editGuidance = isCompaction || lifecycle
+  const editGuidance = isCompaction || lifecycle || resuming
     ? undefined
     : sessionEditsGuidance(conversationId, sessionEditsDenied, {
         carriesEarlierState: startedWithCheckpoint,
         carriesEditDeny: userTurnHostNotes.carriedNotes.some(batch =>
           batch.notes.some(note => note.includes(SESSION_EDITS_DENIED_REMINDER))),
       })
-  const modeReminder = isCompaction || lifecycle
+  const modeReminder = isCompaction || lifecycle || resuming
     ? undefined
     : nativePlanPromptOwnsMode
       ? takeActiveCursorModeReminder(undefined, { sessionEditsDenied: editGuidance })
@@ -1962,7 +1968,7 @@ async function startSession(
           ...(hostAgent ? { hostAgent } : {}),
           sessionEditsDenied: editGuidance,
         })
-  const hostPlanAgentNote = isCompaction || lifecycle
+  const hostPlanAgentNote = isCompaction || lifecycle || resuming
     ? undefined
     : takeHostPlanAgentNote(sessionKey, conversationId, hostAgent, cursorTools, {
         ...(hostPlanFileFor(sessionKey) ? { hostPlanFile: hostPlanFileFor(sessionKey)! } : {}),
@@ -2285,6 +2291,7 @@ async function startSession(
     checkpointRebaseEligible: !ephemeralRun && !resuming && !recovery && !!conversationState,
     hostAgent,
     ...(sessionEditsDenied ? { sessionEditsDenied: true } : {}),
+    sessionPermissionsUnavailable: sessionPermissionsUnavailableFromCallOptions(callOptions),
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
     toolCatalog: sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(tools),
@@ -2497,6 +2504,7 @@ export async function preparePriorSessionForFreshTurn(
     toolResults?: ExtractedToolResult[]
     hostAgent?: string
     sessionEditsDenied?: boolean
+    sessionPermissionsUnavailable?: boolean
   },
 ): Promise<"drained" | "settled-only" | "busy" | "none"> {
   const prior = sessionManager.findOpenByOpenCodeSessionId(openCodeSessionId)
@@ -2545,6 +2553,7 @@ export async function preparePriorSessionForFreshTurn(
     await deliverContinuationResults(prior, historicalPending, {
       hostAgent: opts?.hostAgent,
       sessionEditsDenied: opts?.sessionEditsDenied,
+      sessionPermissionsUnavailable: opts?.sessionPermissionsUnavailable,
     })
     if (prior.closed) return "settled-only"
   }
@@ -3107,7 +3116,8 @@ export async function drainSessionUntilTurnEnded(
           markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
           noteRunImageCheckpoint(session, bytes, frame)
           const tokenDetails = decodeConversationTokenDetails(bytes)
-          if (tokenDetails) {
+          if (tokenDetails && !(cancelling && tokenDetails.usedTokens === 0
+            && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
             if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
             session.tokenDetails = tokenDetails
             session.tokenDetailsFresh = true
@@ -3293,6 +3303,7 @@ function buildCreatePlanContinuationFrame(
   deliveryHostAgent?: string,
   /** The session's edit rule still denies edits, so approval cannot start work. */
   sessionEditsDenied?: boolean,
+  sessionPermissionsUnavailable?: boolean,
 ): { frame: Uint8Array; approved: boolean; emulated: boolean } {
   const metadata = pending.resultMetadata ?? {}
   const interactionId = metadata.interactionId
@@ -3325,11 +3336,12 @@ function buildCreatePlanContinuationFrame(
         (result.error !== undefined ? " error=true" : ""),
     )
   }
-  if (approved && sessionEditsDenied) {
+  if (sessionPermissionsUnavailable || (approved && sessionEditsDenied)) {
     const planPath = typeof metadata.planPath === "string" ? metadata.planPath.trim() : ""
     return {
       frame: buildCreatePlanInteractionReply(interactionId, {
-        error: { error: createPlanSessionEditsDeniedReason(planPath) },
+        error: { error: sessionPermissionsUnavailable
+          ? SESSION_PERMISSIONS_UNAVAILABLE_REASON : createPlanSessionEditsDeniedReason(planPath) },
         plan_uri: "",
       }),
       approved: false,
@@ -3363,10 +3375,12 @@ function buildSwitchModeContinuationFrame(
   result: ExtractedToolResult,
   /** The session's edit rule still denies leaving plan for implementation. */
   sessionEditsDenied?: boolean,
+  sessionPermissionsUnavailable?: boolean,
 ): {
   frame: Uint8Array
   approvedTarget?: string
   bridgeKind?: unknown
+  endTurn?: boolean
 } {
   const metadata = pending.resultMetadata ?? {}
   const interactionId = metadata.interactionId
@@ -3377,9 +3391,11 @@ function buildSwitchModeContinuationFrame(
   const target = "approved" in answer && typeof metadata.switchModeTarget === "string"
     ? metadata.switchModeTarget.trim()
     : ""
-  if (sessionEditsDenied && hostAgentForCursorMode(target) === "build") {
+  if ((sessionEditsDenied || sessionPermissionsUnavailable) && hostAgentForCursorMode(target) === "build") {
     return {
-      frame: buildSwitchModeInteractionReply(interactionId, switchModeRejectedResult(SESSION_EDITS_DENIED_SWITCH_REASON)),
+      frame: buildSwitchModeInteractionReply(interactionId, switchModeRejectedResult(sessionPermissionsUnavailable
+        ? SESSION_PERMISSIONS_UNAVAILABLE_REASON : SESSION_EDITS_DENIED_SWITCH_REASON)),
+      endTurn: true,
     }
   }
   return {
@@ -3414,12 +3430,16 @@ function sessionEditsDeniedFromCallOptions(callOptions: LanguageModelV3CallOptio
   return typeof denied === "boolean" ? denied : undefined
 }
 
+function sessionPermissionsUnavailableFromCallOptions(callOptions: LanguageModelV3CallOptions): boolean {
+  return callOptions.providerOptions?.cursor?.[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION] === true
+}
+
 const continuationDeliveryChains = new WeakMap<CursorSession, Promise<CursorSession | undefined>>()
 
 export async function deliverContinuationResults(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
-  delivery: { hostAgent?: string; sessionEditsDenied?: boolean } = {},
+  delivery: { hostAgent?: string; sessionEditsDenied?: boolean; sessionPermissionsUnavailable?: boolean } = {},
 ): Promise<CursorSession | undefined> {
   // Claim, result writes, state transitions and the step's note injection form
   // one delivery. Serializing individual frames cannot prevent two callers
@@ -3439,7 +3459,7 @@ async function deliverContinuationResultsNow(
   session: CursorSession,
   trailingToolResults: ExtractedToolResult[],
   /** Host primary agent of the request that carries these results. */
-  delivery: { hostAgent?: string; sessionEditsDenied?: boolean } = {},
+  delivery: { hostAgent?: string; sessionEditsDenied?: boolean; sessionPermissionsUnavailable?: boolean } = {},
 ): Promise<CursorSession | undefined> {
   const pendingResults = trailingToolResults.filter(
     (r) => r.sessionId === session.sessionId && session.pending.has(r.execId),
@@ -3469,6 +3489,7 @@ async function deliverContinuationResultsNow(
     const pending = claim.pending
     let frames: Uint8Array[] = []
     let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
+    let endTurnAfterDelivery = false
     let deliveredCreatePlan: { approved: boolean; emulated: boolean } | undefined
     let deliveredImageHashes: string[] = []
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
@@ -3488,8 +3509,9 @@ async function deliverContinuationResultsNow(
       // approved{} or rejected{reason} on the still-open InteractionQuery.
       // Approval also arms the CLI-shaped mode reminder for the next Run.
       try {
-        const built = buildSwitchModeContinuationFrame(pending, r, delivery.sessionEditsDenied)
+        const built = buildSwitchModeContinuationFrame(pending, r, delivery.sessionEditsDenied, delivery.sessionPermissionsUnavailable)
         frames = [built.frame]
+        endTurnAfterDelivery = built.endTurn === true
         if (built.approvedTarget) {
           deliveredSwitchMode = {
             target: built.approvedTarget,
@@ -3508,6 +3530,7 @@ async function deliverContinuationResultsNow(
           r,
           delivery.hostAgent,
           delivery.sessionEditsDenied,
+          delivery.sessionPermissionsUnavailable,
         )
         frames = [built.frame]
         deliveredCreatePlan = built
@@ -3610,7 +3633,25 @@ async function deliverContinuationResultsNow(
           })]
         }
         if (frames.length === 0) {
-          const error = r.error ?? shellResult?.error
+          const directPlanStage = pending.toolName === CURSOR_PLAN_STAGE_TOOL
+          const directPlanExit = pending.toolName === "plan_exit"
+          const directPlanBlocked = (directPlanStage || directPlanExit)
+            && (delivery.sessionPermissionsUnavailable || (r.error === undefined && delivery.sessionEditsDenied))
+          const directPlanReason = directPlanBlocked
+            ? (delivery.sessionPermissionsUnavailable
+                ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
+                : directPlanStage
+                  ? createPlanSessionEditsDeniedReason("")
+                  : SESSION_EDITS_DENIED_SWITCH_REASON)
+            : undefined
+          const directPlanDeclined = directPlanBlocked
+            || (directPlanStage && r.error !== undefined)
+            || (directPlanExit && (
+              "rejected" in switchModeResultFromToolOutput(r.output, r.error !== undefined)
+              || (!!delivery.hostAgent && isHostPlanAgent(delivery.hostAgent))
+            ))
+          if (directPlanDeclined) endTurnAfterDelivery = true
+          const error = directPlanReason ?? r.error ?? shellResult?.error
           const images = error ? [] : execResultImages(pending.resultField, r.images)
           // A failed host tool reports one text as both output and error. Include
           // failures captured by the shell hook when the SDK keeps only text.
@@ -3660,6 +3701,7 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     deliveredResults++
+    if (endTurnAfterDelivery) session.planReviewDeclined = true
     if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
     }
@@ -3698,6 +3740,7 @@ async function deliverContinuationResultsNow(
       && pending.toolName === CURSOR_PLAN_STAGE_TOOL
       && r.error === undefined
       && !delivery.sessionEditsDenied
+      && !delivery.sessionPermissionsUnavailable
     ) {
       setActiveCursorMode(session.openCodeSessionId, "agent")
     }
@@ -4384,6 +4427,10 @@ export async function pump(
   let emittedHostTools = 0
   const earlyRows = new EarlyToolRows()
   let planTurnCancellationRequested = false
+  const isPlanTurnEnding = () =>
+    planTurnCancellationRequested
+    || !!session.planReviewDeclined
+    || isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)
   const replaySafety = new AttemptReplaySafety(session.sessionId, session.replaySafety ??= {})
   const failRunProtocol = (message: string, code: string): never => {
     replaySafety.markBarrier("unknown-or-malformed-frame")
@@ -5021,11 +5068,14 @@ export async function pump(
 
     let next: IteratorResult<Frame>
     try {
-      if (!planTurnCancellationRequested && (session.planReviewDeclined
-        || (session.pending.size === 0 && isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId)))) {
+      if (!planTurnCancellationRequested && session.pending.size === 0
+        && (session.planReviewDeclined || isHostAgentHandoffPending(session.openCodeSessionId, session.sessionId))) {
         // Approval is delivered before cancellation. The replacement agent
         // starts only after Cursor acknowledges the old Run's termination.
         session.heartbeatCancel?.()
+        replaySafety.markBarrier("stateful-interaction")
+        invalidateResumeCheckpoint(session)
+        clearParallelStep()
         await writeWithBackpressure(session.stream, encodeMessage("AgentClientMessage", {
           conversation_action: { cancel_action: {
             reason: session.planReviewDeclined ? "plan_execution_declined" : "host_plan_agent_handoff",
@@ -5230,11 +5280,11 @@ export async function pump(
         cacheDiagnostics.checkpointUpdates++
         setCheckpoint(session.conversationId, bytes)
         noteCheckpoint(session.openCodeSessionId, bytes)
-        acceptResumeCheckpoint(session, bytes, frame)
+        if (!isPlanTurnEnding()) acceptResumeCheckpoint(session, bytes, frame)
         markEarlySteersCheckpointed(session.openCodeSessionId, session.sessionId)
         noteRunImageCheckpoint(session, bytes, frame)
         const tokenDetails = decodeConversationTokenDetails(bytes)
-        if (tokenDetails && !(planTurnCancellationRequested && tokenDetails.usedTokens === 0
+        if (tokenDetails && !(isPlanTurnEnding() && tokenDetails.usedTokens === 0
           && (session.tokenDetails?.usedTokens ?? 0) > 0)) {
           cacheDiagnostics.tokenDetailUpdates++
           session.tokenDetails = tokenDetails
@@ -5411,13 +5461,16 @@ export async function pump(
         session.displayToolCalls.delete(callId)
         const toolCall =
           (completed.tool_call as Record<string, unknown> | undefined) ?? stored
-        if (!session.allowTools || planTurnCancellationRequested) {
+        if (!session.allowTools || isPlanTurnEnding()) {
           trace(`display tool_call_completed: SKIPPED (tools unavailable or agent handoff) callId=${callId}`)
           disposeParallelCall(callId)
           if (closeIfParallelStepComplete()) return
         } else {
           const display = parseDisplayToolCall(callId, toolCall, session.mirroredTodos)
-          const advertised = advertisedToolNamesFromDescriptors(session.toolDescriptors)
+          const allAdvertised = advertisedToolNamesFromDescriptors(session.toolDescriptors)
+          const advertised = session.permittedToolNames && session.permittedToolNames.size > 0
+            ? allAdvertised.filter(name => session.permittedToolNames!.has(name))
+            : allAdvertised
           // A deferred CreatePlan recorded nothing: mirroring its todos would
           // overwrite the host's list with a plan that does not exist.
           const deferredPlan = display?.variant === "create_plan_tool_call"
@@ -5620,7 +5673,7 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
-        if (planTurnCancellationRequested) {
+        if (isPlanTurnEnding()) {
           const parsed = parseExecServerMessage(esm, session.hostToolDialect)
           if (parsed) {
             const row = earlyRows.claim(displayCallId)
@@ -5630,6 +5683,7 @@ export async function pump(
               : "The host agent is switching. End this turn; the next agent continues the work.",
               session.planReviewDeclined ? "plan execution declined" : "agent handoff")) return
             disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
             continue
           }
         }
@@ -5900,6 +5954,22 @@ export async function pump(
             if (closeIfParallelStepComplete()) return
             continue
           }
+          if (
+            (parsed.toolName === "plan_exit" && (session.sessionEditsDenied || session.sessionPermissionsUnavailable))
+            || (parsed.toolName === CURSOR_PLAN_STAGE_TOOL && session.sessionPermissionsUnavailable)
+          ) {
+            const row = earlyRows.claim(displayCallId)
+            if (row) closeEarlyRow(row)
+            const reason = session.sessionPermissionsUnavailable
+              ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
+              : SESSION_EDITS_DENIED_SWITCH_REASON
+            if (!await rejectExec(parsed, reason, "plan exit blocked")) return
+            session.planReviewDeclined = true
+            if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            disposeParallelCall(displayCallId)
+            if (closeIfParallelStepComplete()) return
+            continue
+          }
           if (await recoverCorrelatedEditRead(parsed, displayCallId)) continue
           if (await rejectMissingReadTarget(parsed)) {
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
@@ -6058,13 +6128,13 @@ export async function pump(
       const handled = (() => {
         try {
           return handleInteractionQuery(interactionQuery, payload, {
-            canBridgeAskQuestion: session.allowTools && !planTurnCancellationRequested && interactionToolNames.has("question"),
-            allowTools: session.allowTools && !planTurnCancellationRequested,
+            canBridgeAskQuestion: session.allowTools && !isPlanTurnEnding() && interactionToolNames.has("question"),
+            allowTools: session.allowTools && !isPlanTurnEnding(),
             advertisedTools: interactionToolNames,
             canSaveGeneratedImage:
-              session.allowTools && !planTurnCancellationRequested && interactionToolNames.has(CURSOR_IMAGE_SAVE_TOOL),
+              session.allowTools && !isPlanTurnEnding() && interactionToolNames.has(CURSOR_IMAGE_SAVE_TOOL),
             canBridgeCreatePlan:
-              session.allowTools && !planTurnCancellationRequested
+              session.allowTools && !isPlanTurnEnding()
               && isBridgedCursorPlanModeActive(session.openCodeSessionId)
               && interactionToolNames.has(CURSOR_PLAN_STAGE_TOOL)
               && interactionToolNames.has("write"),
@@ -6078,6 +6148,7 @@ export async function pump(
               ? { activeCursorModeId: getActiveCursorMode(session.openCodeSessionId)! }
               : {}),
             ...(session.sessionEditsDenied ? { sessionEditsDenied: true } : {}),
+            sessionPermissionsUnavailable: session.sessionPermissionsUnavailable,
             workspaceRoot: workspaceRootFromRequestContext(session.requestContext),
           })
         } catch {
@@ -6085,8 +6156,9 @@ export async function pump(
         }
       })()
       try {
-        if (handled.outcome === "acknowledged" || handled.planReview) {
+        if (handled.outcome === "acknowledged" || handled.planReview || handled.endTurn) {
           replaySafety.markBarrier("stateful-interaction")
+          invalidateResumeCheckpoint(session)
         }
         if (handled.reply) {
           await writeWithBackpressure(
@@ -6096,6 +6168,10 @@ export async function pump(
           )
         }
         if (handled.planReview) emitPlanReview(handled.planReview)
+        if (handled.endTurn) {
+          session.planReviewDeclined = true
+          trace("plan execution: immediate refusal delivered; ending the owning turn")
+        }
         trace(
           `interaction_query: replied id=${handled.id} variant=${handled.variantName} ` +
             `field=${handled.variantField} outcome=${handled.outcome}` +
@@ -6350,7 +6426,7 @@ export async function pump(
       announced
       && !earlyRows.seen(announced.callId)
       && shouldOpenEarlyRow({
-        allowTools: session.allowTools && !planTurnCancellationRequested,
+        allowTools: session.allowTools && !isPlanTurnEnding(),
         hostInterrupted: !!session.hostInterrupted,
         holdingParallelStep: !!session.parallelStep && shouldHoldParallelStep(session.parallelStep),
         emittedHostTools,
@@ -6865,7 +6941,7 @@ export function buildOpenCodeInteractionGuidance(
   }
   if (names.has("plan_exit")) {
     instructions.push(
-      "- To leave plan mode, call the OpenCode `plan_exit` tool. Cursor-native SwitchMode for any non-plan target (agent, build, chat, debug, edit, background, multitask, triage, project, …) is also accepted and answered through it; the provider then injects the Cursor CLI-shaped mode reminder for that target.",
+      "- To leave plan mode, call the OpenCode `plan_exit` tool. Cursor-native SwitchMode for any non-plan target (agent, build, debug, edit, background, multitask, triage, project, …; read-only ask/chat/search keeps the current agent) is also accepted and answered through it; the provider then injects the Cursor CLI-shaped mode reminder for that target.",
     )
   }
   // Prefer host todos whenever advertised. Keep guidance terse — spelling out

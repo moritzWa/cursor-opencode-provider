@@ -171,6 +171,7 @@ it.each([false, true])("keeps measured occupancy on a zero-token checkpoint (res
   } finally {
     await settleRunSavesForTests()
     sessionManager.dispose()
+    setHostCacheDirOverride(undefined)
     await fs.rm(directory, { recursive: true, force: true })
   }
 })
