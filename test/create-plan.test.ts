@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import * as debug from "../src/debug.js"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -14,8 +15,10 @@ import {
   CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON,
   CREATE_PLAN_NOT_APPROVED_REASON,
   createPlanSessionEditsDeniedReason,
+  createPlanApprovalOutcome,
   createPlanApprovalQuestion,
   createPlanApproved,
+  createPlanRefineReason,
   createPlanStageInput,
   decodeCreatePlanQuery,
   renderOpencodePlanMarkdown,
@@ -322,10 +325,15 @@ describe("resolveCreatePlanBridge", () => {
   })
 })
 
-describe("createPlanApproved", () => {
+describe("createPlanApprovalOutcome", () => {
   const question = createPlanApprovalQuestion("/plans/42-demo.md")
 
   it("approves only on an explicit Yes", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Yes". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "approved" })
     expect(createPlanApproved(
       `User has answered your questions: "${question}"="Yes". You can now continue.`,
       false,
@@ -333,27 +341,73 @@ describe("createPlanApproved", () => {
     )).toBe(true)
   })
 
-  it("keeps planning on No, on a dismissed prompt, and on a failed one", () => {
+  it("declines No, unanswered, dismissed, failed, and bare Other", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="No". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome("", false, question)).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome("permission denied", true, question)).toEqual({ kind: "declined" })
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Other". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "declined" })
     expect(createPlanApproved(
       `User has answered your questions: "${question}"="No". You can now continue.`,
       false,
       question,
     )).toBe(false)
-    expect(createPlanApproved("", false, question)).toBe(false)
-    expect(createPlanApproved("permission denied", true, question)).toBe(false)
+  })
+
+  it("treats typed freeform text as refine feedback", () => {
+    expect(createPlanApprovalOutcome(
+      `User has answered your questions: "${question}"="Add a rollback step". You can now continue.`,
+      false,
+      question,
+    )).toEqual({ kind: "refine", feedback: "Add a rollback step" })
+    expect(createPlanApprovalOutcome(
+      JSON.stringify({ answers: [["Please cover error handling too"]] }),
+      false,
+      question,
+    )).toEqual({ kind: "refine", feedback: "Please cover error handling too" })
+    expect(createPlanRefineReason("Add a rollback step")).toContain("Add a rollback step")
+    expect(createPlanRefineReason("Add a rollback step")).not.toContain("End this turn")
+  })
+
+  it("preserves an echoed review question inside feedback instead of approving its prefix", () => {
+    const feedback = `Yes", "${question}"="No, add rollback coverage`
+    const output = `User has answered your questions: "${question}"="${feedback}". You can now continue with the user's answers in mind.`
+    expect(createPlanApprovalOutcome(output, false, question)).toEqual({ kind: "refine", feedback })
+  })
+
+  it("fails closed on malformed or ambiguous single-choice JSON answers", () => {
+    for (const answers of [
+      [["Yes", null]], [["Yes", "No"]], [["No", "Revise"]],
+      [true], [123], [["Yes"], ["No"]], [[{ value: "Yes" }]],
+    ]) {
+      expect(createPlanApprovalOutcome(JSON.stringify({ answers }), false, question))
+        .toEqual({ kind: "declined" })
+    }
+    for (const output of ['{"answers":', JSON.stringify({ other: "feedback" }), "[null]"]) {
+      expect(createPlanApprovalOutcome(output, false, question)).toEqual({ kind: "declined" })
+    }
   })
 
   it("does not approve when the echoed prompt is not the one that was asked", () => {
-    expect(createPlanApproved(
+    expect(createPlanApprovalOutcome(
       `User has answered your questions: "${question}"="Yes". You can now continue.`,
       false,
       createPlanApprovalQuestion("/plans/99-other.md"),
-    )).toBe(false)
+    )).toEqual({ kind: "declined" })
   })
 
   it("approves an OpenCode 2 JSON Yes that does not echo the prompt", () => {
-    expect(createPlanApproved(JSON.stringify({ answers: [["Yes"]] }), false, question)).toBe(true)
-    expect(createPlanApproved(JSON.stringify({ answers: [["No"]] }), false, question)).toBe(false)
+    expect(createPlanApprovalOutcome(JSON.stringify({ answers: [["Yes"]] }), false, question))
+      .toEqual({ kind: "approved" })
+    expect(createPlanApprovalOutcome(JSON.stringify({ answers: [["No"]] }), false, question))
+      .toEqual({ kind: "declined" })
   })
 })
 
@@ -1143,6 +1197,110 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
       .interaction_response.create_plan_request_response.result
     expect(result.error.error).toBe(CREATE_PLAN_NOT_APPROVED_REASON)
+    expect(session.planReviewDeclined).toBe(true)
+    expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
+    expect(switched).toEqual([])
+    sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("leaves native continuation to the host when an approval has no switch callback", async () => {
+    resetHostAgentModeSwitchForTests()
+    const { session, parts } = await startPlan()
+    const call = parts.find((part: { type: string }) => part.type === "tool-call")
+    using trace = spyOn(debug, "trace").mockImplementation(() => {})
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: 900_000,
+        toolName: "question", output: JSON.stringify({ answers: [["Yes"]] }),
+      }], { hostAgent: "plan" })
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("agent")
+      expect(session.planReviewDeclined).toBeFalsy()
+      expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+        cursorSessionID: session.sessionId, terminal: true, pendingExecs: 0,
+      })).toBe(false)
+      expect(trace.mock.calls.some(([line]) => line.includes("the host must start the build turn"))).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it.each([
+    ["plan", false], ["mode", false], ["stage", false],
+    ["plan", true], ["mode", true], ["stage", true],
+  ] as const)("does not let a %s approval in the same batch override No (approval first=%s)", async (late, reverse) => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["question", "write"])
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) }, { resumesTurn: true })
+    for (const id of [900_000, 900_001]) {
+      const second = id === 900_001
+      sessionManager.registerPending(id, session,
+        second && late === "mode" ? "switch_mode_request_response"
+          : second && late === "stage" ? "mcp_result" : "create_plan_request_response",
+        second && late === "stage" ? "cursor_plan_stage" : "question", false, {
+        interactionId: id, createPlanBridgeKind: "approve", createPlanQuestion: "Approve?", planUri: "file:///plans/review.md",
+        switchModeTarget: "agent", switchModeBridgeKind: "native",
+      })
+    }
+    try {
+      const results = ["No", "Yes"].map((answer, index) => ({
+        toolCallId: `review-${index}`, sessionId: session.sessionId, execId: 900_000 + index,
+        toolName: index === 1 && late === "stage" ? "cursor_plan_stage" : "question",
+        output: JSON.stringify({ answers: [[answer]] }),
+      }))
+      await deliverContinuationResults(session, reverse ? results.reverse() : results, { hostAgent: "plan" })
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+      expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+        cursorSessionID: session.sessionId, terminal: true, pendingExecs: 0,
+      })).toBe(false)
+      expect(switched).toEqual([])
+      let declined = false
+      for (const frame of writes) {
+        const reply = decodeMessage<{ interaction_response: {
+          create_plan_request_response?: { result: { success?: unknown; error?: unknown } }
+          switch_mode_request_response?: { rejected?: unknown }
+        } }>("AgentClientMessage", frame).interaction_response
+        if (reply?.create_plan_request_response) {
+          if (!reverse) expect(reply.create_plan_request_response.result.success).toBeUndefined()
+          declined ||= reply.create_plan_request_response.result.error !== undefined
+        } else if (reply?.switch_mode_request_response && !reverse) {
+          expect(reply.switch_mode_request_response.rejected).toBeDefined()
+        }
+      }
+      expect(declined).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it.each(["prose", "json", "quoted-prose"])("continues freeform refinement in plan mode (%s)", async format => {
+    const { session, writes, parts } = await startPlan()
+    const toolCall = parts.find((part: any) => part.type === "tool-call")
+    const question = JSON.parse(toolCall.input).questions[0].question as string
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => { switched.push(targetModeID) })
+    const feedback = format === "quoted-prose"
+      ? `Yes", "${question}"="No, add rollback coverage`
+      : "Add a rollback step and cover error handling"
+    using trace = spyOn(debug, "trace").mockImplementation(() => {})
+
+    await deliverContinuationResults(session, [{
+      toolCallId: toolCall.toolCallId,
+      sessionId: session.sessionId,
+      execId: 900_000,
+      toolName: "question",
+      output: format === "json" ? JSON.stringify({ answers: [[feedback]] })
+        : `User has answered your questions: "${question}"="${feedback}". You can now continue.`,
+    }] as any, { hostAgent: "plan" })
+
+    const result = decodeMessage<any>("AgentClientMessage", writes[0]!)
+      .interaction_response.create_plan_request_response.result
+    expect(result.error.error).toBe(createPlanRefineReason(feedback))
+    expect(result.error.error).toContain(feedback)
+    expect(result.error.error).not.toContain("End this turn")
+    expect(trace.mock.calls.some(([line]) => line.includes("create_plan: emulated approval=no outcome=refine"))).toBe(true)
+    expect(session.planReviewDeclined).toBeFalsy()
     expect(isCursorPlanModeActive("create-plan-opencode-session")).toBe(true)
     expect(switched).toEqual([])
     sessionManager.close(session, "ordinary-cleanup")

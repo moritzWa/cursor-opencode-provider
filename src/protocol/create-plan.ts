@@ -180,10 +180,26 @@ export const CREATE_PLAN_HOST_PLAN_WORKFLOW_REASON =
   "plan-mode instructions say, then call `plan_exit` to ask the user to approve it. Do " +
   "not implement until it is approved."
 
-/** Cursor-visible reason when the user wants the plan revised instead of run. */
+/**
+ * Cursor-visible reason when the user picks No or dismisses the approval
+ * prompt. Ends the owning turn; a new user message is required before more work.
+ */
 export const CREATE_PLAN_NOT_APPROVED_REASON =
   "The user did not approve executing this plan. End this turn without further tool calls. "
   + "Stay in plan mode and wait for the user's next message before refining or proposing it again."
+
+/**
+ * Cursor-visible reason when the user typed freeform feedback instead of Yes/No.
+ * The owning turn continues in plan mode so the model can revise.
+ */
+export function createPlanRefineReason(feedback: string): string {
+  const text = feedback.trim()
+  return (
+    "The user did not approve executing this plan and asked for these changes:\n"
+    + `${text}\n`
+    + "Stay in plan mode and revise the plan accordingly. Do not start implementing yet."
+  )
+}
 
 /** Cursor-visible reason when a session edit deny still blocks execution. */
 export function createPlanSessionEditsDeniedReason(planPath: string): string {
@@ -284,17 +300,47 @@ export function createPlanApprovalQuestionInput(planLabel: string): OpencodeQues
 }
 
 /**
+ * How the emulated CreatePlan `question` approval resolved.
+ *
+ * - `approved` — explicit Yes: leave plan and start implementing.
+ * - `declined` — No, unanswered, dismissed, failed, or bare "Other": end the
+ *   owning turn and keep the plan agent.
+ * - `refine` — the user typed freeform feedback: continue this turn in plan
+ *   mode and send that text back through the CreatePlan reply.
+ */
+export type CreatePlanApprovalOutcome =
+  | { kind: "approved" }
+  | { kind: "declined" }
+  | { kind: "refine"; feedback: string }
+
+/** Classify an emulated CreatePlan approval `question` result. */
+export function createPlanApprovalOutcome(
+  output: string,
+  isError: boolean,
+  question: string,
+): CreatePlanApprovalOutcome {
+  if (isError) return { kind: "declined" }
+  const [segment] = parseAnswerSegments([createPlanApprovalItem(question)], output, { singleChoice: true })
+  const answer = (segment ?? "").trim()
+  if (!answer || answer === "Unanswered") return { kind: "declined" }
+  const lower = answer.toLowerCase()
+  if (lower === CREATE_PLAN_APPROVAL_YES.toLowerCase()) return { kind: "approved" }
+  if (lower === CREATE_PLAN_APPROVAL_NO.toLowerCase()) return { kind: "declined" }
+  // Cursor CLI substitutes "Other" when the freeform row was chosen with no text.
+  if (lower === "other") return { kind: "declined" }
+  return { kind: "refine", feedback: answer }
+}
+
+/**
  * True when the emulated approval prompt came back as an explicit "Yes".
- * An unanswered, dismissed, or failed prompt keeps the model planning.
+ * An unanswered, dismissed, failed, No, or freeform prompt is not approval.
  */
 export function createPlanApproved(
   output: string,
   isError: boolean,
   question: string,
 ): boolean {
-  if (isError) return false
-  const [segment] = parseAnswerSegments([createPlanApprovalItem(question)], output)
-  return (segment ?? "").trim().toLowerCase() === CREATE_PLAN_APPROVAL_YES.toLowerCase()
+  return createPlanApprovalOutcome(output, isError, question).kind === "approved"
 }
 
 

@@ -170,7 +170,8 @@ import {
   CREATE_PLAN_NOT_APPROVED_REASON,
   CREATE_PLAN_RESULT_FIELD,
   CURSOR_PLAN_STAGE_TOOL,
-  createPlanApproved,
+  createPlanApprovalOutcome,
+  createPlanRefineReason,
   createPlanSessionEditsDeniedReason,
   createPlanStageInput,
 } from "./protocol/create-plan.js"
@@ -3287,9 +3288,10 @@ function buildAskQuestionContinuationFrame(
 
 /**
  * Turn the host's plan-approval outcome into the CreatePlan reply Cursor is
- * still blocking on. One contract across every channel: `success` means the
- * user approved execution, `error` means the plan was written but not accepted,
- * and the owning turn ends without starting work.
+ * still blocking on. `success` means the user approved execution. `error`
+ * means the plan was written but not accepted: an explicit No/dismissal ends
+ * the owning turn (`endTurn`), while emulated freeform feedback continues the
+ * same turn in plan mode so the model can revise.
  *
  * A host plan-stage tool reports that outcome as tool success/failure; the
  * host `plan_exit` review approves by moving the session out of `plan`. The
@@ -3305,7 +3307,7 @@ function buildCreatePlanContinuationFrame(
   /** The session's edit rule still denies edits, so approval cannot start work. */
   sessionEditsDenied?: boolean,
   sessionPermissionsUnavailable?: boolean,
-): { frame: Uint8Array; approved: boolean; emulated: boolean } {
+): { frame: Uint8Array; approved: boolean; emulated: boolean; endTurn: boolean } {
   const metadata = pending.resultMetadata ?? {}
   const interactionId = metadata.interactionId
   if (typeof interactionId !== "number") {
@@ -3322,18 +3324,24 @@ function buildCreatePlanContinuationFrame(
   // A host plan-stage tool reports approval as tool success.
   const hostExit = metadata.createPlanBridgeKind === "exit"
   const emulated = metadata.createPlanBridgeKind === "approve"
-  const approved = emulated
-    ? createPlanApproved(
+  const emulatedOutcome = emulated
+    ? createPlanApprovalOutcome(
         result.output,
         result.error !== undefined,
         typeof metadata.createPlanQuestion === "string" ? metadata.createPlanQuestion : "",
       )
+    : undefined
+  const approved = emulatedOutcome
+    ? emulatedOutcome.kind === "approved"
     : hostExit
       ? result.error === undefined && !!deliveryHostAgent && !isHostPlanAgent(deliveryHostAgent)
       : result.error === undefined
-  if (emulated) {
+  // Freeform typed feedback continues this Run; No/dismiss ends it. Host-stage
+  // and plan_exit refusals always end the owning turn.
+  const endTurn = emulatedOutcome?.kind === "refine" ? false : !approved
+  if (emulated && emulatedOutcome) {
     trace(
-      `create_plan: emulated approval=${approved ? "yes" : "no"} outLen=${result.output.length}` +
+      `create_plan: emulated approval=${approved ? "yes" : "no"} outcome=${emulatedOutcome.kind} outLen=${result.output.length}` +
         (result.error !== undefined ? " error=true" : ""),
     )
   }
@@ -3347,17 +3355,21 @@ function buildCreatePlanContinuationFrame(
       }),
       approved: false,
       emulated,
+      endTurn: true,
     }
   }
   if (!approved) {
-    const reason = result.error?.trim() || (hostExit ? result.output.trim() : "")
+    const reason = emulatedOutcome?.kind === "refine"
+      ? createPlanRefineReason(emulatedOutcome.feedback)
+      : result.error?.trim() || (hostExit ? result.output.trim() : "") || CREATE_PLAN_NOT_APPROVED_REASON
     return {
       frame: buildCreatePlanInteractionReply(interactionId, {
-        error: { error: reason || CREATE_PLAN_NOT_APPROVED_REASON },
+        error: { error: reason },
         plan_uri: "",
       }),
       approved: false,
       emulated,
+      endTurn,
     }
   }
 
@@ -3368,6 +3380,7 @@ function buildCreatePlanContinuationFrame(
     }),
     approved: true,
     emulated,
+    endTurn: false,
   }
 }
 
@@ -3472,6 +3485,7 @@ async function deliverContinuationResultsNow(
   )
   // Host notes that trailed this step: injected once, after its results.
   const stepNotes = collectHostNoteBodies(trailingToolResults.flatMap((r) => r.notes ?? []))
+  const approvedModeUpdates: Array<{ target: string; emulated?: boolean }> = []
   let deliveredResults = 0
   for (const original of pendingResults) {
     const r = original.error === "" ? { ...original, error: "OpenCode tool execution failed" } : original
@@ -3488,10 +3502,15 @@ async function deliverContinuationResultsNow(
       return undefined
     }
     const pending = claim.pending
+    // No/dismissal ends this owning Run. Another completed review in the
+    // same host batch cannot reopen its execution gate or queue a handoff.
+    const reviewResult = session.planReviewDeclined
+      ? { ...r, error: CREATE_PLAN_NOT_APPROVED_REASON }
+      : r
     let frames: Uint8Array[] = []
     let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
     let endTurnAfterDelivery = false
-    let deliveredCreatePlan: { approved: boolean; emulated: boolean } | undefined
+    let deliveredCreatePlan: { approved: boolean; emulated: boolean; endTurn: boolean } | undefined
     let deliveredImageHashes: string[] = []
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
@@ -3510,7 +3529,7 @@ async function deliverContinuationResultsNow(
       // approved{} or rejected{reason} on the still-open InteractionQuery.
       // Approval also arms the CLI-shaped mode reminder for the next Run.
       try {
-        const built = buildSwitchModeContinuationFrame(pending, r, delivery.sessionEditsDenied, delivery.sessionPermissionsUnavailable)
+        const built = buildSwitchModeContinuationFrame(pending, reviewResult, delivery.sessionEditsDenied, delivery.sessionPermissionsUnavailable)
         frames = [built.frame]
         endTurnAfterDelivery = built.endTurn === true
         if (built.approvedTarget) {
@@ -3528,7 +3547,7 @@ async function deliverContinuationResultsNow(
       try {
         const built = buildCreatePlanContinuationFrame(
           pending,
-          r,
+          reviewResult,
           delivery.hostAgent,
           delivery.sessionEditsDenied,
           delivery.sessionPermissionsUnavailable,
@@ -3708,30 +3727,16 @@ async function deliverContinuationResultsNow(
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
-      setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
-        bridgedPlanEntered: cursorModeRole(deliveredSwitchMode.target) === "plan",
-      })
+      approvedModeUpdates.push({ target: deliveredSwitchMode.target })
     }
-    if (deliveredCreatePlan && !deliveredCreatePlan.approved) {
+    if (deliveredCreatePlan && !deliveredCreatePlan.approved && deliveredCreatePlan.endTurn) {
       session.planReviewDeclined = true
       trace("create_plan: execution not approved; ending the owning turn")
+    } else if (deliveredCreatePlan && !deliveredCreatePlan.approved) {
+      trace("create_plan: freeform refine; continuing the owning turn in plan mode")
     }
     if (deliveredCreatePlan?.approved) {
-      setActiveCursorMode(session.openCodeSessionId, "agent")
-      if (deliveredCreatePlan.emulated && session.openCodeSessionId) {
-        const queued = queueHostAgentModeSwitch({
-          sessionID: session.openCodeSessionId,
-          targetModeID: "agent",
-          cursorSessionID: session.sessionId,
-          hostAgent: "plan",
-        })
-        if (!queued) {
-          trace(
-            `create_plan: approved but no native host-agent switch accepted sessionID=` +
-              `${session.openCodeSessionId}; the host must start the build turn`,
-          )
-        }
-      }
+      approvedModeUpdates.push({ target: "agent", emulated: deliveredCreatePlan.emulated })
     }
     // A directly called advertised plan-stage tool can own the same review
     // gate as a bridged CreatePlan. Its successful result means execution was
@@ -3740,10 +3745,11 @@ async function deliverContinuationResultsNow(
       !pending.bridged
       && pending.toolName === CURSOR_PLAN_STAGE_TOOL
       && r.error === undefined
+      && !session.planReviewDeclined
       && !delivery.sessionEditsDenied
       && !delivery.sessionPermissionsUnavailable
     ) {
-      setActiveCursorMode(session.openCodeSessionId, "agent")
+      approvedModeUpdates.push({ target: "agent" })
     }
     // A host `todoread` result is the authoritative list. Refresh the mirrored
     // snapshot (direct reads and bridged native reads alike) so later merges
@@ -3785,6 +3791,25 @@ async function deliverContinuationResultsNow(
       trace(`continuation: plan review declined; kept ${stepNotes.length} host note(s) for the next user turn`)
     }
     return session
+  }
+  // Apply approvals only after all results have been delivered. A No later in
+  // this batch must win before any mode changes or native handoffs are queued.
+  for (const update of approvedModeUpdates) {
+    setActiveCursorMode(session.openCodeSessionId, update.target, {
+      bridgedPlanEntered: cursorModeRole(update.target) === "plan",
+    })
+    if (update.emulated && session.openCodeSessionId) {
+      const queued = queueHostAgentModeSwitch({
+        sessionID: session.openCodeSessionId,
+        targetModeID: "agent",
+        cursorSessionID: session.sessionId,
+        hostAgent: "plan",
+      })
+      if (!queued) trace(
+        `create_plan: approved but no native host-agent switch accepted sessionID=` +
+          `${session.openCodeSessionId}; the host must start the build turn`,
+      )
+    }
   }
   // A held Run may already contain earlier permission guidance.
   const editGuidance = deliveredResults === 0 ? undefined : sessionEditsGuidance(session.conversationId, delivery.sessionEditsDenied, {
@@ -6917,7 +6942,7 @@ export function buildOpenCodeInteractionGuidance(
       : names.has("question")
         ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). The provider records the plan and uses the host's plan review when advertised, otherwise the OpenCode `question` tool asks whether to start implementing. Wait for execution approval. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool."
         : "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). The provider records the plan where the host keeps plans, and the host decides when it is executed (without a host review, the user switches to the build agent). Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool.",
-    "- A declined, refined, or dismissed execution review ends the current turn: make no further tool calls, including self-test, image, scoring or cleanup calls. Keep the plan agent and wait for a new human message; an ordinary question result is not that message.",
+    "- An explicit No or dismissal of an execution review ends the current turn: make no further tool calls, including self-test, image, scoring or cleanup calls. Keep the plan agent and wait for a new human message. Typed freeform feedback on that review is not dismissal: revise the plan in this same turn using that text. An ordinary question result is not a new human message.",
     planEntryHandoff
       ? "- Planning sequence: call native SwitchMode to enter plan, then STOP and end that turn. Only the following host plan-agent turn may call native CreatePlan. Do not discover tools, investigate, or record a plan between the approved switch and the end of its turn. Once that following turn starts, record the first plan as soon as its shape is clear."
       : "- When the task needs a user-approved plan, record the first version with native CreatePlan as soon as its shape is clear and the advertised planning prerequisites are satisfied. Refining afterward is expected; do not wait for investigation to finish.",

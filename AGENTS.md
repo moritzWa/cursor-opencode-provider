@@ -256,9 +256,11 @@ The **1.18 v2** API and **OpenCode 2.0** are source-incompatible:
 - Write plans as plain markdown in host-native locations, never Cursor's plan
   store. Display records do not execute tools. Writing a plan does not ask;
   leaving approved plan mode to execute does. Show the plan in the transcript
-  before asking; refusal/refinement/dismissal ends the owning turn and keeps the
-  plan agent until a new user message. Treat failure as unapproved. Use the
-  advertised host review channel; without one the user switches agents.
+  before asking; Yes starts build, No/dismissal ends the owning turn and keeps
+  the plan agent until a new user message, and typed freeform feedback continues
+  the same turn in plan mode with that text as the CreatePlan reply. Treat
+  failure as unapproved. Use the advertised host review channel; without one
+  the user switches agents.
 - SwitchMode never spawns a subagent. Apply native primary-agent switches only
   after the owning Run is terminal; lifecycle turns soft-ack without mutating
   mode. Same-mode switches auto-approve. Entering plan needs no execution gate.

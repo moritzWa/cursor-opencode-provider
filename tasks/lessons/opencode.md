@@ -258,12 +258,24 @@ These are failure lessons shared by both hosts, not a replacement for
   plan and stopped without volunteering SwitchMode. Attach approval to
   CreatePlan. A No answer is ordinary question data in native OpenCode, so a
   failed CreatePlan reply alone let the model continue its self-test. Cancel
-  and drain the owning Run after an unapproved review; suppress late output,
+  and drain the owning Run after No or dismissal; suppress late output,
   refuse every new exec before runtime metadata handling, and require a fresh
-  user message. Keep the plan agent and already authorized background jobs;
-  carry host notes delivered beside the declined answer to the next user turn
-  instead of injecting them into the cancelled Run. Self-verification must score post-refusal tool calls as failure, even when
-  implementation itself did not start (`test/create-plan.test.ts`).
+  user message. Typed freeform feedback is not refusal: continue the same turn
+  in plan mode and return that text on the CreatePlan error reply so the model
+  can revise (`createPlanApprovalOutcome`). Only remaining questions delimit
+  prose answers: matching the current question inside feedback truncated it
+  to Yes and approved execution. Single-choice review JSON must have exactly
+  one string in its one answer row; filtering invalid cells or joining
+  conflicting answers can turn malformed data into approval or refinement.
+  A No/dismissal also wins over later approvals in the same result batch;
+  clamping only the next pump left a queued build handoff alive. Keep the
+  existing `emulated approval=` log marker and append the richer outcome so
+  self-test extraction remains usable (`test/create-plan.test.ts`,
+  `test/ask-question.test.ts`). Keep the plan agent and already
+  authorized background jobs; carry host notes delivered beside a declined
+  answer to the next user turn instead of injecting them into the cancelled
+  Run. Self-verification must score post-refusal tool calls as failure, even
+  when implementation itself did not start (`test/create-plan.test.ts`).
 - **Show the plan before asking.** Putting the full plan in the question dock
   hid the conversation. Render it in the assistant transcript and match the
   exact prompt echoed by the answer (`test/create-plan.test.ts`).

@@ -511,7 +511,7 @@ export function cursorModeSystemReminder(
     ? "record the finished plan with Cursor CreatePlan. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until the tool returns success"
     : options.planExitAdvertised === false
       ? options.questionAdvertised
-        ? "record the finished plan with Cursor CreatePlan. Writing it needs no approval; the user is then asked whether to switch to the build agent and start implementing. If they decline, end this turn without further tool calls and wait for a new user message before refining or proposing the plan again"
+        ? "record the finished plan with Cursor CreatePlan. Writing it needs no approval; the user is then asked whether to switch to the build agent and start implementing. If they decline or dismiss, end this turn without further tool calls and wait for a new user message. If they type freeform feedback instead, revise the plan in this same turn using that text"
         : "record the finished plan (Cursor CreatePlan), then tell the user it is ready: they switch to the build agent to have it implemented"
       : "record the finished plan, then call OpenCode `plan_exit` so the user can approve leaving plan mode"
 

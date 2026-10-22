@@ -4,7 +4,8 @@
 
 ### Fixed
 
-- Declining, refining, or dismissing plan execution ends the current turn and keeps the plan agent; late tool requests cannot continue the self-test or start implementation ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
+- Typing freeform feedback on an emulated CreatePlan approval continues the turn in plan mode and preserves the full text, including quoted review questions. Malformed approval results fail closed; No cannot be overridden by another approval in the same result batch ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
+- Declining or dismissing plan execution ends the current turn and keeps the plan agent; late tool requests cannot continue the self-test or start implementation ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
 - OpenCode 2 image saves and optional todo tools assert native permissions for the executing session and agent, including path exceptions and rejection; missing permission APIs fail closed. Image saves recheck their target after approval to prevent directory redirection while waiting
 - Existing-file edit prerequisites require an authorized native read before supplying complete contents; large-file edits retain their complete source without bypassing read permissions
 - Cursor's private Git diff exec directs the model to the native permission-checked shell instead of running Git inside the provider

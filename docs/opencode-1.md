@@ -108,9 +108,12 @@ namespace, discover its schema and invoke it through CallDynamicTool with the
 discovered namespace, tool name and arguments. Discovery is not a mode switch.
 
 When the provider owns the native agent handoff, approval ends the plan Run
-before starting the build turn. Declining, refining, or dismissing the review
-ends the current turn and keeps the session in plan; a new user message is
-required before any further work, including self-test images or scoring.
+before starting the build turn. Declining or dismissing the review ends the
+current turn and keeps the session in plan; a new user message is required
+before any further work, including self-test images or scoring. Typing freeform
+feedback into the provider's emulated `question` review keeps the turn open in
+plan mode and sends that text back as the CreatePlan reply so the model can revise.
+Host-owned `plan_exit` and plan-stage reviews retain their native outcomes.
 
 CreatePlan saves and shows the plan before asking whether to implement. A
 session-wide edit deny keeps the plan saved without an implementation approval
