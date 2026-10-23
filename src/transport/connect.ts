@@ -970,13 +970,19 @@ export async function bidiRunStream(
     trace(`h2 trailers: ${JSON.stringify(stripPseudo(h))}`)
   })
   stream.on("error", (err: Error) => {
-    rawStreamError = err
     writable = false
+    // Bun 1.3 also reports our own CANCEL reset as a stream error while the
+    // response is still open; it is not a failure of a Run we closed.
+    if (locallyClosed) return
+    rawStreamError = err
     trace(`h2 stream error: ${err?.name}: ${err?.message}`)
     scheduleTerminalSettlement()
   })
   stream.on("aborted", () => {
     writable = false
+    // Node and Bun also emit `aborted` for our own CANCEL reset while the
+    // request side is still open; every local close sets the flag first.
+    if (locallyClosed) return
     rawStreamError ??= new CursorTransportError("Cursor Run stream aborted by remote", {
       transient: true,
       replaySafe: true,

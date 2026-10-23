@@ -26,6 +26,7 @@ import {
   getCheckpoint,
   resetCheckpointsForTests,
   setCheckpoint,
+  checkpointTokenDetails,
 } from "../src/protocol/checkpoint.js"
 import {
   getConversationBlob,
@@ -46,6 +47,7 @@ import {
   snapshotHeldHistoryImagesForTests,
 } from "../src/protocol/sent-history-images.js"
 import { CONVERSATION_CACHE_TTL_MS } from "../src/shared.js"
+import { recordSessionEditsGuidance, sessionEditsGuidance } from "../src/protocol/session-edits.js"
 import { encodeMessage } from "../src/protocol/messages.js"
 import {
   pump,
@@ -124,6 +126,63 @@ describe("conversation restart persistence", () => {
 
   afterAll(async () => {
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })))
+  })
+
+  it("persists measured occupancy independently of the zero-token resume checkpoint", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_occupancy_restart"
+    const conversationId = "conversation-occupancy-restart"
+    // Independently specified protobuf #5: used_tokens=42, max_tokens=256.
+    const measured = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+    const terminal = Uint8Array.of(0x2a, 5, 8, 0, 16, 0x80, 2)
+    restoreConversationBinding(sessionKey, conversationId)
+    setCheckpoint(conversationId, measured)
+    setCheckpoint(conversationId, terminal)
+    await persistConversationState(root, { sessionKey, conversationId, requestContext: { rules_info_complete: true } })
+    const file = conversationCacheFilePath(root, sessionKey)
+    const raw = gunzipSync(await readFile(file))
+    // Private cache field #18 (wire type 2) holds only the measured field #5.
+    expect(raw.includes(Buffer.from([0x92, 1, measured.length, ...measured]))).toBe(true)
+    clearMemory()
+    await hydrateConversationState(root, sessionKey)
+    expect(getCheckpoint(conversationId)).toEqual(terminal)
+    expect(checkpointTokenDetails(conversationId, terminal)?.usedTokens).toBe(42)
+
+    // Wrong wire type for #18 invalidates the snapshot rather than trusting it.
+    await writeFile(file, gzipSync(Buffer.concat([raw, Buffer.from([0x90, 1, 1])])))
+    clearMemory()
+    expect((await loadPersistedConversation(root, sessionKey)).status).toBe("invalid")
+  })
+
+  it("persists whether a session edit deny was ever sent, so a restart adds no needless correction", async () => {
+    const root = await cacheRoot()
+    const requestContext = { rules_info_complete: true }
+    const checkpoint = Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 2)
+    const save = async (sessionKey: string, conversationId: string, denied: boolean) => {
+      restoreConversationBinding(sessionKey, conversationId)
+      setCheckpoint(conversationId, checkpoint)
+      recordSessionEditsGuidance(conversationId, denied)
+      await persistConversationState(root, { sessionKey, conversationId, requestContext })
+      return gunzipSync(await readFile(conversationCacheFilePath(root, sessionKey)))
+    }
+    // Private cache field #19 (varint): tag 0x98 0x01, value 1.
+    const marker = Buffer.from([0x98, 1, 1])
+    expect((await save("ses_never_denied", "conv-never-denied", false)).includes(marker)).toBe(false)
+    expect((await save("ses_was_denied", "conv-was-denied", true)).includes(marker)).toBe(true)
+
+    clearMemory()
+    await hydrateConversationState(root, "ses_never_denied")
+    await hydrateConversationState(root, "ses_was_denied")
+    const carried = { carriesEarlierState: true }
+    expect(sessionEditsGuidance("conv-never-denied", false, carried)).toBeUndefined()
+    expect(sessionEditsGuidance("conv-was-denied", false, carried)).toBe(false)
+
+    // Wrong wire type for #19 invalidates the snapshot rather than trusting it.
+    const file = conversationCacheFilePath(root, "ses_was_denied")
+    const raw = gunzipSync(await readFile(file))
+    await writeFile(file, gzipSync(Buffer.concat([raw, Buffer.from([0x9a, 1, 0])])))
+    clearMemory()
+    expect((await loadPersistedConversation(root, "ses_was_denied")).status).toBe("invalid")
   })
 
   it("restores the complete resumable state after process memory is cleared", async () => {

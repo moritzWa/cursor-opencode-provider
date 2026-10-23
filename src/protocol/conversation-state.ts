@@ -14,7 +14,7 @@ import {
   compactConversationBlobs,
   restoreConversationBlobs,
 } from "./blob-store.js"
-import { getCheckpoint, setCheckpoint } from "./checkpoint.js"
+import { getCheckpoint, getCheckpointOccupancy, restoreCheckpointOccupancy, setCheckpoint } from "./checkpoint.js"
 import type { OpencodeToolDef } from "./tools.js"
 import {
   getTurnProvenance,
@@ -23,6 +23,7 @@ import {
   serializeTurnProvenance,
 } from "./turn-provenance.js"
 import { heldHistoryImagesSnapshot, restoreHeldHistoryImages } from "./sent-history-images.js"
+import { restoreSessionEditsDenySent, sessionEditsDenySent } from "./session-edits.js"
 import {
   deletePersistedConversation,
   getPersistedTurnProvenance,
@@ -56,6 +57,9 @@ export async function hydrateConversationState(
   restoreConversationBinding(sessionKey, persisted.conversationId)
   restoreEarlySteers(sessionKey, persisted.earlySteers)
   restoreLostRequest(sessionKey, persisted.lostRequest)
+  // Snapshots written before this marker existed came from releases that never sent a deny.
+  restoreSessionEditsDenySent(persisted.conversationId, persisted.sessionEditsDenySent === true)
+  if (persisted.occupancyCheckpoint) restoreCheckpointOccupancy(persisted.conversationId, persisted.occupancyCheckpoint)
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
@@ -129,6 +133,7 @@ export async function persistConversationState(
     sessionKey: input.sessionKey,
     conversationId: input.conversationId,
     checkpoint,
+    occupancyCheckpoint: getCheckpointOccupancy(input.conversationId),
     blobs,
     requestContext,
     toolCatalog: structuredClone(input.toolCatalog ?? []),
@@ -139,6 +144,7 @@ export async function persistConversationState(
     earlySteers: serializeEarlySteers(input.sessionKey),
     lostRequest: serializeLostRequest(input.sessionKey),
     ...(heldImages ? { sentImageHashes: heldImages.hashes, sentImagesCheckpoint: heldImages.checkpoint } : {}),
+    ...(sessionEditsDenySent(input.conversationId) ? { sessionEditsDenySent: true } : {}),
     ...(provenance?.conversationId === input.conversationId
       ? { turnProvenance: serializeTurnProvenance(provenance) }
       : {}),

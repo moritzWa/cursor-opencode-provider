@@ -470,6 +470,12 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "call_count", type: "uint32" },
   ])
 
+  // The server can append a user message after context injection. This is a
+  // conversation update, not assistant text or a request to send it again.
+  addType(root, "UserMessageAppendedUpdate", [
+    { id: 1, name: "user_message", type: "UserMessage" },
+  ])
+
   // InteractionUpdate — the core streaming update message
   addType(
     root,
@@ -479,6 +485,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 2, name: "tool_call_started", type: "ToolCallStarted" },
       { id: 3, name: "tool_call_completed", type: "ToolCallCompleted" },
       { id: 4, name: "thinking_delta", type: "ThinkingDeltaUpdate" },
+      { id: 6, name: "user_message_appended", type: "UserMessageAppendedUpdate" },
       { id: 7, name: "partial_tool_call", type: "PartialToolCall" },
       { id: 13, name: "heartbeat", type: "Heartbeat" },
       { id: 14, name: "turn_ended", type: "TurnEnded" },
@@ -488,7 +495,7 @@ export function createMessageTypes(): protobuf.Root {
       { id: 23, name: "context_injection_state", type: "ContextInjectionStateUpdate" },
       { id: 27, name: "tool_requests_listed", type: "ToolRequestsListedUpdate" },
     ],
-    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "partial_tool_call", "heartbeat", "turn_ended", "tool_call_delta", "step_started", "step_completed", "context_injection_state", "tool_requests_listed"] }],
+    [{ name: "update", fields: ["text_delta", "tool_call_started", "tool_call_completed", "thinking_delta", "user_message_appended", "partial_tool_call", "heartbeat", "turn_ended", "tool_call_delta", "step_started", "step_completed", "context_injection_state", "tool_requests_listed"] }],
   )
 
   // Server status for an `inject_context_action` (InteractionUpdate #23).
