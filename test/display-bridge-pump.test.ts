@@ -979,6 +979,34 @@ describe("display-only ToolCall pump bridge", () => {
     sessionManager.resolve(session.sessionId, 900_010)
   })
 
+  it("mirrors display tools through the turn's permitted catalog only", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const callId = "plan-permitted"
+    const toolCall = {
+      create_plan_tool_call: {
+        args: {
+          name: "Ship",
+          overview: "Do the thing",
+          plan: "1. A\n2. B",
+          todos: [{ id: "t1", content: "A", status: 1 }],
+        },
+      },
+    }
+    const session = fakeSession(
+      [displayPayload("started", callId, toolCall), displayPayload("completed", callId, toolCall)],
+      writes,
+    )
+    session.permittedToolNames = new Set(["todowrite", "read"])
+    session.nextBridgedExecId = 900_011
+    await pump(session, {
+      enqueue(part: unknown) { parts.push(part) },
+      error() {},
+    } as unknown as ReadableStreamDefaultController<any>, { textId: "text", reasoningId: "reasoning" })
+    expect(parts.find(part => part.type === "tool-call")?.toolName).toBe("todowrite")
+    sessionManager.resolve(session.sessionId, 900_011)
+  })
+
   it("bridges a todo merge only from the completed final list", async () => {
     const writes: Uint8Array[] = []
     const parts: any[] = []

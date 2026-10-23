@@ -1553,6 +1553,60 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     }
   })
 
+  it("refuses a direct plan_exit exec when session permissions cannot be read", async () => {
+    const writes: Uint8Array[] = []
+    const session = planSession([
+      encodeMessage("AgentServerMessage", {
+        exec_server_message: { id: 82, mcp_args: { name: "opencode-plan_exit", tool_name: "plan_exit", provider_identifier: "opencode" } },
+      }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["plan_exit", "read"])
+    session.sessionPermissionsUnavailable = true
+    const parts: LanguageModelV3StreamPart[] = []
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { parts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+      expect(session.planReviewDeclined).toBe(true)
+      expect(session.closed).toBe(true)
+      const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+      expect(replies[0]?.exec_client_message?.mcp_result?.error?.error).toContain("permissions could not be read")
+      expect(replies.some(reply => reply.conversation_action?.cancel_action?.reason === "plan_execution_declined")).toBe(true)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("bridges CreatePlan through the host plan-stage tool under bridged plan mode", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan", { bridgedPlanEntered: true })
+    const writes: Uint8Array[] = []
+    const parts: LanguageModelV3StreamPart[] = []
+    const session = planSession([
+      createPlanPayload({ name: "Staged Plan", overview: "o", plan: "## Steps\n\n1. Stage it.\n", todos: [] }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["cursor_plan_stage", "write", "read"])
+    try {
+      await pump(session, {
+        desiredSize: null, close() {}, error() {},
+        enqueue(part: LanguageModelV3StreamPart) { parts.push(part) },
+      }, { textId: "text", reasoningId: "reasoning" })
+      const call = parts.find(part => part.type === "tool-call")
+      expect(call).toMatchObject({ toolName: "cursor_plan_stage" })
+      const input = JSON.parse((call as { input: string }).input) as {
+        title: string; plan_uri: string; content: string
+      }
+      expect(input.title).toBe("staged-plan")
+      expect(input.plan_uri).toBe("local://staged-plan-plan.md")
+      expect(input.content).toContain("1. Stage it.")
+      expect(session.pending.size).toBe(1)
+      expect(writes).toHaveLength(0)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
   it("does not treat a Yes as permission to implement while session edits stay denied", async () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
@@ -1737,6 +1791,27 @@ describe("CreatePlan through a host plan-stage tool", () => {
       )
       expect(session.planReviewDeclined).toBe(true)
       expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+    }
+  })
+
+  it("ends the turn when a successful plan_exit still leaves the host on its plan agent", async () => {
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const session = planSession([], writes, ["plan_exit"])
+    sessionManager.registerPending(45, session, "mcp_result", "plan_exit", false)
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: `cursor_${session.sessionId}_45`,
+        sessionId: session.sessionId,
+        execId: 45,
+        toolName: "plan_exit",
+        output: "User approved switching to build agent.",
+      }], { hostAgent: "plan" })
+      expect(session.planReviewDeclined).toBe(true)
+      expect(getActiveCursorMode("create-plan-opencode-session")).toBe("plan")
+      expect(decodeMessage<any>("AgentClientMessage", writes[0]!).exec_client_message.mcp_result.error).toBeUndefined()
     } finally {
       sessionManager.close(session, "ordinary-cleanup")
     }

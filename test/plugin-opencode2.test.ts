@@ -927,6 +927,37 @@ describe("opencode2 setup", () => {
     },
   )
 
+  test("cursor_image_save falls back to the tool-context ask when permission.assert is absent", async () => {
+    const { ctx, transforms, sessionLocations } = fakeContext()
+    await setupPlugin(ctx)
+    let execute!: (input: { image_id: string }, context: {
+      sessionID: string; agent: string; messageID: string; id: string;
+      ask?: (request: {
+        permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown>
+      }) => Promise<void>
+    }) => Promise<{ output: { path: string } }>
+    transforms.get("tool")!({ add: (tool: { execute: typeof execute }) => { execute = tool.execute } })
+    const workspace = mkdtempSync(join(tmpdir(), "oc2-img-ask-ws-"))
+    const projectDir = mkdtempSync(join(tmpdir(), "oc2-img-ask-proj-"))
+    sessionLocations.set("ses_img_ask", workspace)
+    const asked: Array<{ permission: string; patterns: string[] }> = []
+    const target = join(projectDir, "assets", "asked.png")
+    const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10)
+    const image_id = stageCursorImage({ path: target, projectDir, mime: "image/png", data: png })
+    try {
+      const result = await execute({ image_id }, {
+        sessionID: "ses_img_ask", agent: "build", messageID: "msg_ask", id: "cursor_ask",
+        ask: async request => { asked.push({ permission: request.permission, patterns: request.patterns }) },
+      })
+      expect(asked.map(entry => entry.permission)).toEqual(["external_directory", "edit"])
+      expect(readFileSync(target)).toEqual(Buffer.from(png))
+      expect(result.output.path).toContain("asked.png")
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+      rmSync(projectDir, { recursive: true, force: true })
+    }
+  })
+
   test("cursor_image_save retains a staging failure instead of treating it as permission denial", async () => {
     const { ctx, transforms, sessionLocations } = fakeContext()
     await setupPlugin(ctx)
