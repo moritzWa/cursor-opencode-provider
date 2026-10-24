@@ -238,8 +238,11 @@ describe("checkpoint eligibility across host results", () => {
     }, 30_000)
   }
 
-  for (const [nextId, incomplete, opaque] of [[1, false, false], [2, false, false], [2, true, false], [2, false, true]] as const) {
-    it(`recovers after a resumed Run's completed exec (id=${nextId}, incomplete=${incomplete}, opaque=${opaque})`, async () => {
+  for (const [nextId, incomplete, opaque, lateCompletion] of [
+    [1, false, false, false], [2, false, false, false], [2, true, false, false],
+    [2, false, true, false], [2, false, false, true],
+  ] as const) {
+    it(`recovers after a resumed Run's completed exec (id=${nextId}, incomplete=${incomplete}, opaque=${opaque}, lateCompletion=${lateCompletion})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-resumed-result-"))
       const requests: Array<{ conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }> = []
       const contexts: Uint8Array[] = []
@@ -251,6 +254,7 @@ describe("checkpoint eligibility across host results", () => {
           if (requests.length === 3) { send({ interaction_update: { turn_ended: {} } }); stream.end(); return }
           send({ exec_server_message: { id: 90, request_context_args: {} } })
           if (requests.length === 1 && opaque) stream.write(frame(Uint8Array.of(0xa2, 0x06, 0)))
+          send({ interaction_update: { tool_call_started: { call_id: `command-${requests.length}` } } })
           send({ exec_server_message: { id: requests.length === 1 ? 1 : nextId,
             shell_args: { command: `echo step-${requests.length}`, tool_call_id: `command-${requests.length}` } } })
         } else if (message.exec_client_message) {
@@ -262,11 +266,16 @@ describe("checkpoint eligibility across host results", () => {
           const key = `${requests.length}:${close?.id}`
           if (!close || close.id !== (requests.length === 1 ? 1 : nextId) || delivered.has(key)) return
           delivered.add(key)
+          send({ interaction_update: { tool_call_completed: { call_id: `command-${requests.length}` } } })
           if (requests.length === 1) {
             send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 9) })
             send({ interaction_update: { thinking_delta: { text: "checkpointed first result" } } })
             stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
-          } else stream.end()
+          } else {
+            // A resumed conversation can still complete an older display call.
+            if (lateCompletion) send({ interaction_update: { tool_call_completed: { call_id: "command-1" } } })
+            stream.end()
+          }
         }
       }
       cacheHttp2SessionForTests(ORIGIN, client)
@@ -274,7 +283,7 @@ describe("checkpoint eligibility across host results", () => {
         const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
           workspaceRoot: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
-        const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": `ses_resume_owners_${nextId}_${incomplete}_${opaque}` },
+        const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": `ses_resume_owners_${nextId}_${incomplete}_${opaque}_${lateCompletion}` },
           tools: [{ type: "function", name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] }
         appendResult(prompt, await readParts(model, options), "first command completed")
         appendResult(prompt, await readParts(model, options), "second command completed")
@@ -311,14 +320,30 @@ describe("checkpoint eligibility across host results", () => {
     }, 30_000)
   }
 
-  for (const scenario of ["complete", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec", "followup-before-result", "new-output", "final-error"] as const) {
+  for (const scenario of [
+    "complete", "announced", "announced-shell", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec",
+    "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
+    "malformed-completion", "repeated-completion-id",
+  ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
       type RunRequest = { conversation_id: string; action: { resume_action?: unknown; user_message_action?: { user_message: { text: string } } } }
       const requests: RunRequest[] = []
       const delivered: number[] = []
+      // Cursor announces each host call before its exec and closes it after the result.
+      const lifecycle = scenario === "announced" || scenario === "announced-shell" || scenario === "cursor-run-call"
+        || scenario === "unannounced-completion" || scenario === "oversized"
+        || scenario === "malformed-completion" || scenario === "repeated-completion-id"
+      const shellVariant = scenario === "announced-shell" ? "shell_args" : "shell_stream_args"
       scripted = (stream, message) => {
         const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+        const shell = (callId: string, command: string) => ({ shell_tool_call: { args: { command, tool_call_id: callId } } })
+        const started = (callId: string, command: string) => {
+          if (lifecycle) send({ interaction_update: { tool_call_started: { call_id: callId, tool_call: shell(callId, command) } } })
+        }
+        const completed = (callId: string, command: string) => {
+          if (lifecycle) send({ interaction_update: { tool_call_completed: { call_id: callId, tool_call: shell(callId, command) } } })
+        }
         if (message.run_request) {
           requests.push(message.run_request as RunRequest)
           if (requests.length > (scenario === "followup-before-result" ? 2 : 1)) {
@@ -335,14 +360,30 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "unknown") stream.write(frame(Uint8Array.of(0xa2, 0x06, 0))) // unknown field 100
           if (scenario === "unrepresented-exec") send({ exec_server_message: { id: 90, list_mcp_resources_exec_args: {} } })
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
-          send({ exec_server_message: { id: 1, shell_stream_args: { command: "echo first", tool_call_id: "first" } } })
+          // A call Cursor runs itself: announced, never claimed by a host exec.
+          if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
+          started("first", "echo first")
+          send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
           const id = (message.exec_client_message as { id: number }).id
-          if (!(message.exec_client_message as Record<string, unknown>).shell_stream || delivered.includes(id)) return
+          // A result is complete with its exit; a large stdout arrives first.
+          const shellReply = message.exec_client_message as { shell_stream?: { exit?: unknown }; shell_result?: unknown }
+          if ((!shellReply.shell_stream?.exit && !shellReply.shell_result) || delivered.includes(id)) return
           delivered.push(id)
           if (id === 1) {
-            send({ exec_server_message: { id: 2, shell_stream_args: { command: "echo second", tool_call_id: "second" } } })
+            completed("first", "echo first")
+            started("second", "echo second")
+            send({ exec_server_message: { id: 2, [shellVariant]: { command: "echo second", tool_call_id: "second" } } })
           } else {
+            completed("second", "echo second")
+            if (scenario === "malformed-completion" || scenario === "repeated-completion-id") {
+              // Independent lifecycle wire: completion #3, call_id #1.
+              // The decoder discards the unknown field or duplicate call id.
+              const callId = [0x0a, 5, ...Buffer.from("first")]
+              const body = [...callId, ...(scenario === "malformed-completion" ? [0x9a, 0x06, 0] : callId)]
+              stream.write(frame(Uint8Array.from([0x0a, body.length + 2, 0x1a, body.length, ...body])))
+            }
+            if (scenario === "unannounced-completion") send({ interaction_update: { tool_call_completed: { call_id: "never-started" } } })
             if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
             if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
             else stream.end() // no checkpoint after either completed result
@@ -367,7 +408,9 @@ describe("checkpoint eligibility across host results", () => {
           }
           return parts
         }
-        for (const output of ["first completed", "second completed"]) {
+        // The rebuild seeds every result; this one cannot fit composer-2.5's window.
+        const secondOutput = scenario === "oversized" ? `second completed ${"z".repeat(1_000_000)}` : "second completed"
+        for (const output of ["first completed", secondOutput]) {
           const parts = await read()
           const call = parts.find(part => part.type === "tool-call")
           if (!call || call.type !== "tool-call") throw new Error("Expected a host command")
@@ -375,7 +418,7 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        if (scenario === "complete") {
+        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -386,6 +429,13 @@ describe("checkpoint eligibility across host results", () => {
           expect(text.match(/first completed/g)).toHaveLength(1)
           expect(text.match(/second completed/g)).toHaveLength(1)
           expect(text).toContain("Do not repeat completed work")
+        } else if (scenario === "oversized") {
+          // The host compacts on this context overflow instead of retrying.
+          const error = await read().catch((caught: unknown) => caught)
+          expect(APICallError.isInstance(error)).toBe(true)
+          expect(error).toMatchObject({ statusCode: 413, isRetryable: false })
+          expect((error as APICallError).message).toMatch(/^prompt is too long/)
+          expect(requests).toHaveLength(1)
         } else {
           expect(await read().catch((error: unknown) => error)).toMatchObject({ isRetryable: false,
             responseHeaders: { "x-should-retry": "false" } })
@@ -400,6 +450,45 @@ describe("checkpoint eligibility across host results", () => {
       }
     }, 30_000)
   }
+
+  it("reports a foreign-history rebase that cannot fit as a context overflow, not a setup failure", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-rebase-overflow-"))
+    let requests = 0
+    scripted = (stream, message) => {
+      if (!message.run_request) return
+      requests++
+      const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      send({ interaction_update: { text_delta: { text: "Cursor answer" } } })
+      send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
+      send({ interaction_update: { turn_ended: {} } })
+      stream.end()
+    }
+    cacheHttp2SessionForTests(ORIGIN, client)
+    try {
+      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        workspaceRoot: root, cacheDir: root }).languageModel("composer-2.5")
+      // A tool-less call would be a lifecycle helper, which never rebases.
+      const headers = { "x-opencode-session-id": "ses_rebase_overflow" }
+      const tools = [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }]
+      const first = await model.doStream({ headers, tools, prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }] })
+      for (const reader = first.stream.getReader(); !(await reader.read()).done;) { /* drain */ }
+      // Another model answered since, at a length the 200k window cannot hold.
+      const error = await Promise.resolve(model.doStream({ headers, tools, prompt: [
+        { role: "user", content: [{ type: "text", text: "Hello" }] },
+        { role: "assistant", content: [{ type: "text", text: `Other model ${"x".repeat(1_000_000)}` }] },
+        { role: "user", content: [{ type: "text", text: "Continue" }] },
+      ] })).catch((caught: unknown) => caught)
+      expect(APICallError.isInstance(error)).toBe(true)
+      expect(error).toMatchObject({ statusCode: 413, isRetryable: false })
+      expect((error as APICallError).message).toMatch(/^prompt is too long/)
+      expect(requests).toBe(1)
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 
   for (const [afterResult, rejectReplacement] of [[false, false], [true, false], [true, true]] as const) {
     it(`only resumes a checkpoint received after the result (after: ${afterResult}, expired replacement: ${rejectReplacement})`, async () => {
