@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-24
+
+### Changed
+
+- GPT-5.4, GPT-5.5 and GPT-5.6 Luna/Sol/Terra pricing no longer includes separate rates above 200k context, matching Cursor's model docs
+
 ### Fixed
 
 - Typing freeform feedback on an emulated CreatePlan approval continues the turn in plan mode and preserves the full text, including quoted review questions. Malformed approval results fail closed; No cannot be overridden by another approval in the same result batch ([#111](https://github.com/oakimov/cursor-opencode-provider/pull/111))
