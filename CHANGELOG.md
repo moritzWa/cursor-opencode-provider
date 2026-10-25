@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-25
+
 ### Fixed
 
 - Wrapped shell commands retain their real exit status in OpenCode and rebuilt model history. Hard timeouts exit 124; background handoffs exit 0. Host exit notices stay out of live stdout, adjacent text blocks preserve their bytes, and invalid terminal statuses fail closed. ([#115](https://github.com/oakimov/cursor-opencode-provider/pull/115), [@nkoynov](https://github.com/nkoynov))
