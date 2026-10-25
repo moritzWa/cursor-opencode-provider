@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- OpenCode 2: an approved Cursor shell command no longer fails with `NotFound: ChildProcess.spawn …/cursor-opencode-wrap-*/shell/…` and asks again when OpenCode disposed another project's plugin setup, such as an idle project it evicts, while the approval was pending. Pending asks stay with the setups still running and are released when the last one goes
+- OpenCode 2 shell approvals survive disposal of another project's plugin setup, avoiding a missing-wrapper spawn failure and a repeated approval prompt. Permission rejections retain their type across setup reloads, and failed event subscriptions do not prevent pending-wrapper cleanup. ([#118](https://github.com/oakimov/cursor-opencode-provider/pull/118), [@nkoynov](https://github.com/nkoynov))
 
 ## [0.8.5] - 2026-10-25
 

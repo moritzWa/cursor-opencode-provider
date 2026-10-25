@@ -151,6 +151,10 @@ const sharedPermissionCalls = processShared("opencode2-permission-calls.v1", () 
   observers: 0,
 }))
 
+// A replacement setup may start after another observer recorded the decline.
+// Keep this bounded terminal evidence across setups and separate module graphs.
+const refusals = processShared("opencode2-tool-refusals.v1", () => new Map<string, ToolRefusal>())
+
 const plugin: Plugin2 & { server: typeof CursorPlugin } = {
   id: "cursor.provider",
   server: CursorPlugin,
@@ -166,7 +170,6 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     let disposeHostAgentModeSwitch: (() => void) | undefined
     trace(`opencode2 plugin: setup directory=${workspaceRoot}`)
     const hasShellEnvHook = typeof ctx.shell?.hook === "function"
-    const refusals = new Map<string, ToolRefusal>()
     const permissionCalls = new Map<string, PendingPermissionCall>()
     const rememberRefusal = (id: string, refusal: ToolRefusal) => {
       refusals.delete(id)
@@ -679,18 +682,20 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       credentialGeneration++
     }
 
+    // Own the observer before iteration: an iterator can throw synchronously
+    // and invoke onStreamClosed before subscribeSessionActivity returns.
+    observePermissionCalls()
     const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch, toolLifecycle, () => {
       hostEventsObserved = false
       releasePermissionCalls()
     })
-    hostEventsObserved = !!unsubscribe
-    if (unsubscribe) observePermissionCalls()
+    hostEventsObserved = !!unsubscribe && observingPermissions
+    if (!unsubscribe) releasePermissionCalls()
 
     return async () => {
       clearInterval(retry)
       unsubscribe?.()
       releasePermissionCalls()
-      refusals.clear()
       await saveOpenTurnsForShutdown()
       disposeHostAgentModeSwitch?.()
       disposeNativePlansDir()
