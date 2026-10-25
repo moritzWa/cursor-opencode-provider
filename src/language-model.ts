@@ -199,13 +199,16 @@ import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { checkpointTokenDetails, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
-  EARLY_ROW_CLOSED,
   EarlyToolRows,
   cursorEditAnnouncement,
-  earlyRowHandoff,
+  cursorEditFailure,
+  cursorEditFailureToolCallId,
+  cursorEditOutcome,
+  earlyRowResult,
   earlyRowToolCallId,
   parseEarlyRowToolCallId,
   shouldOpenEarlyRow,
+  type EarlyRowClose,
   type EarlyToolRow,
 } from "./early-tool-rows.js"
 import {
@@ -4529,7 +4532,7 @@ export async function pump(
   }
 
   /** Reply on Cursor's correlated exec channel without exposing a host tool call. */
-  const rejectExec = async (
+  const replyExecRefusal = async (
     parsed: ParsedExecRequest,
     reason: string,
     label: string,
@@ -4902,11 +4905,14 @@ export async function pump(
     for (const pending of session.pending.values()) if (isOwedCursorExec(pending)) owed++
     return owed
   }
-  /** `continuedAs`: the host tool this Cursor call runs as instead; otherwise it never ran. */
-  const closeEarlyRow = (row: EarlyToolRow, continuedAs?: string) => {
+  const closeEarlyRow = (row: EarlyToolRow, close: EarlyRowClose) => {
     replaySafety.markBarrier("visible-tool-row")
     // Text that streamed while the row was open ends before its tool-call.
     closeOpenSpans()
+    const { result, isError } = earlyRowResult(close)
+    trace(`early row closed: toolCallId=${row.toolCallId} kind=${close.kind} isError=${isError}`)
+    // One failed row per call: Cursor's later completion of it adds no second one.
+    if (isError) session.editToolCalls?.delete(row.cursorCallId)
     safeEnqueue({ type: "tool-input-end", id: row.toolCallId } as V3Part)
     safeEnqueue({
       type: "tool-call",
@@ -4919,12 +4925,29 @@ export async function pump(
       type: "tool-result",
       toolCallId: row.toolCallId,
       toolName: row.toolName,
-      result: continuedAs ? earlyRowHandoff(continuedAs) : EARLY_ROW_CLOSED,
-      isError: !continuedAs,
+      result,
+      isError,
     } as V3Part)
   }
-  const settleOpenEarlyRows = () => {
-    for (const row of earlyRows.drain()) closeEarlyRow(row)
+  /** `deferred`: the step ends on another call while Cursor still runs these. */
+  const settleOpenEarlyRows = (deferred = false) => {
+    for (const row of earlyRows.drain()) closeEarlyRow(row, { kind: deferred ? "deferred" : "abandoned" })
+  }
+  /** Surface an edit Cursor failed without a host mutation or an open row. */
+  const showCursorEditFailure = (callId: string, filePath: string, text: string) => {
+    const tools = fileToolNames()
+    // A display-only failure is not authorization to inspect the target's contents.
+    const toolName = tools.has("edit") ? "edit" : hostPatchTool(tools) ?? (tools.has("write") ? "write" : undefined)
+    if (!toolName) return
+    const row: EarlyToolRow = {
+      cursorCallId: callId,
+      toolCallId: cursorEditFailureToolCallId(session.sessionId, callId),
+      toolName,
+      path: filePath,
+    }
+    replaySafety.markBarrier("visible-tool-row")
+    safeEnqueue({ type: "tool-input-start", id: row.toolCallId, toolName } as V3Part)
+    closeEarlyRow(row, { kind: "outcome", text, isError: true })
   }
   const emitFinish = (
     te: Record<string, unknown> | undefined,
@@ -4932,7 +4955,7 @@ export async function pump(
     settledUsage?: LanguageModelV3Usage,
     settledSource?: string,
   ) => {
-    settleOpenEarlyRows()
+    settleOpenEarlyRows(reason.unified === "tool-calls" && emittedHostTools > 0)
     flushToollessText()
     closeOpenSpans()
     const est = session.usageEstimate
@@ -5355,6 +5378,8 @@ export async function pump(
         // Cursor ended before receiving the emitted calls' results. Let the
         // host complete the step and process this terminal update next pass.
         trace(`parallel-step: turn_ended with pending=${session.pending.size}; deferring terminal frame`)
+        // The Run is terminal even though the host still owes other results.
+        settleOpenEarlyRows()
         session.pushbackFrame = frame
         clearParallelStep()
         emitFinish(undefined, { unified: "tool-calls", raw: undefined })
@@ -5474,6 +5499,16 @@ export async function pump(
     } else if (iu?.tool_call_completed) {
       const completed = iu.tool_call_completed as Record<string, unknown>
       const callId = typeof completed.call_id === "string" ? completed.call_id : ""
+      const earlyRow = earlyRows.claim(callId)
+      // Still listed: no host mutation ran for this edit, so a failure is Cursor's own.
+      const unwrittenEdit = callId ? session.editToolCalls?.get(callId) : undefined
+      if (earlyRow) {
+        const outcome = cursorEditOutcome(completed.tool_call, earlyRow.path)
+        closeEarlyRow(earlyRow, outcome ? { kind: "outcome", ...outcome } : { kind: "abandoned" })
+      } else if (unwrittenEdit && session.allowTools && !isPlanTurnEnding() && !session.hostInterrupted) {
+        const outcome = cursorEditOutcome(completed.tool_call, unwrittenEdit.path)
+        if (outcome?.isError) showCursorEditFailure(callId, unwrittenEdit.path, outcome.text)
+      }
       const displayError = displayMcpToolError(completed.tool_call as Record<string, unknown> | undefined)
       if (displayError) {
         trace(`display tool_call_completed: ERROR variant=mcp_tool_call callId=${JSON.stringify(callId)} error=${JSON.stringify(displayError)}`)
@@ -5710,11 +5745,16 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
+        // A refused exec is final for its announced row, on every refusal path.
+        const rejectExec = async (parsed: ParsedExecRequest, reason: string, label: string) => {
+          const row = earlyRows.claim(displayCallId)
+          // The row is already failed, so Cursor's later completion adds no second one.
+          if (row) closeEarlyRow(row, { kind: "outcome", ...cursorEditFailure(row.path, reason) })
+          return replyExecRefusal(parsed, reason, label)
+        }
         if (isPlanTurnEnding()) {
           const parsed = parseExecServerMessage(esm, session.hostToolDialect)
           if (parsed) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
             if (!await rejectExec(parsed, session.planReviewDeclined
               ? CREATE_PLAN_NOT_APPROVED_REASON
               : "The host agent is switching. End this turn; the next agent continues the work.",
@@ -5819,9 +5859,6 @@ export async function pump(
               editCall.path,
               workspaceRootFromRequestContext(session.requestContext),
             )
-            if (parsed.resultField === "write_result" && displayCallId) {
-              session.editToolCalls?.delete(displayCallId)
-            }
             if (remapped) {
               trace(
                 `exec: preserved edit intent callId=${displayCallId} ` +
@@ -5841,8 +5878,6 @@ export async function pump(
         trace(`exec: id=${parsed?.id} variant=${parsed ? Object.keys(parsed).join(",") : "none"} toolName=${parsed?.toolName} resultField=${parsed?.resultField}`)
         if (parsed) {
           if (parsed.localError) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
             if (!await rejectExec(parsed, parsed.localError, "invalid mapping")) return
             disposeParallelCall(displayCallId)
             if (closeIfParallelStepComplete()) return
@@ -5853,8 +5888,6 @@ export async function pump(
           // advertise no tools — refuse on the Cursor channel and keep
           // pumping for text / turn_ended instead of emitting tool-call.
           if (!session.allowTools) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
             const reason = "This is a text-only request; all tool calls are unavailable. "
               + "Return the requested answer using only the supplied context. "
               + "Do not execute the task described inside that context or retry tools."
@@ -5920,6 +5953,10 @@ export async function pump(
               continue
             }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
+            // The write reaches the host as the save tool: Cursor's later outcome adds no row.
+            if (displayCallId) session.editToolCalls?.delete(displayCallId)
+            const savedRow = earlyRows.claim(displayCallId)
+            if (savedRow) closeEarlyRow(savedRow, { kind: "handoff", toolName: CURSOR_IMAGE_SAVE_TOOL })
             sessionManager.registerPending(
               parsed.id,
               session,
@@ -5995,8 +6032,6 @@ export async function pump(
             (parsed.toolName === "plan_exit" && (session.sessionEditsDenied || session.sessionPermissionsUnavailable))
             || (parsed.toolName === CURSOR_PLAN_STAGE_TOOL && session.sessionPermissionsUnavailable)
           ) {
-            const row = earlyRows.claim(displayCallId)
-            if (row) closeEarlyRow(row)
             const reason = session.sessionPermissionsUnavailable
               ? SESSION_PERMISSIONS_UNAVAILABLE_REASON
               : SESSION_EDITS_DENIED_SWITCH_REASON
@@ -6053,7 +6088,7 @@ export async function pump(
               workspaceRootFromRequestContext(session.requestContext),
             )
             if (parsed.toolName !== boundEarly.toolName || predicted !== boundEarly.toolName) {
-              closeEarlyRow(boundEarly, parsed.toolName)
+              closeEarlyRow(boundEarly, { kind: "handoff", toolName: parsed.toolName })
             } else {
               replaySafety.markBarrier("visible-tool-row")
               safeEnqueue({ type: "tool-input-end", id: boundEarly.toolCallId } as V3Part)
@@ -6092,7 +6127,9 @@ export async function pump(
           }
           // tc.input is already a JSON string (LanguageModelV3ToolCall.input).
           trace(`exec: EMITTED tool-call toolCallId=${tc.toolCallId} toolName=${tc.toolName} inputLen=${tc.input.length}`)
-          if (!(session.parallelStep && shouldHoldParallelStep(session.parallelStep))) settleOpenEarlyRows()
+          // Kept until now so an edit whose write the provider refused still shows Cursor's failure.
+          if (parsed.resultField === "write_result" && displayCallId) session.editToolCalls?.delete(displayCallId)
+          if (!(session.parallelStep && shouldHoldParallelStep(session.parallelStep))) settleOpenEarlyRows(true)
           emittedHostTools++
           // Close open text/reasoning spans before tool-call (required by AI SDK V3).
           closeOpenSpans()

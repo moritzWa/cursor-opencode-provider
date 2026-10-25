@@ -169,6 +169,15 @@ A prompt sent before those servers finish connecting will not see their tools. O
 | — | `ctx.websearch.transform` publishes Exa results as `{url,title,content,time}` for OpenCode 2's native permission-gated `websearch` tool |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: CursorPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
+Edit rows use Cursor's own result when an edit finishes without a host write,
+including errors after the authorized read. A row still waiting for its exec
+may close as deferred when another tool ends the step; a terminal Run closes it
+as unfinished, and a refused exec as failed with the refusal reason, including
+when other calls are pending or Cursor later reports a different completion.
+A binary write staged for the image save tool hands its row to that tool.
+Failure labels use the permitted catalog without reading target files.
+See [shared early-row behavior](../README.md#known-limitations).
+
 Wrapped commands expose their real exit status to the host. A hard timeout
 exits 124; a background handoff exits 0. The native final `Exited with code N`
 block remains in history on its own line and is removed from live stdout when
