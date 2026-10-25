@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode 2 shell approvals survive disposal of another project's plugin setup, avoiding a missing-wrapper spawn failure and a repeated approval prompt. Permission rejections retain their type across setup reloads, and failed event subscriptions do not prevent pending-wrapper cleanup. ([#118](https://github.com/oakimov/cursor-opencode-provider/pull/118), [@nkoynov](https://github.com/nkoynov))
+
 ## [0.8.5] - 2026-10-25
 
 ### Fixed
