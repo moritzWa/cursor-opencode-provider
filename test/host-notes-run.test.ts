@@ -178,7 +178,7 @@ describe("seeded Runs through a full provider Run", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-replayed-permissions-"))
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       const sessionKey = "ses_replayed_permissions"
       const options = { cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: false } }
       onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
@@ -204,7 +204,7 @@ describe("seeded Runs through a full provider Run", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-carried-permissions-"))
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
       for (const denied of [false, true]) {
         const sessionKey = `ses_carried_permissions_${denied}`
@@ -242,7 +242,7 @@ describe("seeded Runs through a full provider Run", () => {
     try {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "alpha")
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       const options = (value: boolean) => ({ cursor: { [CURSOR_SESSION_EDITS_DENIED_OPTION]: value } })
       onRun = (run, message) => {
         if (message.run_request) run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
@@ -279,7 +279,7 @@ describe("seeded Runs through a full provider Run", () => {
     try {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "alpha")
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       const options = (value: boolean) => ({ cursor: { [CURSOR_SESSION_EDITS_DENIED_OPTION]: value } })
       const steps = 4
       onRun = (run, message) => {
@@ -330,7 +330,7 @@ describe("seeded Runs through a full provider Run", () => {
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
       setActiveCursorMode("ses_stage_permissions", "plan")
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
       await collect(model, [
         { role: "user", content: [{ type: "text", text: "Review the plan." }] },
@@ -345,7 +345,7 @@ describe("seeded Runs through a full provider Run", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-plan-permissions-"))
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => { if (message.run_request) endTurn(run, "Done.") }
       const prompt: Prompt = [{ role: "system", content: "Host plan instructions" }, { role: "user", content: [{ type: "text", text: "Plan the change." }] }]
       const options = (denied: boolean) => ({ cursor: { [CURSOR_HOST_AGENT_OPTION]: "plan", [CURSOR_SESSION_EDITS_DENIED_OPTION]: denied } })
@@ -371,7 +371,7 @@ describe("seeded Runs through a full provider Run", () => {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "alpha\n")
       const sessionKey = "ses_seed_rebuild"
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (!message.run_request) return
         if (runs.indexOf(run) === 0) run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
@@ -409,7 +409,7 @@ describe("history images through a full provider Run", () => {
   const IMAGE_A = "AQID"
   const IMAGE_B = "BAUG"
   const checkpoint = (n: number) => Uint8Array.from([0x98, 0x06, n])
-  const model = (root: string) => createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root })
+  const model = (root: string) => createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root })
     .languageModel("claude-sonnet-5-5")
   const user = (text: string, image?: string): Prompt[number] => ({
     role: "user",
@@ -681,7 +681,7 @@ describe("host notes through a full provider Run", () => {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "protected\n")
       const checkpoint = Uint8Array.from([0x0a, 0x00])
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (message.run_request && runs.indexOf(run) === 0) {
           run.send({ conversation_checkpoint_update: checkpoint })
@@ -743,7 +743,7 @@ describe("host notes through a full provider Run", () => {
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
       const sessionKey = "ses_background_notifications"
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       const tools: LanguageModelV3CallOptions["tools"] = [{
         type: "function", name: "shell", description: "Run a native shell command",
         inputSchema: { type: "object", properties: {
@@ -801,7 +801,7 @@ describe("host notes through a full provider Run", () => {
       fs.writeFileSync(file, "alpha\n")
       const instruction = `Instructions from: ${path.join(root, "AGENTS.md")}\nUse bazel.`
       const sessionKey = "ses_fresh_read_note"
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (message.run_request && runs.indexOf(run) === 0) {
           run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
@@ -839,7 +839,7 @@ describe("host notes through a full provider Run", () => {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "already-read\n")
       const sessionKey = "ses_prior_throw"
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (message.run_request && runs.indexOf(run) === 0) {
           run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
@@ -876,7 +876,7 @@ describe("host notes through a full provider Run", () => {
       const file = path.join(root, "probe.txt")
       fs.writeFileSync(file, "already-read\n")
       const sessionKey = "ses_undrained_user_turn"
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (message.run_request && runs.indexOf(run) === 0) {
           run.send({ conversation_checkpoint_update: Uint8Array.from([0x0a, 0x00]) })
@@ -922,7 +922,7 @@ describe("host notes through a full provider Run", () => {
       const note = "<system-update>Use bazel for builds.</system-update>"
       restorePersistedHostNotes(sessionKey, encodePersistedHostNotes([note]))
       const model = createCursor({
-        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+        name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
         retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
       }).languageModel("composer-2.5")
       onRun = (run, message) => {
@@ -955,7 +955,7 @@ describe("host notes through a full provider Run", () => {
       const instructions = `Instructions from: ${path.join(root, "AGENTS.md")}\nThis project builds with bazel.`
       const mcpUpdate = "<system-update>\nInstructions for the following MCP servers are available.\n</system-update>"
       const sessionKey = `ses_run_${Date.now()}`
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
 
       onRun = (run, message) => {
         if (message.run_request && runs.indexOf(run) === 0) {

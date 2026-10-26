@@ -168,7 +168,7 @@ async function continueAfterStop(stop: Stop, abortedMessage: boolean) {
     fs.writeFileSync(file, "alpha\n")
     const sessionKey = `ses_restart_${stop.replace(/\W+/g, "_")}_${abortedMessage}`
     const model = () =>
-      createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+      createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
     onRun = (run, message) => {
       const index = runs.indexOf(run)
       if (message.run_request && index === 0) {
@@ -277,7 +277,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
     try {
       const sessionKey = "ses_restart_streaming"
       const model = () =>
-        createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+        createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         const index = runs.indexOf(run)
         if (message.run_request && index === 0) {
@@ -340,7 +340,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
     try {
       const sessionKey = "ses_restart_aborted"
       const model = () =>
-        createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+        createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         const index = runs.indexOf(run)
         if (message.run_request && index === 0) {
@@ -396,7 +396,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
     try {
       const sessionKey = "ses_restart_turn_end_save"
       const model = () =>
-        createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+        createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         const index = runs.indexOf(run)
         if (message.run_request && index === 0) {
@@ -457,7 +457,7 @@ describe("a turn stopped mid-step, continued by the next process", () => {
       fs.writeFileSync(file, "alpha\n")
       const sessionKey = "ses_late_step_cancel"
       const model = () =>
-        createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
+        createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root }).languageModel("composer-2.5")
       onRun = (run, message) => {
         if (message.run_request) {
           run.send({ conversation_checkpoint_update: checkpoint("before-the-read") })

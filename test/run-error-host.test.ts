@@ -108,7 +108,7 @@ async function streamError(sessionKey: string): Promise<unknown> {
   cacheHttp2SessionForTests(ORIGIN, client)
   try {
     const model = createCursor({
-      name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+      name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
       retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
     })
       .languageModel("composer-2.5")
@@ -186,7 +186,7 @@ describe("checkpoint eligibility across host results", () => {
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
         const key = `ses_checkpoint_${checkpointAt}`
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           workspaceRoot: root, retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run the command" }] }]
         const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": key },
@@ -280,7 +280,7 @@ describe("checkpoint eligibility across host results", () => {
       }
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           workspaceRoot: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
         const options: LanguageModelV3CallOptions = { prompt, headers: { "x-opencode-session-id": `ses_resume_owners_${nextId}_${incomplete}_${opaque}_${lateCompletion}` },
@@ -392,7 +392,7 @@ describe("checkpoint eligibility across host results", () => {
       }
       cacheHttp2SessionForTests(ORIGIN, client)
       try {
-        const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+        const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
           workspaceRoot: root, cacheDir: root, retry: { baseDelayMs: 1, maxDelayMs: 1 } }).languageModel("composer-2.5")
         const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run both commands" }] }]
         const options = { prompt, headers: { "x-opencode-session-id": `ses_result_history_${scenario}` },
@@ -465,7 +465,7 @@ describe("checkpoint eligibility across host results", () => {
     }
     cacheHttp2SessionForTests(ORIGIN, client)
     try {
-      const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN,
+      const model = createCursor({ name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN,
         workspaceRoot: root, cacheDir: root }).languageModel("composer-2.5")
       // A tool-less call would be a lifecycle helper, which never rebases.
       const headers = { "x-opencode-session-id": "ses_rebase_overflow" }
@@ -526,7 +526,7 @@ describe("checkpoint eligibility across host results", () => {
           name: "cursor", agentBaseURL: ORIGIN, cacheDir: root,
           getAccessToken: async request => {
             if (request?.forceRefresh) renewals++
-            return renewals ? "renewed-test-token" : "test-token"
+            return renewals ? "renewed-test-token" : "example-token"
           },
           retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
@@ -600,7 +600,7 @@ describe("follow-up checkpoint arrival", () => {
     try {
       const key = "ses_progress_early_checkpoint"
       const model = createCursor({
-        name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
+        name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root,
         retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 },
       }).languageModel("composer-2.5")
       const { stream } = await model.doStream({
@@ -803,7 +803,7 @@ describe("retry limits across OpenCode calls", () => {
       const attempt = async () => {
         // Hosts may reload the SDK model between retries. State belongs to the turn.
         const model = createCursor({
-          name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: root,
+          name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root,
           retry: { maxAttempts, baseDelayMs: 1, maxDelayMs: 1 },
         }).languageModel("composer-2.5")
         try {
