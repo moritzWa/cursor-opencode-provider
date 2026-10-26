@@ -21,6 +21,10 @@ inventory publication, sharing a 10-second readiness budget. A populated cache
 publishes immediately without waiting for credential renewal or fresh discovery.
 Endpoint warmup runs separately from catalog readiness.
 
+A temporary connection-metadata lookup failure does not hide saved or discovered
+models: the inventory publishes without that optional metadata. Each Run still
+requires a usable current credential; model visibility does not authorize access.
+
 Missing credentials leave `/connect` available. Authentication, network, empty
 catalog, publication and readiness-timeout failures are reported in startup
 warnings and provider debug logs; setup stays active so later credential events,

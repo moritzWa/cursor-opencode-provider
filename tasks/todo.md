@@ -9,6 +9,8 @@
     credentials, discovery/publication failure, deadlines and credential changes.
   - [x] Update operator docs; run typecheck, build, regressions and native
     OpenCode 2.1.4 cold/warm checks and same-session continuity.
+  - [x] Preserve cached/discovered inventory when optional connection metadata
+    fails, with independent required authentication and regression coverage.
 
 - [ ] Redesign shell handling around native OpenCode execution and eradicate
   unnecessary provider duplication. Preserve the current fixes while designing

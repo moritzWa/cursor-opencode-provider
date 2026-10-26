@@ -294,7 +294,12 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     )
 
     const publishModels = async (next: ModelInfo[], current: () => boolean): Promise<boolean> => {
-      const connection = await ctx.integration.connection.active(CURSOR_INTEGRATION_ID)
+      const connection = await ctx.integration.connection.active(CURSOR_INTEGRATION_ID).catch((error: unknown) => {
+        // Connection metadata is optional for inventory publication; Run auth
+        // still resolves and validates the current credential independently.
+        trace(`opencode2 models: connection lookup failed; publishing without sourceConnection: ${String(error)}`)
+        return undefined
+      })
       if (!current()) return false
       const candidate = { models: next, connection, current }
       candidateInventory = candidate

@@ -14,7 +14,9 @@ Operator setup: [OpenCode 2.0](../../docs/opencode-2.md).
   the revision and prevents reconnect/retry, so report discovery failures while
   retaining registrations. Subscribe before discovery, discard superseded
   attempts, and keep uncommitted publication candidates out of later transform
-  replays (`test/plugin-opencode2.test.ts`, cold model readiness).
+  replays. The readiness change also made optional connection metadata fatal:
+  preserve catalog publication when that lookup fails, while keeping required
+  Run authentication independent (`test/plugin-opencode2.test.ts`, cold model readiness).
 - **Published types outrank early API docs.** Hook arity, domains and the
   `aisdk:` discriminator differed. Check actual usages through the compiled
   host contract (`test/opencode2-conformance.types.ts`).

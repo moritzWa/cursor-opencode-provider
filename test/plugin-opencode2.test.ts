@@ -1361,6 +1361,51 @@ describe("opencode2 setup", () => {
       await Bun.sleep(10)
     })
 
+    for (const source of ["cached", "discovered"] as const) {
+      test(`${source} models still publish when the connection lookup fails`, async () => {
+        if (source === "cached") await writeCache(cacheDir, {
+          models: [baseModel], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION,
+        })
+        const { ctx, inventory } = connectedContext()
+        const publications: Array<Parameters<ProviderEditor["add"]>[0]> = []
+        const add = inventory.editor.add
+        inventory.editor.add = (input) => { publications.push(input); add(input) }
+        const warning = spyOn(console, "warn").mockImplementation(() => {})
+        let lookups = 0
+        ctx.integration.connection.active = async () => {
+          // Cold discovery first needs a valid credential; only the later,
+          // optional publication lookup fails. Cache seed needs no credential.
+          if (source === "discovered" && ++lookups === 1) {
+            return { type: "credential", id: "account", label: "Cursor" }
+          }
+          throw new Error("connection lookup unavailable")
+        }
+        let discoveries = 0
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+          if (!String(input).endsWith("/AvailableModels")) return Response.json({})
+          discoveries++
+          return modelResponse()
+        }) as typeof fetch
+        try {
+          await setupPlugin(ctx)
+          const id = source === "cached" ? baseModel.id : "ready-model"
+          expect(inventory.models.has(`cursor/${id}`)).toBe(true)
+          expect(publications).toHaveLength(1)
+          expect(publications[0]).not.toHaveProperty("sourceConnection")
+          expect(warning).not.toHaveBeenCalled()
+          expect(discoveries).toBe(source === "cached" ? 0 : 1)
+          await ctx.provider.reload()
+          expect(inventory.models.has(`cursor/${id}`)).toBe(true)
+          expect(publications).toHaveLength(2)
+          expect(publications[1]).not.toHaveProperty("sourceConnection")
+          // Publishing inventory without metadata must not bypass Run auth.
+          const error = await requireCursorAccessToken(ctx.integration).catch((error: unknown) => error)
+          expect(error).toBeInstanceOf(CursorAuthError)
+          expect(String(error)).toContain("connection lookup unavailable")
+        } finally { warning.mockRestore() }
+      })
+    }
+
     test("missing credentials keep /connect active and a later event discovers models", async () => {
       globalThis.fetch = (async (input: RequestInfo | URL) => String(input).endsWith("/AvailableModels")
         ? modelResponse() : Response.json({})) as typeof fetch
