@@ -536,7 +536,7 @@ For intermittent disconnects or laptop sleep/wake, enable `CURSOR_PROVIDER_RECOV
 
 Completed inline `get_mcp_tools` lookups are read-only and do not block rebuilding from completed host results. A lookup that is unfinished, spills to a file, has unknown fields, or has no matching start remains a barrier, as does other unrepresented server-side work.
 
-After sending a host tool result, recovery waits for its matching server-side tool completion before accepting another resume checkpoint. A delayed checkpoint generated before the result can otherwise arrive after the local write and repeat completed work. Without that acknowledgement, recovery rebuilds from saved tool results when safe, or stops. The `checkpoint-unacknowledged` diagnostic identifies this case.
+After sending a host tool result, recovery waits for its matching server-side tool completion before accepting another resume checkpoint. A delayed checkpoint generated before the result can otherwise arrive after the local write and repeat completed work. Without that acknowledgement, recovery rebuilds from saved tool results when safe, or stops. The `checkpoint-unacknowledged` diagnostic identifies this case. Question, mode-switch and plan replies use their interaction call IDs for this acknowledgement, including during terminal draining. Display-only todo mirrors have already completed on Cursor and do not wait for another completion.
 
 | Problem | What to try |
 |---------|-------------|

@@ -9,7 +9,7 @@
 ### Fixed
 
 - Completed inline tool-catalog lookups no longer block recovery after saved host tool results. Incomplete, spilled, malformed, and unknown server-side work still blocks unsafe replay.
-- A delayed pre-result checkpoint cannot resume completed host work until Cursor acknowledges the matching result; local receipt order alone no longer authorizes checkpoint replay.
+- A delayed pre-result checkpoint cannot resume completed host work until Cursor acknowledges the matching result; local receipt order alone no longer authorizes checkpoint replay. Acknowledged question, mode-switch and plan replies, todo mirrors, and terminal drains retain usable recovery checkpoints.
 
 - OpenCode 2 shell approvals survive disposal of another project's plugin setup, avoiding a missing-wrapper spawn failure and a repeated approval prompt. Permission rejections retain their type across setup reloads, and failed event subscriptions do not prevent pending-wrapper cleanup. ([#118](https://github.com/oakimov/cursor-opencode-provider/pull/118), [@nkoynov](https://github.com/nkoynov))
 
