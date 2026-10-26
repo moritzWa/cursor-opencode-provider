@@ -26,6 +26,22 @@ describe("buildRunRequest", () => {
     expect(rr.requested_model?.model_id).toBe("test-model")
   })
 
+  it("omits retired field 10 and unused workspace-exclusion field 12", () => {
+    const data = buildRunRequest({
+      text: "Hello",
+      modelId: "test-model",
+      conversationId: "conv-fields",
+      messageId: "message-fields",
+    })
+
+    // Inspect raw fields independently of the hand-written AgentRunRequest schema.
+    const runRequest = readAllFields(data).find((field) => field.fn === 1)?.bytes
+    expect(runRequest).toBeDefined()
+    const fieldNumbers = readAllFields(runRequest!).map((field) => field.fn)
+    expect(fieldNumbers).not.toContain(10)
+    expect(fieldNumbers).not.toContain(12)
+  })
+
   it("sends the Cursor mode as UserMessage.mode (field 4, agent.v1.AgentMode)", () => {
     const userMessageFields = (data: Uint8Array) => {
       const field = (bytes: Uint8Array, fn: number) => readAllFields(bytes).find((f) => f.fn === fn)?.bytes
