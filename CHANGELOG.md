@@ -6,6 +6,10 @@
 
 - Recovery-only diagnostics (`CURSOR_PROVIDER_RECOVERY_DEBUG=1`) record interruption, recovery decisions, and host-call/result IDs without logging prompt or tool payloads.
 
+### Changed
+
+- CreatePlan saves plans through an advertised host `write` or patch tool before execution review. File permission authorizes saving; only an explicit Yes approves implementation. Review respects current permissions, cancellation and interrupted saves never replay automatically, and catalogs without a supported writer refuse before mutation ([#90](https://github.com/oakimov/cursor-opencode-provider/issues/90)).
+
 ### Fixed
 
 - Completed inline tool-catalog lookups no longer block recovery after saved host tool results. Incomplete, spilled, malformed, and unknown server-side work still blocks unsafe replay.

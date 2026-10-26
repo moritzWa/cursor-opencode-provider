@@ -222,6 +222,24 @@ export type CursorSession = {
   replaySafety?: ReplaySafetyState
   /** A delivered plan result refused execution; terminate this Run without continuing. */
   planReviewDeclined?: boolean
+  /**
+   * CreatePlan follow-up after a successful host plan write: emit the review
+   * tool, or acknowledge without asking, before reading further Cursor frames.
+   */
+  queuedCreatePlanAction?: {
+    kind: "review" | "ack" | "hold"
+    interactionId: number
+    createPlanToolCallId?: string
+    bridgeKind: string
+    planUri: string
+    planPath: string
+    markdown?: string
+    planReview?: string
+    toolName?: "plan_exit" | "question"
+    questionInput?: unknown
+    createPlanQuestion?: string
+    receiptHostCallId?: string
+  }
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
