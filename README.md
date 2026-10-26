@@ -392,6 +392,7 @@ that stall window. The setting does not override OpenCode's own retry limits.
 | `NO_PROXY` / `no_proxy` | Comma/space hosts that bypass the proxy (`*`, exact host, or `.suffix` / `suffix` domain forms; a `host:port` entry bypasses only that port) |
 | `CURSOR_ENDLESS_RETRIES` | Set to `1` or `true` to bypass retry count limits; off by default. Safety cutoffs and host retry limits still apply. See [retry limits](#retry-limits). |
 | `CURSOR_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
+| `CURSOR_PROVIDER_RECOVERY_DEBUG` | Set to `1` or `true` for recovery metadata only (session/call IDs, elapsed time, checkpoints, guard decisions). Uses the same log path and 10 MiB cap; leave full debug off to exclude payload traces. |
 | `CURSOR_PROVIDER_DEBUG_FILE` | Debug log path (default: `debug-<pid>.log` under `$TMPDIR/cursor-provider-logs-<uid>/`) |
 | `CURSOR_AGENT_TRANSCRIPTS_FOLDER` | Optional folder containing past-chat transcripts, advertised to Cursor on OpenCode 1.x and 2.0. Sent only if it is an existing directory; unset, empty, missing, non-directory, or unstatable paths are omitted. Relative paths resolve against the workspace. The provider does not create the folder or write transcripts. |
 | `CURSOR_OPENCODE2_DEV_ENTRY` | **Local OpenCode 2.0 only.** Absolute path to a built entry file (usually `dist/index.js`). Rewrites the AI SDK package to `aisdk:file://…` so the daemon imports your local build instead of `npm install`-ing the published package. Export it **before** `opencode2 service start`, then restart after rebuilds. Unset in production. See [OpenCode 2.0 local clone](docs/opencode-2.md#from-a-local-clone-cursor_opencode2_dev_entry). |
@@ -530,6 +531,12 @@ Primary modes and hidden/internal agents are never selected unless OpenCode expl
 The package root intentionally stays plugin-safe for OpenCode's classic loader. `CursorPluginV2` and non-plugin runtime APIs are **not** re-exported from the package root; load them through their dedicated subpaths.
 
 ## Troubleshooting
+
+For intermittent disconnects or laptop sleep/wake, enable `CURSOR_PROVIDER_RECOVERY_DEBUG=1` before starting the host. Set `CURSOR_PROVIDER_DEBUG_FILE` to a persistent file if the default temporary log is unsuitable. The file is mode 0600 and capped at 10 MiB. Search `recovery:` lines by `hostSessionId`: `interrupted` records the error code and checkpoint/barrier state; `history-check` explains acceptance or refusal; `reopened` links old and replacement Run IDs; `pump-complete` records progress (`closed=true pending=0` is terminal). `host-call-emitted` and `host-result-delivered` correlate dispatched calls and saved results. These IDs help investigate duplicates but do not by themselves prove two different model-generated calls have identical effects. Elapsed wall time includes suspension; it is not proof the OS slept. Correlate with the OS sleep log.
+
+Completed inline `get_mcp_tools` lookups are read-only and do not block rebuilding from completed host results. A lookup that is unfinished, spills to a file, has unknown fields, or has no matching start remains a barrier, as does other unrepresented server-side work.
+
+After sending a host tool result, recovery waits for its matching server-side tool completion before accepting another resume checkpoint. A delayed checkpoint generated before the result can otherwise arrive after the local write and repeat completed work. Without that acknowledgement, recovery rebuilds from saved tool results when safe, or stops. The `checkpoint-unacknowledged` diagnostic identifies this case.
 
 | Problem | What to try |
 |---------|-------------|

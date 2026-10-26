@@ -596,7 +596,7 @@ describe("parallel tool-call pump", () => {
   it("resumes a checkpoint received after a completed host tool result", async () => {
     const checkpoint = Uint8Array.of(10, 1, 2)
     const { session } = fixture([
-      shell(1), frame({ conversation_checkpoint_update: checkpoint }), text("after the result"),
+      shell(1), completed("call-1"), frame({ conversation_checkpoint_update: checkpoint }), text("after the result"),
     ])
     const first = collect()
     await pump(session, first.controller, ids)

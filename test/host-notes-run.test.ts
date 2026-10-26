@@ -579,9 +579,10 @@ describe("history images through a full provider Run", () => {
     onRun = (run, message) => {
       const index = runs.indexOf(run)
       if (message.run_request && index === 1) {
-        run.send({ exec_server_message: { id: 1, read_args: { path: file } } })
+        run.send({ exec_server_message: { id: 1, read_args: { path: file, tool_call_id: "read-image" } } })
         run.send({ conversation_checkpoint_update: checkpoint(40) })
       } else if (message.exec_client_message?.read_result) {
+        run.send({ interaction_update: { tool_call_completed: { call_id: "read-image" } } })
         endTurnOn(run, afterResult)
       } else if (message.run_request) {
         endTurnOn(run, checkpoint(index + 1))
