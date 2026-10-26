@@ -130,6 +130,9 @@ describe("CreatePlan restart receipts", () => {
     const valid = { ...receipt(), createPlanToolCallId: "cursor-display", consumedResultId: "write-result" }
     restorePlanOperations("valid", JSON.stringify({ version: 1, receipts: [valid] }))
     expect(planOperationsFor("valid")).toEqual([valid])
+    const { afterWrite: _after, reviewToolName: _tool, ...minimal } = receipt()
+    restorePlanOperations("minimal", JSON.stringify({ version: 1, receipts: [{ ...minimal, afterWrite: "invalid", reviewToolName: "invalid" }] }))
+    expect(planOperationsFor("minimal")).toEqual([minimal])
   })
 
   it("shares receipts across separately loaded module copies", async () => {

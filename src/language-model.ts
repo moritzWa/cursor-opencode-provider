@@ -178,7 +178,6 @@ import {
   createPlanStageInput,
 } from "./protocol/create-plan.js"
 import {
-  canAdmitPlanOperation,
   clearPlanOperation,
   clearPlanOperations,
   incompletePlanOperations,
@@ -2635,6 +2634,28 @@ export async function preparePriorSessionForFreshTurn(
     if (prior.closed) return "settled-only"
   }
 
+  // A real new user turn abandons the prior review. A historical writer
+  // result can queue that review here without opening another host call;
+  // settle its still-owed interaction before draining the old Run.
+  const queuedPlan = prior.queuedCreatePlanAction
+  if (queuedPlan?.kind === "review") {
+    let beforeReply = lastFrameArrival()
+    const written = await writeWithBackpressure(prior.stream, buildCreatePlanInteractionReply(queuedPlan.interactionId, {
+      error: { error: FRESH_TURN_PENDING_CANCEL_REASON }, plan_uri: "",
+    }), "create_plan review abandoned for new user turn", () => {
+      beforeReply = lastFrameArrival()
+      return !prior.closed
+    })
+    if (!written) return "settled-only"
+    invalidateResumeCheckpoint(prior, beforeReply, true)
+    const unacknowledged = prior.unacknowledgedHostResults ??= []
+    unacknowledged.push({ callId: queuedPlan.createPlanToolCallId, afterFrame: beforeReply })
+    prior.queuedCreatePlanAction = undefined
+    prior.planReviewDeclined = true
+    if (queuedPlan.receiptHostCallId) clearPlanOperation(prior.openCodeSessionId, queuedPlan.receiptHostCallId)
+    await persistPlanOperations(prior)
+  }
+
   const cancelled = await cancelPendingExecsForFreshTurn(prior)
   if (cancelled > 0) {
     trace(
@@ -3904,9 +3925,12 @@ async function deliverContinuationResultsNow(
     // including time spent queued behind another write, but admit those that
     // arrive while that frame drains. Earlier result frames are incomplete.
     let beforeResultWrite = lastFrameArrival()
+    const replyDeferred = pending.resultField === CREATE_PLAN_RESULT_FIELD
+      && pending.resultMetadata?.createPlanPhase === "write"
+      && session.queuedCreatePlanAction?.kind === "review"
     const outcome = await sessionManager.deliverClaim(claim, frames, () => {
       beforeResultWrite = lastFrameArrival()
-    })
+    }, { replyDeferred })
     if (outcome.kind !== "delivered") {
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
@@ -3918,7 +3942,7 @@ async function deliverContinuationResultsNow(
       await persistPlanOperations(session)
     }
     if (endTurnAfterDelivery) session.planReviewDeclined = true
-    if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
+    if (outcome.framesWritten > 0 || replyDeferred || (pending.bridged && !pending.aborted)) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
       // A display-only mirror sends nothing to Cursor: its server completion
       // already arrived before the host call. Only a real reply needs an ack.
@@ -6718,26 +6742,6 @@ export async function pump(
           const planUri = plan.planUri ?? ""
           const planPath = typeof plan.planPath === "string" ? plan.planPath.trim() : ""
           const markdown = typeof plan.markdown === "string" ? plan.markdown : ""
-          const admitted = canAdmitPlanOperation(session.openCodeSessionId, markdown)
-          if (!admitted.ok) {
-            try {
-              await writeWithBackpressure(
-                session.stream,
-                buildCreatePlanInteractionReply(handled.id, {
-                  error: { error: admitted.error },
-                  plan_uri: "",
-                }),
-                `create_plan write refused id=${handled.id}`,
-              )
-            } catch (error) {
-              rethrowTransportWriteFailure(error)
-              failRunProtocol("Cursor interaction reply failed", RUN_REPLY_FAILED)
-            }
-            if (plan.persistence.afterWrite.kind === "hold") session.planReviewDeclined = true
-            disposeParallelCall(handled.toolCallId)
-            if (closeIfParallelStepComplete()) return
-            continue
-          }
           const writeExecId = session.nextBridgedExecId++
           const writeToolCallId = `cursor_${session.sessionId}_${writeExecId}`
           const after = plan.persistence.afterWrite
@@ -6793,7 +6797,7 @@ export async function pump(
             session,
             CREATE_PLAN_RESULT_FIELD,
             plan.persistence.toolName,
-            true,
+            false,
             {
               interactionId: handled.id,
               createPlanToolCallId: plan.toolCallId,

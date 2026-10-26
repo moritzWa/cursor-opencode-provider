@@ -510,11 +510,10 @@ export function buildAsyncAskQuestionCompletion(
  * so switching models and hosts stays coherent. Empty / missing args keep the
  * CLI empty-`plan_uri` success ack (nothing to write).
  *
- * Writing the plan never asks; executing it always does. Which channel raises
- * that prompt is resolved from the advertised catalog by
- * {@link resolveCreatePlanBridge}, and every channel reports the same outcome:
- * `success` means the user approved execution, `error` means the plan was
- * written but not accepted, so the model keeps planning.
+ * Host permission may ask to save the plan. Execution review is a separate
+ * step resolved from the advertised catalog by {@link resolveCreatePlanBridge}.
+ * Review success approves execution; an acknowledgment outside plan mode only
+ * confirms persistence. A failed or declined review never approves execution.
  */
 function handleCreatePlanQuery(
   id: number,

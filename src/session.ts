@@ -754,6 +754,8 @@ export class SessionManager {
     frames: readonly Uint8Array[],
     /** Called at each actual serialized write, before write() and its drain. */
     beforeWrite?: () => void,
+    /** A completed host phase queued the interaction's next phase instead of its final reply. */
+    options?: { replyDeferred: boolean },
   ): Promise<DeliveryOutcome> {
     const { session, execId, pending } = claim
     const key = this.key(session.sessionId, execId)
@@ -784,7 +786,7 @@ export class SessionManager {
 
     let framesWritten = 0
     try {
-      if (!pending.bridged && !pending.aborted && frames.length === 0) {
+      if (!pending.bridged && !pending.aborted && frames.length === 0 && !options?.replyDeferred) {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {

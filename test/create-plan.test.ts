@@ -4,6 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { execFileSync } from "node:child_process"
+import { createCursor } from "../src/index.js"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { pathToFileURL } from "node:url"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -48,6 +49,7 @@ import {
 } from "../src/protocol/switch-mode.js"
 import {
   deliverContinuationResults,
+  extractTrailingToolResults,
   preparePriorSessionForFreshTurn,
   pump,
   releaseHostNoteInjectionsForTests,
@@ -65,8 +67,10 @@ import { restoreConversationBinding } from "../src/protocol/conversation-bind.js
 import { setConversationPersistenceHookForTests } from "../src/protocol/conversation-persistence.js"
 import {
   hostGlobalDataDir,
+  getHostCacheDirOverride,
   hostPlansDir,
   setNativePlansDir,
+  setHostCacheDirOverride,
   HOST_PATH_BRIDGE,
   type OpenCodePathBridge,
 } from "../src/context/paths.js"
@@ -891,6 +895,37 @@ describe("CreatePlan host persistence routing", () => {
     expect(fs.existsSync(prepared.planPath)).toBe(false)
   })
 
+  it("refuses lossy plan patches and reports a filesystem failure in the test writer", () => {
+    const call = buildPlanPersistenceCall({ kind: "patch", toolName: "patch" }, "/workspace/plan.md", "CRLF\r\n")
+    expect(call.ok).toBe(false)
+    if (call.ok) throw new Error("Expected an unrepresentable patch")
+    expect(call.error).toContain("carriage returns")
+    const parent = path.join(workspace, "blocked")
+    fs.writeFileSync(parent, "keep")
+    const result = writeOpencodePlanFile({ name: "Blocked", overview: "", plan: "Steps.", todos: [], isProject: false }, workspace, 1, path.join(parent, "plan.md"))
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error("Expected a filesystem error")
+    expect(result.error).toContain("Failed to write plan file")
+    expect(fs.readFileSync(parent, "utf8")).toBe("keep")
+  })
+
+  it.each([false, true])("refuses empty content and an unrepresentable plan destination before mutation (deny=%s)", sessionEditsDenied => {
+    for (const invalid of ["empty", "path"] as const) {
+      const payload = createPlanPayload(invalid === "empty" ? { name: " ", plan: " " } : { name: "Plan", plan: "Steps." })
+      const query = decodeMessage<any>("AgentServerMessage", payload).interaction_query
+      const handled = handleInteractionQuery(query, payload, {
+        workspaceRoot: workspace, allowTools: true, planModeActive: true, sessionEditsDenied,
+        advertisedTools: ["patch", "question"], hostPlanFile: path.join(workspace, "invalid\nplan.md"),
+      })
+      expect(handled.outcome).toBe("failed")
+      expect(handled.createPlan).toBeUndefined()
+      const result = decodeMessage<any>("AgentClientMessage", handled.reply!).interaction_response.create_plan_request_response.result
+      expect(result.error.error).toContain(invalid === "empty" ? "no plan content" : "patch header")
+      expect(handled.endTurn === true).toBe(sessionEditsDenied)
+      expect(fs.readdirSync(workspace)).toEqual([])
+    }
+  })
+
   it("refuses incomplete restored plan operations without replaying mutation", () => {
     const key = "plan-ops-session"
     expect(recordPlanOperation(key, {
@@ -915,6 +950,235 @@ describe("CreatePlan host persistence routing", () => {
 
 describe("CreatePlan full-pump host write and patch matrix", () => {
   afterEach(() => resetHostPlanFilesForTests())
+
+  it.each([false, true])("refuses a writer before mutation when durable receipt admission is full (deny=%s)", async denied => {
+    resetPlanOperationsForTests()
+    const key = "create-plan-opencode-session"
+    for (let i = 0; i < 8; i++) expect(recordPlanOperation(key, {
+      interactionId: i, hostCallId: `other-${i}`, planPath: "/workspace/plan.md", planUri: "file:///workspace/plan.md",
+      markdown: "# Pending\n", phase: "write", bridgeKind: "approve",
+    }).ok).toBe(true)
+    setActiveCursorMode(key, "plan")
+    const writes: Uint8Array[] = []
+    const parts: LanguageModelV3StreamPart[] = []
+    const session = planSession([
+      createPlanPayload({ name: "Budget", plan: "Do not write." }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], writes, ["write", "question"])
+    session.sessionEditsDenied = denied || undefined
+    try {
+      await pump(session, { enqueue(part: LanguageModelV3StreamPart) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        { textId: "budget", reasoningId: "r" })
+      expect(parts.filter(part => part.type === "tool-call")).toHaveLength(0)
+      const reply = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes)).find(message => message.interaction_response)
+      expect(reply.interaction_response.create_plan_request_response.result.error.error).toContain("operation budget is full")
+      expect(planOperationsFor(key)).toHaveLength(8)
+      expect(fs.readdirSync(workspace)).toEqual([])
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it.each(["budget", "review"] as const)("retains fail-closed state when the %s refusal cannot be delivered", async phase => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const writes: Uint8Array[] = []
+    const parts: LanguageModelV3StreamPart[] = []
+    const session = planSession([createPlanPayload({ name: "Reply failure", plan: "No implementation." })], writes, ["write", "question"])
+    const controller = { enqueue(part: LanguageModelV3StreamPart) { parts.push(part) }, error() {} }
+    try {
+      if (phase === "budget") {
+        for (let i = 0; i < 8; i++) expect(recordPlanOperation(session.openCodeSessionId, {
+          interactionId: i, hostCallId: `call-${i}`, planPath: "/workspace/plan.md", planUri: "file:///workspace/plan.md",
+          markdown: "# Pending\n", phase: "write", bridgeKind: "approve",
+        }).ok).toBe(true)
+      } else {
+        await pump(session, controller as ReadableStreamDefaultController<LanguageModelV3StreamPart>, { textId: "write", reasoningId: "r" })
+        const call = parts.find(part => part.type === "tool-call")
+        if (!call || call.type !== "tool-call") throw new Error("Expected a host writer")
+        await deliverContinuationResults(session, [{
+          toolCallId: call.toolCallId, sessionId: session.sessionId, execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "Saved",
+        }])
+        session.permittedToolNames = new Set(["write"])
+      }
+      session.stream.write = () => { throw new Error("transport closed") }
+      await expect(pump(session, controller as ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        { textId: "refusal", reasoningId: "r" })).rejects.toThrow()
+      expect(parts.filter(part => part.type === "tool-call" && part.toolName === "question")).toHaveLength(0)
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(phase === "budget" ? 8 : 1)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it("acknowledges a saved plan outside plan mode without approving implementation", async () => {
+    resetPlanOperationsForTests()
+    const { session, writes, parts } = await runCreatePlan([
+      createPlanPayload({ name: "Record", plan: "Just save this." }),
+    ], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: Number(call.toolCallId.split("_").pop()),
+        toolName: "write", output: "Saved",
+      }])
+      const reply = decodeMessage<any>("AgentClientMessage", writes.at(-1)!).interaction_response.create_plan_request_response.result
+      expect(reply.success).toBeDefined()
+      expect(reply.plan_uri).toStartWith("file://")
+      expect(session.queuedCreatePlanAction).toBeUndefined()
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(0)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBeUndefined()
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it.each(["write", "review"] as const)("fails closed when the %s continuation loses its interaction identity", async phase => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, writes, parts } = await runCreatePlan([
+      createPlanPayload({ name: "Corruption", plan: "Do not approve an uncorrelated plan." }),
+    ], ["write", "question"])
+    try {
+      if (phase === "review") {
+        const writer = parts.find(part => part.type === "tool-call")
+        await completePlanWrite(session, writes, parts, writer)
+      }
+      const call = parts.filter(part => part.type === "tool-call").at(-1)
+      const execId = Number(call.toolCallId.split("_").pop())
+      const pending = session.pending.get(execId)!
+      delete pending.resultMetadata!.interactionId
+      expect(await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId, toolName: call.toolName, output: "Yes",
+      }])).toBeUndefined()
+      expect(session.closed).toBe(true)
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(1)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it("stops a failed live plan continuation before rebasing or resolving credentials", async () => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const previousCache = getHostCacheDirOverride()
+    const { session, parts } = await runCreatePlan([createPlanPayload({ name: "Lost identity", plan: "Wait." })], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    delete session.pending.get(Number(call.toolCallId.split("_").pop()))!.resultMetadata!.interactionId
+    let credentials = 0
+    try {
+      const model = createCursor({ name: "cursor", cacheDir: workspace, getAccessToken: async () => {
+        credentials++
+        throw new Error("A failed plan continuation must not open a Run")
+      } }).languageModel("gpt-5")
+      const { stream } = await model.doStream({
+        headers: { "x-opencode-session-id": session.openCodeSessionId! },
+        tools: [{ type: "function", name: "write", inputSchema: { type: "object" } }],
+        prompt: [
+          { role: "user", content: [{ type: "text", text: "Make a plan." }] },
+          { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "write", input: JSON.parse(call.input) }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "write", output: { type: "text", value: "Saved" } }] },
+        ],
+      })
+      const output: LanguageModelV3StreamPart[] = []
+      const reader = stream.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        output.push(value)
+      }
+      expect(output.flatMap(part => part.type === "text-delta" ? [part.delta] : []).join("")).toContain("No implementation was approved")
+      expect(credentials).toBe(0)
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(1)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+      setHostCacheDirOverride(previousCache)
+    }
+  })
+
+  it.each(["refusal", "interrupted"] as const)("reports a %s writer without offering implementation review", async failure => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, writes, parts } = await runCreatePlan([createPlanPayload({ name: "Refused", plan: "Wait." })], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    try {
+      await deliverContinuationResults(session, [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId, execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "",
+        ...(failure === "refusal" ? { refusal: "permission_denied" as const } : { interrupted: true }),
+      }])
+      const reply = decodeMessage<any>("AgentClientMessage", writes.at(-1)!).interaction_response.create_plan_request_response.result
+      expect(reply.error.error).toBe(failure === "refusal" ? "permission_denied" : "Failed to write plan file")
+      expect(session.queuedCreatePlanAction).toBeUndefined()
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(0)
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it.each(["saved", "denied", "abandoned"] as const)("settles an owed plan writer before a fresh user turn: %s", async outcome => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, writes, parts } = await runCreatePlan([
+      createPlanPayload({ name: "History", plan: "Review the saved plan." }),
+      encodeMessage("AgentServerMessage", { interaction_update: { turn_ended: {} } }),
+    ], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    session.pumpActive = false
+    session.pumpOwner = null
+    try {
+      const results = outcome === "abandoned" ? [] : [{
+        toolCallId: call.toolCallId, sessionId: session.sessionId,
+        execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "Saved",
+        ...(outcome === "denied" ? { error: "permission denied" } : {}),
+      }]
+      expect(await preparePriorSessionForFreshTurn(session.openCodeSessionId, { timeoutMs: 50, toolResults: results })).toBe("drained")
+      const replies = writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes))
+        .flatMap(message => message.interaction_response?.create_plan_request_response ? [message.interaction_response] : [])
+      expect(replies).toHaveLength(1)
+      expect(replies[0].id).toBe(42)
+      expect(replies[0].create_plan_request_response.result.error.error)
+        .toContain(outcome === "denied" ? "permission denied" : "new user turn")
+      expect(session.queuedCreatePlanAction).toBeUndefined()
+      expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(0)
+      expect(getActiveCursorMode(session.openCodeSessionId)).toBe("plan")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
+
+  it("keeps a plan writer result under a native host note on its review continuation", async () => {
+    resetPlanOperationsForTests()
+    setActiveCursorMode("create-plan-opencode-session", "plan")
+    const { session, writes, parts } = await runCreatePlan([
+      createPlanPayload({ name: "Host note", plan: "Review after save." }),
+    ], ["write", "question"])
+    const call = parts.find(part => part.type === "tool-call")
+    try {
+      const results = extractTrailingToolResults([
+        { role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "write", output: { type: "text", value: "Saved" } }] },
+        { role: "user", content: [{ type: "text", text: "<system-update>\nThe available skills changed.\n</system-update>" }] },
+      ])
+      expect(results).toHaveLength(1)
+      await deliverContinuationResults(session, results)
+      await pump(session, { enqueue(part: LanguageModelV3StreamPart) { parts.push(part) }, error() {} } as ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        { textId: "review", reasoningId: "r" })
+      expect(parts.filter(part => part.type === "tool-call" && part.toolName === "question")).toHaveLength(1)
+      expect(writes.map(bytes => decodeMessage<any>("AgentClientMessage", bytes)).some(message => message.interaction_response)).toBe(false)
+      expect(planOperationsFor(session.openCodeSessionId)[0]?.phase).toBe("review")
+    } finally {
+      sessionManager.close(session, "ordinary-cleanup")
+      resetPlanOperationsForTests()
+    }
+  })
 
   it("refuses a second parallel CreatePlan instead of losing its pending review", async () => {
     resetPlanOperationsForTests()
@@ -1016,20 +1280,23 @@ describe("CreatePlan full-pump host write and patch matrix", () => {
     }
   })
 
-  it("retains the receipt through the write-to-review transition", async () => {
+  it.each(["tool_plan", ""])("retains the receipt and revokes the old checkpoint through write-to-review (display=%s)", async displayCallId => {
     resetPlanOperationsForTests()
     setActiveCursorMode("create-plan-opencode-session", "plan")
     const { session, parts } = await runCreatePlan([
-      createPlanPayload({ name: "Receipt", plan: "Review after save." }),
+      createPlanPayload({ name: "Receipt", plan: "Review after save." }, 42, displayCallId),
     ], ["write", "question"])
     try {
       const call = parts.find(part => part.type === "tool-call")
+      session.resumeCheckpoint = Uint8Array.of(1, 2, 3)
       await deliverContinuationResults(session, [{
         toolCallId: call.toolCallId, sessionId: session.sessionId,
         execId: Number(call.toolCallId.split("_").pop()), toolName: "write", output: "Saved",
       }])
       expect(planOperationsFor(session.openCodeSessionId)).toHaveLength(1)
       expect(planOperationsFor(session.openCodeSessionId)[0]?.phase).toBe("review")
+      expect(session.resumeCheckpoint).toBeUndefined()
+      expect(session.checkpointRevokedByHostResult).toBe(true)
     } finally {
       sessionManager.close(session, "ordinary-cleanup")
       resetPlanOperationsForTests()
