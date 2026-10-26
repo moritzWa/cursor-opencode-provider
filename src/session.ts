@@ -222,6 +222,24 @@ export type CursorSession = {
   replaySafety?: ReplaySafetyState
   /** A delivered plan result refused execution; terminate this Run without continuing. */
   planReviewDeclined?: boolean
+  /**
+   * CreatePlan follow-up after a successful host plan write: emit the review
+   * tool, or acknowledge without asking, before reading further Cursor frames.
+   */
+  queuedCreatePlanAction?: {
+    kind: "review" | "ack" | "hold"
+    interactionId: number
+    createPlanToolCallId?: string
+    bridgeKind: string
+    planUri: string
+    planPath: string
+    markdown?: string
+    planReview?: string
+    toolName?: "plan_exit" | "question"
+    questionInput?: unknown
+    createPlanQuestion?: string
+    receiptHostCallId?: string
+  }
   /** History images this Run's checkpoints hold or may hold; absent for a Run outside an OpenCode session. */
   historyImages?: RunHistoryImages
   /** Last checkpoint-derived context snapshot, independent of retry eligibility. */
@@ -736,6 +754,8 @@ export class SessionManager {
     frames: readonly Uint8Array[],
     /** Called at each actual serialized write, before write() and its drain. */
     beforeWrite?: () => void,
+    /** A completed host phase queued the interaction's next phase instead of its final reply. */
+    options?: { replyDeferred: boolean },
   ): Promise<DeliveryOutcome> {
     const { session, execId, pending } = claim
     const key = this.key(session.sessionId, execId)
@@ -766,7 +786,7 @@ export class SessionManager {
 
     let framesWritten = 0
     try {
-      if (!pending.bridged && !pending.aborted && frames.length === 0) {
+      if (!pending.bridged && !pending.aborted && frames.length === 0 && !options?.replyDeferred) {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {
