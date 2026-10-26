@@ -53,7 +53,7 @@ describe("OpenCode-backed websearch tool", () => {
       permission: "websearch",
       patterns: ["current release"],
     })])
-    expect(requestUrl).toContain("https://mcp.exa.ai/mcp?exaApiKey=test-key")
+    expect(requestUrl).toContain("https://mcp.exa.ai/mcp?exaApiKey=example-key")
     const body = JSON.parse(String(requestInit?.body))
     expect(body.params).toEqual({
       name: "web_search_exa",
