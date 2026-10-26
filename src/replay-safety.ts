@@ -108,7 +108,7 @@ export class AttemptReplaySafety {
     }
     if (this.barrierReason) return
     this.barrierReason = reason
-    trace(`replay barrier: reason=${reason} sessionId=${this.sessionId}`)
+    trace(`recovery: replay-barrier reason=${reason} sessionId=${this.sessionId}`)
   }
 
   applyTo(failure: CursorProviderError): CursorProviderError {
@@ -116,7 +116,7 @@ export class AttemptReplaySafety {
     if (this.barrierReason) {
       failure.replayBarrier = this.stateful ? "stateful" : "output-only"
       trace(
-        `replay suppressed: reason=${this.barrierReason} barrier=${failure.replayBarrier} ` +
+        `recovery: replay-suppressed reason=${this.barrierReason} barrier=${failure.replayBarrier} ` +
           `sessionId=${this.sessionId}`,
       )
     }
