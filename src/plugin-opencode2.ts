@@ -1,6 +1,7 @@
 import {
   CURSOR_PROVIDER_ID,
   CURSOR_COMPACTION_OPTION,
+  CURSOR_HISTORY_REWRITE_OPTION,
   CURSOR_HOST_AGENT_OPTION,
   CURSOR_SESSION_EDITS_DENIED_OPTION,
   CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION,
@@ -44,6 +45,7 @@ import { registerCursorImageSaveTool } from "./opencode2/image-save-tool.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
+import { clearPersistedConversationState } from "./protocol/conversation-state.js"
 import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { rememberHostSkillFiles } from "./context/skills.js"
 import { trace } from "./debug.js"
@@ -141,6 +143,32 @@ function markCompactionAndOptions(
   // inheriting the process-wide fallback marker.
   event.options ??= {}
   event.options[CURSOR_COMPACTION_OPTION] = isCompaction
+}
+
+const MAX_HOST_COMPACTIONS = 256
+
+/**
+ * Sessions the host compacted with a model other than Cursor's. Cursor never sees that request, and the recent
+ * tail the host keeps after the summary still ends with Cursor's own step, so the provider cannot tell the
+ * history changed and would resume the full pre-compaction conversation: the host then measures the same
+ * overflowing context again and compacts again after every turn. Shared across Locations because the compaction
+ * and the next Cursor request can run in different copies of this module.
+ */
+const hostCompactions = processShared("host-compactions.v1", () => new Set<string>())
+
+function noteHostCompaction(sessionID: string): void {
+  hostCompactions.delete(sessionID)
+  hostCompactions.add(sessionID)
+  while (hostCompactions.size > MAX_HOST_COMPACTIONS) {
+    const oldest = hostCompactions.values().next().value
+    if (oldest === undefined) break
+    hostCompactions.delete(oldest)
+  }
+}
+
+/** True once per host compaction: the next Cursor request must start a fresh conversation from host history. */
+function takeHostCompaction(sessionID: string): boolean {
+  return hostCompactions.delete(sessionID)
 }
 
 type PendingPermissionCall = { sessionID: string; callID: string }
@@ -535,6 +563,12 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         markCompactionAndOptions(event, event.agent === "compaction")
         event.options ??= {}
         event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
+        if (
+          event.agent !== "compaction" &&
+          event.model?.providerID === CURSOR_PROVIDER_ID &&
+          takeHostCompaction(event.sessionID)
+        )
+          event.options[CURSOR_HISTORY_REWRITE_OPTION] = true
         delete event.options[CURSOR_SESSION_EDITS_DENIED_OPTION]
         delete event.options[CURSOR_SESSION_PERMISSIONS_UNAVAILABLE_OPTION]
         // Compaction cannot approve a plan; its session read stays best effort,
@@ -602,6 +636,13 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       ctx.session.hook("compaction", async (event) => {
         event.messages = preserveNativeToolResults(event.messages, refusals)
         markCompactionAndOptions(event, true)
+        if (event.model?.providerID !== CURSOR_PROVIDER_ID) {
+          noteHostCompaction(event.sessionID)
+          // Without a saved checkpoint a server restart before the next turn cannot resume the old conversation.
+          await clearPersistedConversationState(opencodeGlobalCacheDir(), event.sessionID).catch((error) => {
+            trace(`host compaction: checkpoint cleanup failed sessionID=${event.sessionID}: ${String(error)}`)
+          })
+        }
         await rememberSessionDirectory(event.sessionID)
       }),
     )

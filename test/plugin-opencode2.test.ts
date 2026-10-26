@@ -1408,6 +1408,45 @@ describe("opencode2 setup", () => {
     expect(isCompactionSession("s-normal")).toBe(false)
   })
 
+  test("a compaction run by another provider rebases the next Cursor request once", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "cursor-host-compaction-"))
+    setHostCacheDirOverride(cacheDir)
+    try {
+      const { ctx, hooks, sessionLocations } = fakeContext()
+      sessionLocations.set("s-host-compaction", "/proj")
+      await setupPlugin(ctx)
+      const request = async (agent: string, providerID = "cursor") => {
+        const event: any = { sessionID: "s-host-compaction", agent, model: { providerID }, options: {} }
+        await hooks.get("session.context")!(event)
+        return event.options
+      }
+
+      expect((await request("build")).opencodeHistoryRewrite).toBeUndefined()
+
+      await hooks.get("session.compaction")!({
+        sessionID: "s-host-compaction",
+        agent: "compaction",
+        model: { providerID: "openai" },
+        options: {},
+      })
+      expect((await request("compaction", "openai")).opencodeHistoryRewrite).toBeUndefined()
+      expect((await request("build", "anthropic")).opencodeHistoryRewrite).toBeUndefined()
+      expect((await request("build")).opencodeHistoryRewrite).toBe(true)
+      expect((await request("build")).opencodeHistoryRewrite).toBeUndefined()
+
+      await hooks.get("session.compaction")!({
+        sessionID: "s-host-compaction",
+        agent: "compaction",
+        model: { providerID: "cursor" },
+        options: {},
+      })
+      expect((await request("build")).opencodeHistoryRewrite).toBeUndefined()
+    } finally {
+      setHostCacheDirOverride(undefined)
+      rmSync(cacheDir, { recursive: true, force: true })
+    }
+  })
+
   test("the session context carries the active host agent into provider options", async () => {
     const { ctx, hooks, sessionLocations } = fakeContext()
     sessionLocations.set("s-plan-agent", "/proj")
