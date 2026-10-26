@@ -845,6 +845,7 @@ describe("a steer sent while Cursor waits inside a step", () => {
           next: (run, message) => {
             if (message.exec_client_message?.read_result) {
               if (delivered) injectionState(run, injectionId, "delivered")
+              run.send({ interaction_update: { tool_call_completed: { call_id: "tc-1" } } })
               endTurn(run, delivered ? "Read it. STEERED" : "Read it.")
             } else if (message.run_request && mode === "follow-up checkpoint" && runs.indexOf(run) === 1) {
               run.send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 42) })

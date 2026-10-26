@@ -174,6 +174,7 @@ describe("checkpoint eligibility across host results", () => {
         const result = message.exec_client_message as { shell_stream?: { start?: unknown } } | undefined
         if (!checkpointSent && (checkpointAt === "final-drain" ? control?.stream_close?.id === 1 : result?.shell_stream?.start)) {
           checkpointSent = true
+          if (checkpointAt === "final-drain") send({ interaction_update: { tool_call_completed: { call_id: "command" } } })
           send({ conversation_checkpoint_update: checkpoint })
         }
         if (control?.stream_close?.id === 1) {
@@ -324,6 +325,7 @@ describe("checkpoint eligibility across host results", () => {
     "complete", "announced", "announced-shell", "missing-history", "unknown", "unrepresented-exec", "duplicate-exec",
     "followup-before-result", "new-output", "final-error", "cursor-run-call", "unannounced-completion", "oversized",
     "malformed-completion", "repeated-completion-id",
+    "inline-catalog", "spilled-catalog", "unfinished-catalog", "unacknowledged-checkpoint",
   ] as const) {
     it(`recovers a post-result drop only from represented completed work (${scenario})`, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-result-history-"))
@@ -362,6 +364,17 @@ describe("checkpoint eligibility across host results", () => {
           if (scenario === "duplicate-exec") send({ exec_server_message: { id: 1, list_mcp_resources_exec_args: {} } })
           // A call Cursor runs itself: announced, never claimed by a host exec.
           if (scenario === "cursor-run-call") send({ interaction_update: { tool_call_started: { call_id: "cursor-internal" } } })
+          if (scenario === "inline-catalog" || scenario === "spilled-catalog" || scenario === "unfinished-catalog") {
+            const args = { server: "opencode", tool_name: "bash" }
+            send({ interaction_update: { tool_call_started: { call_id: "catalog", tool_call: {
+              get_mcp_tools_tool_call: { args },
+            } } } })
+            if (scenario !== "unfinished-catalog") send({ interaction_update: { tool_call_completed: { call_id: "catalog", tool_call: {
+              get_mcp_tools_tool_call: { args, result: { success: {
+                content: "bash: run a command", ...(scenario === "spilled-catalog" ? { output_file_path: "/catalog.json" } : {}),
+              } } },
+            } } } })
+          }
           started("first", "echo first")
           send({ exec_server_message: { id: 1, [shellVariant]: { command: "echo first", tool_call_id: "first" } } })
         } else if (message.exec_client_message) {
@@ -385,6 +398,8 @@ describe("checkpoint eligibility across host results", () => {
             }
             if (scenario === "unannounced-completion") send({ interaction_update: { tool_call_completed: { call_id: "never-started" } } })
             if (scenario === "new-output") send({ interaction_update: { text_delta: { text: "new output" } } })
+            // Arrival after a local write does not prove the checkpoint holds its result.
+            if (scenario === "unacknowledged-checkpoint") send({ conversation_checkpoint_update: Uint8Array.of(10, 1, 7) })
             if (scenario === "final-error") stream.end(frame(Buffer.from('{"error":{"code":"permission_denied"}}'), 2))
             else stream.end() // no checkpoint after either completed result
           }
@@ -418,7 +433,7 @@ describe("checkpoint eligibility across host results", () => {
           prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: output } }] })
         }
         if (scenario === "missing-history") prompt.splice(1, 2)
-        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell") {
+        if (scenario === "complete" || scenario === "announced" || scenario === "announced-shell" || scenario === "inline-catalog" || scenario === "unacknowledged-checkpoint") {
           const parts = await read()
           expect(parts.some(part => part.type === "finish" && part.finishReason.unified === "stop")).toBe(true)
           expect(parts.some(part => part.type === "tool-call")).toBe(false)
@@ -514,7 +529,10 @@ describe("checkpoint eligibility across host results", () => {
             if (!afterResult) send({ conversation_checkpoint_update: checkpoint })
           }
         } else if (message.exec_client_message) {
-          if (afterResult) send({ conversation_checkpoint_update: checkpoint })
+          if (afterResult) {
+            send({ interaction_update: { tool_call_completed: { call_id: "command" } } })
+            send({ conversation_checkpoint_update: checkpoint })
+          }
           send({ interaction_update: { thinking_delta: { text: "after the command" } } })
           stream.end(frame(Buffer.from('{"error":{"code":"unavailable"}}'), 2))
         }
