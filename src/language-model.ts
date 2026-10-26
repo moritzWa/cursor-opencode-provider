@@ -339,7 +339,7 @@ import {
   hostNoteText,
   wrapHostNotesForCursor,
 } from "./protocol/host-notes.js"
-import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout } from "./replay-safety.js"
+import { analyzeReplayFrame, announcedCallsClaimed, AttemptReplaySafety, describeFrameLayout, type ReplayToolLifecycle } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
   cursorUsageCountersFromTurnEnded,
@@ -888,6 +888,16 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.resumeCheckpointAfterFrame = undefined
+}
+
+/** Both the normal pump and terminal drain consume result acknowledgements. */
+function acknowledgeHostResults(session: CursorSession, lifecycle: ReplayToolLifecycle | undefined, frame: Frame): void {
+  if (lifecycle?.kind !== "completed" || !session.unacknowledgedHostResults?.length) return
+  const arrived = frameArrival(frame)
+  session.unacknowledgedHostResults = session.unacknowledgedHostResults.filter(result =>
+    result.callId !== lifecycle.callId || (arrived !== undefined && arrived <= result.afterFrame))
+  trace(`recovery: host-result-completion hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
+    `callId=${lifecycle.callId} unacknowledged=${session.unacknowledgedHostResults.length}`)
 }
 
 /** `resumeCheckpoint` is set only by a checkpoint this Run received. */
@@ -3134,6 +3144,9 @@ export async function drainSessionUntilTurnEnded(
       }
 
       const iu = asm.interaction_update as Record<string, unknown> | undefined
+      if (iu?.tool_call_completed) {
+        acknowledgeHostResults(session, analyzeReplayFrame(payload, { interactionUpdate: iu }).toolLifecycle, frame)
+      }
       const kv = asm.kv_server_message as Record<string, unknown> | undefined
       const esm = asm.exec_server_message as Record<string, unknown> | undefined
       const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
@@ -3762,9 +3775,20 @@ async function deliverContinuationResultsNow(
     if (endTurnAfterDelivery) session.planReviewDeclined = true
     if (outcome.framesWritten > 0 || (pending.bridged && !pending.aborted)) {
       invalidateResumeCheckpoint(session, beforeResultWrite, true)
-      const exec = session.replaySafety?.execs?.find(exec => exec.sessionId === session.sessionId && exec.id === r.execId)
-      const unacknowledged = session.unacknowledgedHostResults ??= []
-      unacknowledged.push({ callId: exec?.callId, afterFrame: beforeResultWrite })
+      // A display-only mirror sends nothing to Cursor: its server completion
+      // already arrived before the host call. Only a real reply needs an ack.
+      if (outcome.framesWritten > 0) {
+        const exec = session.replaySafety?.execs?.find(exec => exec.sessionId === session.sessionId && exec.id === r.execId)
+        const metadata = pending.resultMetadata
+        const interactionCallId = pending.resultField === ASK_QUESTION_RESULT_FIELD ? metadata?.askQuestionToolCallId
+          : pending.resultField === SWITCH_MODE_RESULT_FIELD ? metadata?.switchModeToolCallId
+          : pending.resultField === CREATE_PLAN_RESULT_FIELD ? metadata?.createPlanToolCallId
+          : undefined
+        const callId = typeof interactionCallId === "string" && interactionCallId.length > 0
+          ? interactionCallId : exec?.callId
+        const unacknowledged = session.unacknowledgedHostResults ??= []
+        unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+      }
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
     if (deliveredSwitchMode) {
@@ -5322,14 +5346,7 @@ export async function pump(
     }
     if (replayFrame.barrier === "display-tool-lifecycle") {
       replaySafety.recordToolLifecycle(replayFrame.toolLifecycle)
-      const lifecycle = replayFrame.toolLifecycle
-      if (lifecycle?.kind === "completed" && session.unacknowledgedHostResults?.length) {
-        const arrived = frameArrival(frame)
-        session.unacknowledgedHostResults = session.unacknowledgedHostResults.filter(result =>
-          result.callId !== lifecycle.callId || (arrived !== undefined && arrived <= result.afterFrame))
-        trace(`recovery: host-result-completion hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
-          `callId=${lifecycle.callId} unacknowledged=${session.unacknowledgedHostResults.length}`)
-      }
+      acknowledgeHostResults(session, replayFrame.toolLifecycle, frame)
     } else if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
     if (replayFrame.barrier === "non-control-exec") {
       replaySafety.recordExec(esm?.id, esm ? extractExecDisplayCallId(esm) : undefined)
