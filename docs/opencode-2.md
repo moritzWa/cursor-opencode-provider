@@ -38,11 +38,25 @@ You do **not** need a hand-written `providers` entry, and there is no `enabled` 
 
 Synced models set `time.released` to `0` (Cursor AvailableModels does not expose release dates). OpenCode 2.0's picker sorts by `released` descending, so filter by provider **Cursor** or search a model id if the global list looks empty.
 
+## Compaction with another provider
+
+You can use another provider's model for the host's compaction summary. After
+OpenCode commits that summary, the next normal Cursor request starts from the
+compacted host history, keeping the recent messages and completed tool results.
+The conversation group stays stable; subsequent turns reuse the new checkpoint.
+Preparing a background summary or failing a summary does not reset Cursor.
+
+The rebase requirement is saved with the conversation snapshot and survives a
+server restart, including a shutdown save from a held tool Run. If saving that
+requirement fails, the next Cursor request reports the error and retries saving
+on a later request. No extra configuration is needed. See the
+[compaction acceptance checks](host-compat-acceptance.md#opencode-2-foreign-compaction).
+
 ## From npm
 
 ```json
 {
-  "plugin": ["cursor-opencode-provider/plugin/opencode2"]
+  "plugins": ["cursor-opencode-provider/plugin/opencode2"]
 }
 ```
 
@@ -99,17 +113,18 @@ export OPENCODE_CONFIG_DIR=~/.config/opencode2
 export CURSOR_OPENCODE2_DEV_ENTRY=/absolute/path/to/cursor-opencode-provider/dist/index.js
 ```
 
-Example config that loads the local package (directory path — not a bare `.js` file):
+Example config for the plugin directory created above (with its own
+`package.json` and `index.js`):
 
 ```json
 {
-  "plugin": [
-    "/absolute/path/to/cursor-opencode-provider"
+  "plugins": [
+    "/absolute/path/to/cursor-plugin"
   ]
 }
 ```
 
-Prefer the `$OPENCODE_CONFIG_DIR/plugins/<name>/` package directory shown above. For the AI SDK entry, still set `CURSOR_OPENCODE2_DEV_ENTRY` to `dist/index.js`.
+Use the wrapper directory, rather than the provider source root, as the local plugin entry. For the AI SDK entry, still set `CURSOR_OPENCODE2_DEV_ENTRY` to `dist/index.js`.
 
 - **Export the env var before starting the daemon.** `opencode2 serve` / `service start` inherit env at start time. After changing `CURSOR_OPENCODE2_DEV_ENTRY`, `OPENCODE_CONFIG_DIR`, or rebuilding `dist/`, restart the service:
 
@@ -399,12 +414,12 @@ Old `opencode.json.bak-*` copies from the dump era are safe to delete after the 
 
 Config should load **one** of:
 
-- `"plugin": ["cursor-opencode-provider/plugin/opencode2"]` (npm)
+- `"plugins": ["cursor-opencode-provider/plugin/opencode2"]` (npm)
 - a `$OPENCODE_CONFIG_DIR/plugins/<name>/` directory that re-exports `dist/plugin-opencode2.js` (local)
 
 Remove, if present:
 
-- `"plugin": ["cursor-opencode-provider"]` (classic 1.x)
+- `"plugins": ["cursor-opencode-provider"]` (classic 1.x)
 - `"plugins": ["cursor-opencode-provider/plugin/v2"]`
 - any `file://…/dist/plugin.js` or `plugin-v2.js` path under this config dir
 - `@opencode-ai/plugin-next` / “next” plugin pins in this package (the current 2.0 entrypoint duck-types the host; it does not depend on `@opencode/plugin`)

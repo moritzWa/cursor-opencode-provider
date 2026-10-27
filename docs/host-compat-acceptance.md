@@ -35,6 +35,31 @@ operator's store. Enable provider debug logs for each run.
    attempt may publish; dispose a setup while discovery is pending and verify
    no later reload comes from it. Use deterministic fixtures for these races.
 
+## OpenCode 2 foreign compaction
+
+Use stock OpenCode 2.1.4 with the rebuilt plugin and provider, isolated host
+state, and debug logs. Configure a compaction model from another provider.
+
+1. Build a Cursor conversation, compact it, and retain recent Cursor messages
+   after the summary. Confirm the next Run uses a new conversation id, the same
+   conversation group, no old checkpoint, and the summary plus retained history.
+   Continue once more: the new conversation and checkpoint stay warm.
+2. Fail a summary request. Confirm the next Cursor Run keeps its conversation
+   and checkpoint. Repeat while a successful background summary is held but
+   unused: preparing it alone must not invalidate the saved state. Apply that
+   precomputed summary later and verify the rebase occurs then.
+3. Compact between host tool steps. Confirm completed results seed the new
+   Run once and are never uploaded onto the pre-compaction held Run.
+4. Shut down after the successful compaction, before the next Cursor request,
+   including with a held tool Run. Restart and verify compacted history replaces
+   the old checkpoint. Exercise duplicate event observers across Locations and
+   a late save from the retired conversation with deterministic fixtures.
+5. Make snapshot saving fail. The receipt remains pending, the next request
+   reports the failure, and a later request can retry after storage recovers.
+
+These checks belong to the dedicated OpenCode 2 entrypoint. Keep classic
+compaction and warm-continuation regressions passing in the full suite.
+
 ## Classic OpenCode — approval without `plan_exit`
 
 1. Start stock OpenCode in a TTY with provider debug logging enabled, in the default build agent.

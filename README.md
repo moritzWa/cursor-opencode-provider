@@ -89,7 +89,7 @@ OpenCode 2.0 (prefer a dedicated `OPENCODE_CONFIG_DIR`):
 
 ```json
 {
-  "plugin": ["cursor-opencode-provider/plugin/opencode2"]
+  "plugins": ["cursor-opencode-provider/plugin/opencode2"]
 }
 ```
 
@@ -200,6 +200,11 @@ The provider resolves each catalog context limit in this order:
 3. A conservative `200000` fallback when neither source publishes a limit
 
 The docs fallback only fills static catalog metadata. It does not invent Cursor variants or enable a long-context tier that `AvailableModels` did not advertise.
+
+OpenCode 2 can summarize with another provider's model. A committed summary
+rebases the next Cursor turn onto compacted host history; failed or unused
+background summaries keep the warm conversation. The requirement survives
+restart. See [foreign compaction](docs/opencode-2.md#compaction-with-another-provider).
 
 #### Model families
 
