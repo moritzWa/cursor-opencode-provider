@@ -368,6 +368,20 @@ fs.createReadStream(job + "/pipe").on("data", chunk => fs.writeSync(fd, chunk))
     expect(elapsed).toBeLessThan(2500)
   }, 15_000)
 
+  it("keeps a finalized record footer out of output before the done marker is published", async () => {
+    const terminal = job("printf before", { timeoutMs: 300 })
+    const runner = path.join(terminal.directory, "runner.sh")
+    const original = fs.readFileSync(runner, "utf8")
+    const marker = `printf '%s\\n' "$code" >"$job/done"`
+    expect(original).toContain(marker)
+    fs.writeFileSync(runner, original.replace(marker, `sleep 1\n${marker}`))
+    const launched = await launch(terminal)
+    expect(launched.stdout).toMatch(/^before\n__CURSOR_SHELL_BACKGROUND__/)
+    expect(launched.stdout).not.toContain("exit_code:")
+    expect(launched.stdout).not.toContain("ended_at:")
+    expect(await waitDone(terminal)).toContain("exit_code: 0")
+  })
+
   it("reports a hard timeout as a timeout when its command is still being stopped at the window's end", async () => {
     const terminal = job("printf before; trap '' TERM; exec sleep 30", { timeoutMs: 1000, hardTimeoutMs: 300 })
     const started = Date.now()
