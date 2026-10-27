@@ -496,8 +496,10 @@ These are failure lessons shared by both hosts, not a replacement for
 - **Completion markers do not freeze a growing record.** A launcher sampled
   file size before `done` while the supervisor appended its footer. Read the
   final output-byte bound after sampling live size, so timeout and background
-  results contain command bytes only (`test/terminal-runner.test.ts`, finalized
-  record footer).
+  results contain command bytes only. A fixed delay before `done` did not
+  guarantee the launcher sampled a footer: coordinate footer readiness and
+  sampling explicitly, and assert the sampled size exceeds command bytes
+  (`test/terminal-runner.test.ts`, finalized record footer).
 - **Read native execution before emulating it.** Both hosts own shell choice,
   permission and process-group cancellation. Preserve native background support;
   the remaining redesign is tracked in [todo](../todo.md).

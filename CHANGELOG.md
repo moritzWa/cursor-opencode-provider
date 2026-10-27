@@ -12,7 +12,7 @@
 
 ### Fixed
 
-- Managed shell output excludes terminal-record footers even when completion races a timeout or background handoff ([@oakimov](https://github.com/oakimov)).
+- Managed shell output excludes terminal-record footers even when completion races a timeout or background handoff ([#128](https://github.com/oakimov/cursor-opencode-provider/pull/128), [@oakimov](https://github.com/oakimov)).
 - OpenCode 2.1.4 waits for cold-cache model discovery and publication before the first model selection, with a bounded readiness wait, visible failure diagnostics and later retries. Warm-cache startup remains immediate, temporary connection-metadata errors do not hide saved models, and superseded discovery results cannot replace the current inventory ([#91](https://github.com/oakimov/cursor-opencode-provider/issues/91)).
 - Plan saves carried in host history retain their owed CreatePlan reply. Native host notes continue to review; a new user turn explicitly settles an abandoned review instead of silently losing it ([#125](https://github.com/oakimov/cursor-opencode-provider/pull/125)).
 - Completed inline tool-catalog lookups no longer block recovery after saved host tool results. Incomplete, spilled, malformed, and unknown server-side work still blocks unsafe replay.
