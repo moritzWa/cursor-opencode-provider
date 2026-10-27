@@ -7,13 +7,13 @@ import { getPersistedConversation, persistConversation } from "./protocol/conver
 type Rewrite = { eventID: string; pending: boolean; durable: boolean; saving?: Promise<void> }
 const state = processShared("host-history-rewrite.v1", () => ({
   rewrites: new Map<string, Rewrite>(),
-  writes: new Map<string, Promise<void>>(),
+  writes: new Map<string, Promise<unknown>>(),
 }))
 const keyFor = (cacheDir: string, sessionKey: string) => JSON.stringify([path.resolve(cacheDir), sessionKey])
 
-export function queueConversationStateWrite(
-  cacheDir: string, sessionKey: string, write: () => Promise<void>,
-): Promise<void> {
+export function queueConversationStateWrite<T>(
+  cacheDir: string, sessionKey: string, write: () => Promise<T>,
+): Promise<T> {
   const key = keyFor(cacheDir, sessionKey)
   const next = (state.writes.get(key) ?? Promise.resolve()).catch(() => {}).then(write)
   state.writes.set(key, next)
@@ -21,6 +21,11 @@ export function queueConversationStateWrite(
     if (state.writes.get(key) === next) state.writes.delete(key)
   }).catch(() => {})
   return next
+}
+
+/** Wait until every snapshot write queued for the session, by any module copy, has finished or failed. */
+export function settleConversationStateWrites(cacheDir: string, sessionKey: string): Promise<void> {
+  return (state.writes.get(keyFor(cacheDir, sessionKey)) ?? Promise.resolve()).then(() => {}, () => {})
 }
 
 export function hasHostHistoryRewrite(cacheDir: string, sessionKey: string): boolean {

@@ -1,10 +1,12 @@
 import { hasHostHistoryRewrite, noteHostHistoryRewrite, resetHostHistoryRewritesForTests } from "../src/host-history-rewrite.js"
+import { onCopyStateReplaced } from "../src/protocol/conversation-state.js"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
@@ -966,4 +968,147 @@ describe("retry limits across OpenCode calls", () => {
       }
     }, 30_000)
   }
+})
+
+describe("a session that returns to a Location", () => {
+  it("resumes the conversation another Location advanced, without that Location's stale turn state", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-location-return-"))
+    const graph = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-location-graph-"))
+    fs.cpSync(path.resolve(import.meta.dir, "../src"), path.join(graph, "src"), { recursive: true })
+    fs.symlinkSync(path.resolve(import.meta.dir, "../node_modules"), path.join(graph, "node_modules"), "dir")
+    const load = (file: string) => import(pathToFileURL(path.join(graph, "src", file)).href)
+    const other = await load("index.ts") as typeof import("../src/index.js")
+    const otherConnect = await load("transport/connect.ts") as typeof import("../src/transport/connect.js")
+    const otherModel = await load("language-model.ts") as typeof import("../src/language-model.js")
+    const otherSessions = await load("session.ts") as typeof import("../src/session.js")
+    type Request = { conversation_id: string; conversation_state?: Uint8Array }
+    const requests: Request[] = []
+    scripted = (stream, message) => {
+      if (!message.run_request) return
+      requests.push(message.run_request as Request)
+      const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      send({ conversation_checkpoint_update: Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, requests.length) })
+      send({ interaction_update: { text_delta: { text: "Cursor answer" } } })
+      send({ interaction_update: { turn_ended: {} } })
+      stream.end()
+    }
+    const read = async (model: LanguageModelV3, options: LanguageModelV3CallOptions) => {
+      const reader = (await model.doStream(options)).stream.getReader()
+      while (!(await reader.read()).done) { /* drain */ }
+    }
+    const user = (text: string) => ({ role: "user" as const, content: [{ type: "text" as const, text }] })
+    const answer = { role: "assistant" as const, content: [{ type: "text" as const, text: "Cursor answer" }] }
+    const headers = { "x-opencode-session-id": "ses_location_return" }
+    const tools = [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }]
+    cacheHttp2SessionForTests(ORIGIN, client)
+    otherConnect.cacheHttp2SessionForTests(ORIGIN, client)
+    const options = { name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root }
+    try {
+      const locationA = createCursor(options).languageModel("composer-2.5")
+      const locationB = other.createCursor(options).languageModel("composer-2.5")
+      await read(locationA, { headers, tools, prompt: [user("Hello")] })
+      // Location A compacts on the Cursor model; its next Run would rebase from the summary.
+      await read(locationA, { headers, tools, prompt: [user("Hello"), answer, user("Summarize")],
+        providerOptions: { cursor: { opencodeCompaction: true } } })
+      await settleRunSavesForTests()
+      // The session moves to Location B, which rebases and continues there.
+      await read(locationB, { headers, tools, prompt: [user("SUMMARY"), user("Continue")] })
+      await otherModel.settleRunSavesForTests()
+      const advanced = requests.at(-1)!
+      expect(advanced.conversation_state?.length ?? 0).toBe(0)
+      // Back in Location A, the next turn resumes B's conversation.
+      await read(locationA, { headers, tools, prompt: [user("SUMMARY"), user("Continue"), answer, user("Next")] })
+      const returned = requests.at(-1)!
+      expect(requests).toHaveLength(4)
+      expect(returned.conversation_id).toBe(advanced.conversation_id)
+      expect(Array.from(returned.conversation_state ?? [])).toEqual([0x2a, 5, 8, 42, 16, 0x80, 3])
+    } finally {
+      otherSessions.sessionManager.dispose()
+      await otherModel.settleRunSavesForTests()
+      otherModel.resetTurnStateForTests()
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+      fs.rmSync(graph, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it("leaves a Run it still holds alone when another Location advanced the conversation meanwhile", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-location-held-"))
+    const graph = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-location-graph-"))
+    fs.cpSync(path.resolve(import.meta.dir, "../src"), path.join(graph, "src"), { recursive: true })
+    fs.symlinkSync(path.resolve(import.meta.dir, "../node_modules"), path.join(graph, "node_modules"), "dir")
+    const load = (file: string) => import(pathToFileURL(path.join(graph, "src", file)).href)
+    const other = await load("index.ts") as typeof import("../src/index.js")
+    const otherConnect = await load("transport/connect.ts") as typeof import("../src/transport/connect.js")
+    const otherModel = await load("language-model.ts") as typeof import("../src/language-model.js")
+    const otherSessions = await load("session.ts") as typeof import("../src/session.js")
+    const replaced: string[] = []
+    onCopyStateReplaced(key => replaced.push(key))
+    const requests: unknown[] = []
+    let heldResult = false
+    scripted = (stream, message) => {
+      const send = (value: Record<string, unknown>) => stream.write(frame(encodeMessage("AgentServerMessage", value)))
+      if (message.run_request) {
+        requests.push(message.run_request)
+        send({ conversation_checkpoint_update: Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, requests.length) })
+        if (requests.length === 1) {
+          send({ exec_server_message: { id: 1, shell_args: { command: "echo done", tool_call_id: "command" } } })
+          return
+        }
+        send({ interaction_update: { text_delta: { text: "Cursor answer" } } })
+        send({ interaction_update: { turn_ended: {} } })
+        stream.end()
+        return
+      }
+      if (message.exec_client_message && !heldResult) {
+        heldResult = true
+        send({ interaction_update: { tool_call_completed: { call_id: "command" } } })
+        send({ conversation_checkpoint_update: Uint8Array.of(0x2a, 5, 8, 42, 16, 0x80, 9) })
+        send({ interaction_update: { text_delta: { text: "Done" } } })
+        send({ interaction_update: { turn_ended: {} } })
+        stream.end()
+      }
+    }
+    const read = async (model: LanguageModelV3, options: LanguageModelV3CallOptions) => {
+      const parts: LanguageModelV3StreamPart[] = []
+      const reader = (await model.doStream(options)).stream.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return parts
+        parts.push(value)
+      }
+    }
+    const headers = { "x-opencode-session-id": "ses_location_held" }
+    const tools = [{ type: "function" as const, name: "bash", inputSchema: { type: "object", properties: { command: { type: "string" } } } }]
+    cacheHttp2SessionForTests(ORIGIN, client)
+    otherConnect.cacheHttp2SessionForTests(ORIGIN, client)
+    const options = { name: "cursor", accessToken: "example-token", agentBaseURL: ORIGIN, cacheDir: root, workspaceRoot: root }
+    try {
+      const locationA = createCursor(options).languageModel("composer-2.5")
+      const locationB = other.createCursor(options).languageModel("composer-2.5")
+      const prompt: LanguageModelV3CallOptions["prompt"] = [{ role: "user", content: [{ type: "text", text: "Run it" }] }]
+      const call = (await read(locationA, { headers, tools, prompt })).find(part => part.type === "tool-call")
+      if (!call || call.type !== "tool-call") throw new Error("Expected the shell call")
+      await read(locationB, { headers, tools, prompt: [{ role: "user", content: [{ type: "text", text: "Meanwhile" }] }] })
+      await otherModel.settleRunSavesForTests()
+      prompt.push({ role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: JSON.parse(call.input) }] })
+      prompt.push({ role: "tool", content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName, output: { type: "text", value: "done" } }] })
+      const parts = await read(locationA, { headers, tools, prompt })
+      expect(replaced).toEqual([])
+      expect(heldResult).toBe(true)
+      expect(requests).toHaveLength(2)
+      expect(parts.some(part => part.type === "finish")).toBe(true)
+    } finally {
+      otherSessions.sessionManager.dispose()
+      await otherModel.settleRunSavesForTests()
+      otherModel.resetTurnStateForTests()
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      setHostCacheDirOverride(undefined)
+      fs.rmSync(root, { recursive: true, force: true })
+      fs.rmSync(graph, { recursive: true, force: true })
+    }
+  }, 30_000)
 })
