@@ -268,6 +268,9 @@ history rebuilds. The host's final exit notice is excluded from live stdout,
 and its final exit, signal or timeout notice starts on its own line; other text
 blocks concatenate without changing their bytes.
 
+Terminal-record headers and footers stay out of command stdout, including
+when completion races a timeout or background handoff.
+
 A failed host shell call reaches Cursor once as stderr in streamed and unary
 results. Distinct partial command output remains on stdout. See the
 [1.x shell guide](docs/opencode-1.md#shell-failures-and-interruption) and

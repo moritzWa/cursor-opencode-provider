@@ -219,6 +219,9 @@ it matches the captured outcome, including when a command printed nothing and
 the notice is the whole result. Native signal and timeout notices also start on
 their own line. Other text blocks retain their exact bytes.
 
+Terminal-record headers and footers stay out of command stdout, including
+when completion races a timeout or background handoff.
+
 Shell output keeps path-like text, whitespace and successful timeout-shaped
 text unchanged. Internal wrapper markers are removed without trimming command
 output, and failed shell streams retain partial output alongside their error.
