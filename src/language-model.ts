@@ -23,6 +23,7 @@ import {
 } from "./parallel-step.js"
 import {
   bidiRunStream,
+  compressRunRequestAhead,
   CursorRunInterruptedError,
   frameArrival,
   lastFrameArrival,
@@ -1851,6 +1852,8 @@ async function openRunWithRequest(
   const previousStop = owner.stoppedWithSessionId ? hostInterrupts.get(owner.stoppedWithSessionId) : undefined
   if (owner.signal?.aborted || (previousStop && owner.requestedAt < previousStop.at)) cancel()
   try {
+    if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
+    await compressRunRequestAhead(request)
     if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
     stream = await bidiRunStream(token, options)
     if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)

@@ -1,14 +1,16 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
+import * as zlib from "node:zlib"
 import { gunzipSync } from "node:zlib"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
+import { CursorLocalCancellationError } from "../src/errors.js"
 import { resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
 import { mapAvailableModelsResponse, writeCache } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
@@ -19,9 +21,11 @@ import { decodeFramePayload, encodeFrame, FLAG_GZIP, streamFrames, type Frame } 
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager } from "../src/session.js"
 import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
+import { writeStreamMessage } from "../src/stream-write.js"
 import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
+  compressRunRequestAhead,
   isCompressionRejection,
   resetRunCompressionForTests,
   RUN_COMPRESS_MIN_BYTES,
@@ -47,6 +51,14 @@ async function listen(server: http2.Http2Server): Promise<number> {
 function routeConnectionsTo(port: number): void {
   ;(http2 as { connect: unknown }).connect = (origin: string, options?: http2.ClientSessionOptions) =>
     realConnect(origin, { ...options, createConnection: () => net.connect(port, "127.0.0.1") })
+}
+
+// Each gzip waits in `held` until the test runs it.
+function holdCompression(held: Array<() => void>) {
+  const realGzip = zlib.gzip
+  return spyOn(zlib, "gzip").mockImplementation(((input: zlib.InputType, callback: zlib.CompressCallback) => {
+    held.push(() => realGzip(input, callback))
+  }) as unknown as typeof zlib.gzip)
 }
 
 async function until(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -101,26 +113,28 @@ describe("isCompressionRejection", () => {
   })
 })
 
-type Answer = "ok" | "unimplemented" | "decompress" | "unrelated" | "garbage" | "http-415" | "grpc-headers" | "grpc-trailers"
+type Answer = "ok" | "unimplemented" | "decompress" | "unrelated" | "garbage" | "http-415" | "http-401" | "grpc-headers" | "grpc-trailers"
 
 describe("Run stream compression", () => {
-  const streams: Array<{ headers: http2.IncomingHttpHeaders; frames: Frame[] }> = []
+  const streams: Array<{ headers: http2.IncomingHttpHeaders; frames: Frame[]; rstCode?: number }> = []
   const answers: Answer[] = []
   let server: http2.Http2Server
 
   beforeAll(async () => {
     server = http2.createServer()
     server.on("stream", (stream, headers) => {
-      const record = { headers, frames: [] as Frame[] }
+      const record: (typeof streams)[number] = { headers, frames: [] }
       streams.push(record)
       const chunks: Buffer[] = []
       stream.on("data", (chunk: Buffer) => {
         chunks.push(chunk)
         record.frames = [...streamFrames(new Uint8Array(Buffer.concat(chunks)))]
       })
+      stream.on("close", () => { record.rstCode = stream.rstCode })
       stream.on("error", () => {})
       const ok = { ":status": 200, "content-type": "application/connect+proto" }
-      switch (answers.shift() ?? "ok") {
+      const answer = answers.shift() ?? "ok"
+      switch (answer) {
         case "ok":
           stream.respond(ok)
           stream.write(encodeFrame(0x00, new Uint8Array([1])))
@@ -142,7 +156,8 @@ describe("Run stream compression", () => {
           stream.end(endStream("not json"))
           break
         case "http-415":
-          stream.respond({ ":status": 415 }, { endStream: true })
+        case "http-401":
+          stream.respond({ ":status": Number(answer.slice(5)) }, { endStream: true })
           break
         case "grpc-headers":
           stream.respond({ ":status": 200, "content-type": "application/grpc", "grpc-status": "12" }, { endStream: true })
@@ -198,6 +213,132 @@ describe("Run stream compression", () => {
     expect(run.compressionRejected?.()).toBe(false)
     run.end()
   })
+
+  const filled = (size: number, value: number) => new Uint8Array(size).fill(value)
+  const payloads = (frames: Frame[]) => frames.map((frame) => new Uint8Array(decodeFramePayload(frame)))
+
+  it("writes large and small messages in the order given while the large ones compress", async () => {
+    const messages = [filled(300_000, 1), filled(10, 2), filled(2048, 3), filled(20, 4), filled(500_000, 5), filled(30, 6)]
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    const writes = messages.map((message) => run.write(message))
+    // The first small message waits for the large one before it.
+    expect(writes[1]).toBeInstanceOf(Promise)
+    await Promise.all(writes)
+    await until(() => streams[0]?.frames.length === messages.length)
+
+    expect(streams[0]!.frames.map((frame) => frame.flags)).toEqual([FLAG_GZIP, 0x00, FLAG_GZIP, 0x00, FLAG_GZIP, 0x00])
+    expect(payloads(streams[0]!.frames)).toEqual(messages)
+    // With nothing compressing, a small message goes out at once.
+    expect(run.write(filled(10, 7))).toBe(true)
+    run.end()
+  })
+
+  it("writes an opening request compressed ahead at once, before Cursor can answer", async () => {
+    const request = filled(300_000, 8)
+    await compressRunRequestAhead(request)
+    await compressRunRequestAhead(filled(10, 9))
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    expect(run.write(request)).toBe(true)
+    await until(() => streams[0]?.frames.length === 1)
+
+    expect(streams[0]!.frames[0]!.flags).toBe(FLAG_GZIP)
+    expect(payloads(streams[0]!.frames)).toEqual([request])
+    run.end()
+  })
+
+  it("keeps concurrent protocol writes in order through compression and backpressure", async () => {
+    const messages = [new Uint8Array(randomBytes(1_000_000)), filled(5, 2), new Uint8Array(randomBytes(400_000)), filled(5, 4)]
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    await Promise.all(messages.map((message, index) => writeStreamMessage(run, message, `write ${index}`)))
+    await until(() => streams[0]?.frames.length === messages.length)
+
+    expect(payloads(streams[0]!.frames)).toEqual(messages)
+    run.end()
+  })
+
+  it.each(["destroy", "end", "abort"] as const)("drops messages still waiting for compression when the Run is closed (%s)", async (close) => {
+    const held: Array<() => void> = []
+    using _gzip = holdCompression(held)
+    const abort = new AbortController()
+    const run = await bidiRunStream("token", { baseURL: ORIGIN, signal: abort.signal })
+    expect(run.write(filled(10, 1))).toBe(true)
+    const compressing = run.write(filled(4096, 2))
+    const behind = run.write(filled(10, 3))
+    await until(() => streams[0]?.frames.length === 1 && held.length === 1)
+    if (close === "abort") abort.abort()
+    else run[close]()
+    for (const compress of held) compress()
+
+    await expect(compressing).rejects.toBeInstanceOf(CursorLocalCancellationError)
+    await expect(behind).rejects.toBeInstanceOf(CursorLocalCancellationError)
+    expect(() => run.write(filled(10, 4))).toThrow(CursorLocalCancellationError)
+    // Reset, not a clean end that Cursor could take as a complete request.
+    await until(() => streams[0]!.rstCode !== undefined)
+    expect(streams[0]!.rstCode).toBe(http2.constants.NGHTTP2_CANCEL)
+    expect(payloads(streams[0]!.frames)).toEqual([filled(10, 1)])
+  })
+
+  it("sends a message uncompressed, in its place, when zlib cannot compress it", async () => {
+    using _gzip = spyOn(zlib, "gzip").mockImplementation(((_input: zlib.InputType, callback: zlib.CompressCallback) => {
+      callback(new Error("zlib failed"), Buffer.alloc(0))
+    }) as unknown as typeof zlib.gzip)
+    const messages = [filled(4096, 1), filled(10, 2)]
+    const run = await bidiRunStream("token", { baseURL: ORIGIN })
+    await Promise.all(messages.map((message) => run.write(message)))
+    await until(() => streams[0]?.frames.length === messages.length)
+
+    expect(streams[0]!.frames.map((frame) => frame.flags)).toEqual([0x00, 0x00])
+    expect(payloads(streams[0]!.frames)).toEqual(messages)
+    run.end()
+  })
+
+  it.each([10, 4096])("fails the Run, not replay-safe, when HTTP/2 refuses a %d-byte write", async (size) => {
+    const connect = http2.connect
+    ;(http2 as { connect: unknown }).connect = (origin: string, options?: http2.ClientSessionOptions) => {
+      const session = connect(origin, options)
+      const request = session.request.bind(session)
+      session.request = ((...args: Parameters<typeof request>) => {
+        const stream = request(...args)
+        stream.write = () => { throw new Error("stream write refused") }
+        return stream
+      }) as typeof session.request
+      return session
+    }
+    try {
+      const run = await bidiRunStream("token", { baseURL: ORIGIN })
+      const failure = await Promise.resolve().then(() => run.write(filled(size, 1))).catch((error: unknown) => error)
+      expect(failure).toMatchObject({ message: "Cursor Run stream write failed", replaySafe: false })
+      expect(() => run.write(filled(10, 2))).toThrow("Cursor Run stream write failed")
+      run.destroy()
+      // Else the server meets this stream late and gives it the next test's answer.
+      await until(() => streams[0]?.rstCode !== undefined)
+    } finally {
+      ;(http2 as { connect: unknown }).connect = connect
+    }
+  })
+
+  it.each(["http-415", "http-401"] as const)(
+    "leaves a Run that Cursor ends while a message compresses to report its own replay-safe error (%s)",
+    async (answer) => {
+      answers.push(answer)
+      const held: Array<() => void> = []
+      using _gzip = holdCompression(held)
+      const run = await bidiRunStream("token", { baseURL: ORIGIN })
+      let ended = false
+      run.onTerminal(() => { ended = true })
+      const request = writeStreamMessage(run, filled(8192, 1), "initial Run request")
+      await until(() => ended && held.length === 1)
+      for (const compress of held) compress()
+
+      expect(await request).toBe(true)
+      const failure = await (async () => {
+        for await (const _ of run.frames()) { /* until the Run ends */ }
+      })().then(() => undefined, (error: unknown) => error)
+      expect(failure).toMatchObject({ replaySafe: true, message: expect.stringContaining(answer.slice(5)) })
+      expect(run.compressionRejected?.()).toBe(answer === "http-415")
+      expect(streams[0]!.frames).toEqual([])
+    },
+  )
 
   it.each(["unimplemented", "decompress", "http-415", "grpc-headers", "grpc-trailers"] as const)(
     "sends the origin's later Runs uncompressed after Cursor refuses a gzip Run (%s)",
@@ -450,5 +591,29 @@ describe("Cursor refusing a gzip Run through the provider", () => {
 
     expect(errors(parts)).not.toEqual([])
     expect(seen).toHaveLength(1)
+  })
+
+  it("opens no Run when the turn is stopped while its request compresses", async () => {
+    const held: Array<() => void> = []
+    using _gzip = holdCompression(held)
+    const abort = new AbortController()
+    const model = createCursor({ name: "cursor", accessToken: "test-token", agentBaseURL: ORIGIN, cacheDir: directory })
+      .languageModel("gzip-fixture")
+    const opened = model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: `Summarize this: ${"x".repeat(50_000)}` }] }],
+      tools: [{ type: "function", name: "read", inputSchema: { type: "object", properties: {} } }],
+      headers: { "x-opencode-session-id": "ses_gzip_stopped_compressing" },
+      abortSignal: abort.signal,
+    }).then(async ({ stream }) => {
+      const reader = stream.getReader()
+      while (!(await reader.read()).done) { /* until the turn ends */ }
+    }, () => undefined)
+    await until(() => held.length > 0)
+    abort.abort()
+    for (const compress of held) compress()
+    await Promise.resolve(opened).catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(seen).toEqual([])
   })
 })
