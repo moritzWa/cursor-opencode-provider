@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Run requests advertise only gzip response compression, which the provider can decode, instead of also offering brotli ([@nkoynov](https://github.com/nkoynov)).
 - OpenCode 2 resumes a session's saved Cursor conversation again when its next turn runs in a newly loaded Location (after a session move, or when an idle Location loads again), instead of re-sending the whole history uncached, also when the session moves back to a Location that is still loaded. A Location still running a Run for the session keeps its live state. While the latest save has failed or cannot be read, a Location behind it starts from host history instead of resuming the older snapshot or its own older checkpoint. A rewrite after another provider's compaction still starts fresh ([@nkoynov](https://github.com/nkoynov)).
 - Managed shell output excludes terminal-record footers even when completion races a timeout or background handoff ([#128](https://github.com/oakimov/cursor-opencode-provider/pull/128), [@oakimov](https://github.com/oakimov)).
 - OpenCode 2 rebases Cursor from compacted host history after a successful summary by another provider, including cached background summaries and restarts. Failed or unused summaries keep the warm conversation ([#124](https://github.com/oakimov/cursor-opencode-provider/pull/124), [@moritzWa](https://github.com/moritzWa)).
