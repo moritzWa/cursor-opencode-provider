@@ -246,11 +246,16 @@ describe("Cursor refusing a gzip Run through the provider", () => {
   let refusal: Refusal
   let refuseOnlyWarm = false
   let slowResend = false
+  let holdForTool = false
   let server: http2.Http2Server
   let directory: string
 
   const checkpoint = encodeMessage("ConversationStateStructure", { root_prompt_messages_json: ["turn-1"] })
   const answer = (stream: http2.ServerHttp2Stream) => {
+    if (holdForTool) {
+      stream.write(serverFrame({ exec_server_message: { id: 1, read_args: { path: path.join(directory, "readme.md"), tool_call_id: "call-read" } } }))
+      return
+    }
     stream.write(serverFrame({ interaction_update: { text_delta: { text: "Done." } } }))
     stream.write(serverFrame({ conversation_checkpoint_update: checkpoint }))
     stream.write(serverFrame({ interaction_update: { turn_ended: { input_tokens: 10, output_tokens: 2 } } }))
@@ -324,6 +329,7 @@ describe("Cursor refusing a gzip Run through the provider", () => {
     refusal = undefined
     refuseOnlyWarm = false
     slowResend = false
+    holdForTool = false
   })
 
   afterAll(async () => {
@@ -419,6 +425,24 @@ describe("Cursor refusing a gzip Run through the provider", () => {
     expect(seen[1]!.state).toEqual(checkpoint)
     expect(seen[2]!.request).toEqual(seen[1]!.request!)
   })
+
+  it.each([undefined, "after-request"] as const)(
+    "releases the Run's request once its first pass ends, while the Run is held for tools (refusal: %s)",
+    async (refused) => {
+      refusal = refused
+      holdForTool = true
+      await fs.writeFile(path.join(directory, "readme.md"), "Read me.")
+      const parts = await turn(["Read the readme."], "ses_gzip_held")
+
+      expect(errors(parts)).toEqual([])
+      expect(parts.some((part) => part.type === "tool-call")).toBe(true)
+      expect(seen).toHaveLength(refused ? 2 : 1)
+      const held = sessionManager.findOpenByOpenCodeSessionId("ses_gzip_held")
+      expect(held?.pending.size).toBe(1)
+      // A refusal can only end the pass that opened the Run; later passes cannot resend.
+      expect(held?.resendRunRequest).toBeUndefined()
+    },
+  )
 
   it("does not resend a refused Run after it showed output", async () => {
     refusal = "after-output"

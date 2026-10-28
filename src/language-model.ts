@@ -1534,6 +1534,9 @@ export async function pumpWithRecovery(input: {
       } catch (error) {
         if (!await resendRefusedGzipRun(pumpedSession, error, input.abortSignal)) throw error
         await pumpPass()
+      } finally {
+        // Only the pass that opened a Run sees a gzip refusal. A Run held for tools must not keep its request.
+        pumpedSession.resendRunRequest = undefined
       }
       if (pumpedSession.closed && pumpedSession.pending.size === 0) {
         forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
