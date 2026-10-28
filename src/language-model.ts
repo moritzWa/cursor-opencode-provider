@@ -258,6 +258,7 @@ import {
 import {
   clearPersistedConversationState,
   hydrateConversationState,
+  onCopyStateReplaced,
   hydrateTurnProvenance,
   persistConversationState,
 } from "./protocol/conversation-state.js"
@@ -1758,10 +1759,22 @@ async function writeExecHeartbeats(session: CursorSession, generation: number): 
   }
 }
 
+onCopyStateReplaced((sessionKey) => {
+  postCompactionRebaseBySession.delete(sessionKey)
+  undeliveredHostNotesBySession.delete(sessionKey)
+  steerAnsweringRuns.delete(sessionKey)
+  promptIdentityBySession.delete(sessionKey)
+  toolCatalogBySession.delete(sessionKey)
+  mirroredTodosBySession.delete(sessionKey)
+})
+
 /** Restore receipts before matching a promoted copy, which may need no Run at all. */
 async function restoreSessionState(sessionKey: string | undefined, cacheDir: string): Promise<void> {
   if (sessionKey) {
-    const restored = await hydrateConversationState(cacheDir, sessionKey).catch((error) => {
+    // A Run this copy still holds for the session owns its live conversation state.
+    const ownsRun = !!sessionManager.findOpenByOpenCodeSessionId(sessionKey)
+      || sessionManager.openSessionsStoppedWith(sessionKey).length > 0
+    const restored = ownsRun ? undefined : await hydrateConversationState(cacheDir, sessionKey).catch((error) => {
       trace(`conversation persistence: restore failed sessionKey=${sessionKey}: ${String(error)}`)
       return undefined
     })

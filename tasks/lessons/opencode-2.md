@@ -40,6 +40,19 @@ Operator setup: [OpenCode 2.x](../../docs/opencode-2.md).
   process-wide but parent links, activity and prompts were per copy, so a
   child's tool never renewed the parent's Run when the plugin and provider were
   different copies (`session-activity.v1`, `test/activity.test.ts`).
+  Conversation bindings are shared but checkpoints are per copy, so a session
+  moved to another Location, or back, skipped restore and resumed nothing or
+  an older checkpoint. A copy behind the latest snapshot generation restores
+  it; when it cannot (failed latest save, missing snapshot, writes that never
+  settle) it drops its own checkpoint and seeds host history. A per-copy
+  checkpoint outlives an evicted shared record, so "never held a generation"
+  does not mean "holds no older checkpoint"; whether another copy wrote the
+  latest generation decides. It also outlives an evicted binding: an unbound
+  session's default conversation id comes back, so a copy restoring it from
+  disk, or finding no snapshot, drops its checkpoint unless it holds the
+  latest generation. Tests need a copy that served the session before, and
+  one whose record was evicted since, not only one that never did
+  (`hydrateConversationState`, `test/host-history-rewrite.test.ts`).
 - **`isRetryable: false` does not stop a retry.** 2.x classifies an
   `APICallError` by status and retries 408/409/429/5xx; only `x-should-retry:
   false` overrides it. An unrecognized failure without a status also retries:
