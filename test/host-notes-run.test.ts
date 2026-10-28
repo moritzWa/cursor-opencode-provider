@@ -12,6 +12,7 @@ import path from "node:path"
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION, CURSOR_SESSION_EDITS_DENIED_OPTION } from "../src/shared.js"
+import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { encodeJsonAsValue, readAllFields } from "../src/protocol/struct.js"
 import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
@@ -81,7 +82,7 @@ beforeAll(async () => {
       while (pending.length >= 5) {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
-        const message = decodeMessage<ClientMessage>("AgentClientMessage", pending.subarray(5, 5 + length))
+        const message = decodeMessage<ClientMessage>("AgentClientMessage", decodeFramePayload({ flags: pending[0]!, payload: pending.subarray(5, 5 + length) }))
         pending = pending.subarray(5 + length)
         run.received.push(message)
         onRun(run, message)

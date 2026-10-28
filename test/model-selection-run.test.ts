@@ -12,6 +12,7 @@ import { CURSOR_VARIANT_PARAMETERS_KEY, mapAvailableModelsResponse, writeCache }
 import { resetConversationBindingsForTests } from "../src/protocol/conversation-bind.js"
 import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
+import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { sessionManager } from "../src/session.js"
 import { MODEL_CACHE_SCHEMA_VERSION } from "../src/shared.js"
@@ -48,7 +49,7 @@ beforeAll(async () => {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
         const message = decodeMessage<{ run_request?: typeof requests[number] }>(
-          "AgentClientMessage", pending.subarray(5, 5 + length),
+          "AgentClientMessage", decodeFramePayload({ flags: pending[0]!, payload: pending.subarray(5, 5 + length) }),
         )
         pending = pending.subarray(5 + length)
         if (!message.run_request) continue

@@ -19,6 +19,7 @@ import {
   bidiRunStream,
   cacheHttp2SessionForTests,
   closeCachedHttp2SessionsForTests,
+  resetRunCompressionForTests,
 } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
 
@@ -122,11 +123,14 @@ const savedClientVersion = process.env.CURSOR_CLIENT_VERSION
 beforeEach(() => {
   process.env.CURSOR_CLIENT_VERSION = "cli-drain-test-1"
   resetClientVersionCache()
+  // The filled payloads would compress below the relay's buffers and never block.
+  resetRunCompressionForTests(ORIGIN)
 })
 
 afterEach(async () => {
   sessionManager.dispose()
   resetTurnStateForTests()
+  resetRunCompressionForTests()
   closeCachedHttp2SessionsForTests()
   await fake?.close()
   fake = undefined

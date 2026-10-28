@@ -8,6 +8,7 @@ import path from "node:path"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createCursor } from "../src/index.js"
 import { CursorAuthError, CursorRetryExhaustedError, CursorServerError, CursorTransportError } from "../src/errors.js"
+import { decodeFramePayload } from "../src/protocol/framing.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { cacheHttp2SessionForTests, closeCachedHttp2SessionsForTests, frameArrival, lastFrameArrival } from "../src/transport/connect.js"
 import { setHostCacheDirOverride } from "../src/context/paths.js"
@@ -54,7 +55,7 @@ beforeAll(async () => {
       while (pending.length >= 5) {
         const length = pending.readUInt32BE(1)
         if (pending.length < 5 + length) break
-        const message = decodeMessage<Record<string, unknown>>("AgentClientMessage", pending.subarray(5, 5 + length))
+        const message = decodeMessage<Record<string, unknown>>("AgentClientMessage", decodeFramePayload({ flags: pending[0]!, payload: pending.subarray(5, 5 + length) }))
         pending = pending.subarray(5 + length)
         if (scripted) { scripted(stream, message); continue }
         if (!message.run_request) continue

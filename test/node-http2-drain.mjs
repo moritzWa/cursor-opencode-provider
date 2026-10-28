@@ -11,6 +11,7 @@ import {
   bidiRunStream,
   cacheHttp2SessionForTests,
   closeCachedHttp2SessionsForTests,
+  resetRunCompressionForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
 import { writeStreamMessage } from "../dist/stream-write.js"
@@ -27,6 +28,8 @@ import { settleRunSavesForTests } from "../dist/language-model.js"
 // Bun. Adapted from the relay tests in #77 (by @nkoynov).
 process.env.CURSOR_CLIENT_VERSION = "cli-node-drain-test-1"
 const ORIGIN = "https://agentn.node-drain-test.cursor.sh"
+// The filled payloads would compress below the relay's buffers and never block.
+resetRunCompressionForTests(ORIGIN)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const failureOf = (promise) => promise.then(() => undefined, (error) => error)
 const waitUntil = async (condition, ms = 5_000) => {
@@ -247,6 +250,7 @@ for (const [name, bytes, close] of [
   ["exit-after-end-destroy-blocked", 3_000_000, "end-then-destroy"],
 ]) {
   const script = `
+import { randomBytes } from "node:crypto"
 import http2 from "node:http2"
 import { bidiRunStream, cacheHttp2SessionForTests } from ${JSON.stringify(CONNECT_MODULE)}
 const server = http2.createServer()
@@ -263,7 +267,7 @@ await new Promise((resolve) => client.once("connect", resolve))
 cacheHttp2SessionForTests("https://agentn.node-exit-test.cursor.sh", client)
 void (async () => {
   const run = await bidiRunStream("token", { baseURL: "https://agentn.node-exit-test.cursor.sh" })
-  run.write(new Uint8Array(${bytes}).fill(5))
+  run.write(new Uint8Array(randomBytes(${bytes})))
   await arrived
   await new Promise((resolve) => setTimeout(resolve, 200))
   ${close !== "destroy" ? "run.end()" : ""}

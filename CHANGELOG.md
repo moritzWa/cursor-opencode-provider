@@ -8,6 +8,7 @@
 
 ### Changed
 
+- Run messages of 1 KiB or more go to Cursor gzip-compressed, as Cursor CLI sends them: the Run request and the conversation blobs Cursor fetches again at the start of every new Run (about 4× smaller). On long conversations the first token of a new turn arrives sooner: about 1.2 s at 700k tokens and 0.4 s at 300k in a real-key A/B; small conversations don't change. If Cursor refuses a gzip Run, the same request is sent once more uncompressed and later Runs to that host stay uncompressed until the provider restarts ([discussion #127](https://github.com/oakimov/cursor-opencode-provider/discussions/127)).
 - CreatePlan saves plans through an advertised host `write` or patch tool before execution review. File permission authorizes saving; only an explicit Yes approves implementation. Review respects current permissions, cancellation and interrupted saves never replay automatically, and catalogs without a supported writer refuse before mutation ([#90](https://github.com/oakimov/cursor-opencode-provider/issues/90)).
 
 ### Fixed

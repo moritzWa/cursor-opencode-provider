@@ -1520,7 +1520,7 @@ export async function pumpWithRecovery(input: {
         openingFailure = undefined
         throw failure
       }
-      await pump(
+      const pumpPass = () => pump(
         pumpedSession,
         input.controller,
         {
@@ -1529,6 +1529,12 @@ export async function pumpWithRecovery(input: {
         },
         input.abortSignal,
       )
+      try {
+        await pumpPass()
+      } catch (error) {
+        if (!await resendRefusedGzipRun(pumpedSession, error, input.abortSignal)) throw error
+        await pumpPass()
+      }
       if (pumpedSession.closed && pumpedSession.pending.size === 0) {
         forgetRetryBudget(pumpedSession.openCodeSessionId, retryBudget)
       }
@@ -1638,6 +1644,22 @@ export async function pumpWithRecovery(input: {
       }
     }
   }
+}
+
+/** Cursor refused a gzip Run before acting on it: send the same request once more, now uncompressed. */
+async function resendRefusedGzipRun(session: CursorSession, error: unknown, signal?: AbortSignal): Promise<boolean> {
+  if (!(error instanceof CursorProviderError) || !error.replaySafe) return false
+  if (!session.resendRunRequest || !session.stream.compressionRejected?.()) return false
+  if (session.closed || session.hostInterrupted || signal?.aborted) return false
+  trace(`Run compression: sessionId=${session.sessionId} refused before Cursor acted on it; resending once uncompressed`)
+  // A heartbeat on the refused stream would fail and close the session while the resend uploads.
+  session.heartbeatCancel?.()
+  await session.resendRunRequest(signal)
+  // As for a new Run, Cursor's silence is timed from the end of the upload.
+  sessionManager.recordSemanticProgress(session)
+  // The refused pass did nothing; the resent Run counts as the first, which may still reseed a checkpoint.
+  if (session.cacheDiagnostics) session.cacheDiagnostics.pumpPasses--
+  return true
 }
 
 export type CursorRunRecovery =
@@ -1816,7 +1838,17 @@ async function openRunWithRequest(
     if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
     stream = await bidiRunStream(token, options)
     if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
-    await writeWithBackpressure(stream, request, operation)
+    try {
+      await writeWithBackpressure(stream, request, operation)
+    } catch (error) {
+      // A server without gzip can refuse before reading the body, which fails a large upload.
+      if (cancelled || !stream.compressionRejected?.()) throw error
+      trace(`Run compression: ${operation} refused while uploading; sending it once more uncompressed`)
+      stream.destroy()
+      stream = await bidiRunStream(token, options)
+      if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
+      await writeWithBackpressure(stream, request, operation)
+    }
     if (cancelled) throw new CursorLocalCancellationError(`Cursor ${operation} cancelled`)
     return stream
   } catch (error) {
@@ -2442,6 +2474,30 @@ async function startSession(
     throw new CursorProtocolError("Cannot reopen a closed Cursor session")
   }
 
+  const replaceRun = async (
+    bearer: string,
+    request: Uint8Array,
+    operation: string,
+    nextRunId: string,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    const next = await openRunWithRequest(bearer, {
+      baseURL: agentBaseUrl, headers: options.headers,
+    }, request, operation, {
+      signal,
+      stoppedWithSessionId: session.stoppedWithSessionId ?? session.openCodeSessionId,
+      requestedAt: session.requestedAt ?? session.createdAt,
+    })
+    abortIfNeeded(signal, next)
+    session.heartbeatCancel?.()
+    await waitForStreamWrites(session.stream)
+    abortIfNeeded(signal, next)
+    sessionManager.replaceStream(session, next, nextRunId)
+    attachSessionHeartbeat(session)
+    session.resendRunRequest = (resendSignal) => replaceRun(bearer, request, operation, nextRunId, resendSignal)
+  }
+  session.resendRunRequest = (signal) => replaceRun(token, reqBytes, "initial Run request", runId, signal)
+
   session.reopenWithUserMessage = async (text: string, signal?: AbortSignal) => {
     abortIfNeeded(signal)
     const freshToken = await resolveRunBearerToken(options)
@@ -2462,19 +2518,7 @@ async function startSession(
       action: "user",
       mode: cursorAgentModeWireValue(getActiveCursorMode(session.openCodeSessionId)),
     })
-    const next = await openRunWithRequest(freshToken, {
-      baseURL: agentBaseUrl, headers: options.headers,
-    }, reqBytes, "progress-only continuation Run", {
-      signal,
-      stoppedWithSessionId: session.stoppedWithSessionId ?? session.openCodeSessionId,
-      requestedAt: session.requestedAt ?? session.createdAt,
-    })
-    abortIfNeeded(signal, next)
-    session.heartbeatCancel?.()
-    await waitForStreamWrites(session.stream)
-    abortIfNeeded(signal, next)
-    sessionManager.replaceStream(session, next, nextRunId)
-    attachSessionHeartbeat(session)
+    await replaceRun(freshToken, reqBytes, "progress-only continuation Run", nextRunId, signal)
   }
 
   callOptions.abortSignal?.addEventListener("abort", () => {

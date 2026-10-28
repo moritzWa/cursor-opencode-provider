@@ -6,6 +6,7 @@ import {
   bidiRunStream,
   closeCachedHttp2SessionsForTests,
   getSession,
+  resetRunCompressionForTests,
 } from "../dist/transport/connect.js"
 import { encodeFrame } from "../dist/protocol/framing.js"
 import { writeStreamMessage } from "../dist/stream-write.js"
@@ -15,6 +16,8 @@ import { writeStreamMessage } from "../dist/stream-write.js"
 process.env.CURSOR_CLIENT_VERSION = "cli-node-session-memory-test-1"
 for (const key of ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"]) delete process.env[key]
 const ORIGIN = "https://agentn.node-session-memory-test.cursor.sh"
+// The filled requests would compress to a few kilobytes and never fill the session.
+resetRunCompressionForTests(ORIGIN)
 const MiB = 1024 * 1024
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const realConnect = http2.connect
