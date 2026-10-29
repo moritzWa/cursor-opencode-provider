@@ -923,7 +923,7 @@ function acknowledgeHostResults(session: CursorSession, lifecycle: ReplayToolLif
   session.unacknowledgedHostResults = session.unacknowledgedHostResults.filter(result =>
     result.callId !== lifecycle.callId || (arrived !== undefined && arrived <= result.afterFrame))
   trace(`recovery: host-result-completion hostSessionId=${session.openCodeSessionId} sessionId=${session.sessionId} ` +
-    `callId=${lifecycle.callId} unacknowledged=${session.unacknowledgedHostResults.length}`)
+    `callId=${lifecycle.callId.replace(/\r?\n/g, "\\n")} unacknowledged=${session.unacknowledgedHostResults.length}`)
 }
 
 /** `resumeCheckpoint` is set only by a checkpoint this Run received. */
@@ -6427,7 +6427,7 @@ export async function pump(
               `exec: binary write STAGED toolCallId=${toolCallId} ` +
                 `requested=${JSON.stringify(binaryWrite.path)} target=${JSON.stringify(target)} ` +
                 `bytes=${binaryWrite.data.length} kind=${inputImage ? "input-image"
-                  : generateImageCallId ? `generated callId=${generateImageCallId}` : "uncorrelated"}`,
+                  : generateImageCallId ? `generated callId=${generateImageCallId.replace(/\r?\n/g, "\\n")}` : "uncorrelated"}`,
             )
             emittedHostTools++
             closeOpenSpans()
