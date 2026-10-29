@@ -20,6 +20,8 @@
  */
 
 import { randomUUID } from "node:crypto"
+import fs from "node:fs"
+import path from "node:path"
 
 export type PendingCursorImage = {
   id: string
@@ -111,6 +113,44 @@ export function takePendingCursorImage(
   pending.delete(id)
   if (now - image.createdAt > STAGED_IMAGE_TTL_MS) return undefined
   return image
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && Buffer.from(a.buffer, a.byteOffset, a.length)
+    .equals(Buffer.from(b.buffer, b.byteOffset, b.length))
+}
+
+/** Whether `target` is free for `data`: absent, or already holding those bytes. */
+function holdsOnlyBytes(target: string, data: Uint8Array): boolean {
+  for (const image of pending.values()) {
+    if (image.path === target && !sameBytes(image.data, data)) return false
+  }
+  let stat: fs.Stats
+  try {
+    stat = fs.lstatSync(target)
+  } catch {
+    return true
+  }
+  // A link or directory is never overwritten through; the save refuses links.
+  if (!stat.isFile()) return false
+  if (stat.size !== data.length) return false
+  try {
+    return sameBytes(fs.readFileSync(target), data)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A Run's input images often share a file name (three different `cvs.png`).
+ * Cursor writes each to `assets/<name>`, so the later ones would replace the
+ * earlier. Keep an image whose name is taken by other bytes, on disk or staged,
+ * beside it as `<name>-<hash12><ext>`; the WriteResult reports that path.
+ */
+export function distinctInputImagePath(target: string, data: Uint8Array, hash: string): string {
+  if (holdsOnlyBytes(target, data)) return target
+  const extension = path.extname(target)
+  return `${target.slice(0, target.length - extension.length)}-${hash.slice(0, 12)}${extension}`
 }
 
 /** Drop a staged image whose turn ended without committing it. */

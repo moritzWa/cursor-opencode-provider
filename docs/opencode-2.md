@@ -249,8 +249,6 @@ an event subscription that fails during startup does not retain that ownership.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.x. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.x has no public `ask` on its tool context, so the 2.x entrypoint advertises the tool with `permission: "edit"` (agents that deny edits do not get it) and, before writing, asserts `external_directory` and `edit` on the actual target through the plugin's `ctx.permission.assert`; without that API the save is refused. The id is opaque, so the model cannot write arbitrary files.
 
-Cursor also writes a Run's input images into its assets cache. When an uncorrelated write carries bytes identical to one of this Run's input images and targets the provider's own `assets/` folder, the provider stores the bytes there and answers Cursor directly, with no host tool step. A tool step would also keep those images from counting as held, so every later turn would attach and save them again. An existing file with different bytes is never replaced: the image goes to a content-hash name beside it and Cursor receives that path. Workspace targets, unknown bytes and writes tied to a model tool call stay on the permission-gated `cursor_image_save` path. This does not remove images from Cursor's context.
-
 ## Task attachments
 
 Cursor Task attachments reach the native `subagent` prompt as exact, quoted
@@ -284,7 +282,10 @@ a rejected credential on an untouched resumed attempt. Checkpoints received
 while a completed tool result drains remain eligible only after Cursor acknowledges
 the matching tool completion. A late pre-result checkpoint cannot authorize replay.
 Question, mode-switch and plan replies use the same acknowledgement guard;
-display-only todo mirrors do not wait for a second completion. Terminal drains
+display-only todo mirrors do not wait for a second completion. Saves of
+Cursor's input-image copies, which name no call and are never completed, do
+not wait either; a generated image's save waits for its GenerateImage
+completion. Terminal drains
 recognize matching completions too. Follow-ups retain
 checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
 checkpoint end the turn.

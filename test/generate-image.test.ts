@@ -28,81 +28,11 @@ import {
 } from "../src/image-staging.js"
 import {
   executeCursorImageSave,
-  materializeAttachedImage,
   resolveContainedImagePath,
   IMAGE_PERMISSION_DENIED_PREFIX,
 } from "../src/image-save.js"
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01])
-
-describe("input image materialization", () => {
-  const other = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x02])
-  const assets = () => path.join(projectDir, "assets")
-
-  it("stores a new input image and reuses an identical one without rewriting it", () => {
-    const target = path.join(assets(), "input.png")
-    expect(materializeAttachedImage(target, projectDir, PNG)).toBe(target)
-    expect(fs.readFileSync(target)).toEqual(Buffer.from(PNG))
-    const before = fs.statSync(target)
-    expect(materializeAttachedImage(target, projectDir, PNG)).toBe(target)
-    expect(fs.statSync(target).mtimeMs).toBe(before.mtimeMs)
-  })
-
-  it("never replaces a different image that shares the file name", () => {
-    const target = path.join(assets(), "cvs.png")
-    expect(materializeAttachedImage(target, projectDir, PNG)).toBe(target)
-    const second = materializeAttachedImage(target, projectDir, other)!
-    expect(second).not.toBe(target)
-    expect(path.dirname(second)).toBe(assets())
-    expect(path.basename(second)).toMatch(/^cvs-[0-9a-f]{12}\.png$/)
-    expect(fs.readFileSync(target)).toEqual(Buffer.from(PNG))
-    expect(fs.readFileSync(second)).toEqual(Buffer.from(other))
-    expect(materializeAttachedImage(target, projectDir, other)).toBe(second)
-  })
-
-  it("leaves workspace, nested and non-assets targets to the permission-gated save", () => {
-    for (const target of [
-      path.join(workspace, "input.png"),
-      path.join(projectDir, "input.png"),
-      path.join(assets(), "nested", "input.png"),
-      assets(),
-    ]) expect(materializeAttachedImage(target, projectDir, PNG)).toBeUndefined()
-    expect(fs.existsSync(path.join(workspace, "input.png"))).toBe(false)
-    expect(fs.existsSync(path.join(projectDir, "input.png"))).toBe(false)
-  })
-
-  it("does not follow an asset symlink that leaves the provider project", () => {
-    const external = path.join(workspace, "input.png")
-    fs.writeFileSync(external, PNG)
-    fs.mkdirSync(assets())
-    const target = path.join(assets(), "input.png")
-    fs.symlinkSync(external, target)
-    expect(materializeAttachedImage(target, projectDir, PNG)).toBeUndefined()
-    expect(fs.readFileSync(external)).toEqual(Buffer.from(PNG))
-  })
-
-  it("leaves a target that is not a regular file to the permission-gated save", () => {
-    fs.mkdirSync(path.join(assets(), "taken.png"), { recursive: true })
-    expect(materializeAttachedImage(path.join(assets(), "taken.png"), projectDir, PNG)).toBeUndefined()
-  })
-
-  it.skipIf(process.getuid?.() === 0)("falls back to the permission-gated save when the cache cannot be written", () => {
-    fs.mkdirSync(assets())
-    fs.chmodSync(assets(), 0o500)
-    try {
-      expect(materializeAttachedImage(path.join(assets(), "input.png"), projectDir, PNG)).toBeUndefined()
-    } finally {
-      fs.chmodSync(assets(), 0o700)
-    }
-    expect(fs.readdirSync(assets())).toHaveLength(0)
-  })
-
-  it("does not write through an assets directory that is a symlink out of the project", () => {
-    fs.symlinkSync(workspace, assets())
-    expect(materializeAttachedImage(path.join(assets(), "input.png"), projectDir, PNG)).toBeUndefined()
-    expect(fs.readdirSync(workspace)).toHaveLength(0)
-  })
-})
 
 let workspace: string
 let projectDir: string

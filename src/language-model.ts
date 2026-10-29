@@ -206,8 +206,8 @@ import {
   imageMimeForPath,
   remapCursorImageWritePath,
 } from "./protocol/generate-image.js"
-import { stageCursorImage } from "./image-staging.js"
-import { IMAGE_PERMISSION_DENIED_PREFIX, materializeAttachedImage } from "./image-save.js"
+import { distinctInputImagePath, stageCursorImage } from "./image-staging.js"
+import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { checkpointTokenDetails, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
   EarlyToolRows,
@@ -270,6 +270,7 @@ import {
   noteHistoryImageCheckpoint,
   noteHistoryImagesSent,
   resetHeldHistoryImagesForTests,
+  runHasHistoryImage,
   runHistoryImages,
 } from "./protocol/sent-history-images.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
@@ -331,6 +332,7 @@ import {
   assertCursorUserImageSupport,
   extractCursorPromptImages,
   extractCursorToolResultImages,
+  imageContentHash,
   MAX_CURSOR_IMAGE_INPUT_BYTES,
   type CursorImageInput,
 } from "./image-input.js"
@@ -859,6 +861,17 @@ export function promptIdentityWouldRemint(
   _current: PromptIdentity,
 ): boolean {
   return false
+}
+
+/** The one GenerateImage call Cursor has started and not yet completed, if exactly one. */
+function openGenerateImageCallId(session: CursorSession): string | undefined {
+  let found: string | undefined
+  for (const [callId, toolCall] of session.displayToolCalls) {
+    if (!toolCall.generate_image_tool_call) continue
+    if (found) return undefined
+    found = callId
+  }
+  return found
 }
 
 function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, frame: Frame): void {
@@ -4034,10 +4047,24 @@ async function deliverContinuationResultsNow(
           : pending.resultField === SWITCH_MODE_RESULT_FIELD ? metadata?.switchModeToolCallId
           : pending.resultField === CREATE_PLAN_RESULT_FIELD ? metadata?.createPlanToolCallId
           : undefined
+        const imageSave = pending.toolName === CURSOR_IMAGE_SAVE_TOOL && pending.resultField === "write_result"
+        const generateImageCallId = imageSave ? metadata?.generateImageCallId : undefined
         const callId = typeof interactionCallId === "string" && interactionCallId.length > 0
-          ? interactionCallId : exec?.callId
-        const unacknowledged = session.unacknowledgedHostResults ??= []
-        unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+          ? interactionCallId
+          : exec?.callId ?? (typeof generateImageCallId === "string" ? generateImageCallId : undefined)
+        // Cursor never completes its copy of an input image, so waiting would refuse
+        // every later checkpoint of the Run. Whatever the outcome, resuming a
+        // checkpoint from before it only has Cursor send the same write again.
+        if (imageSave && metadata?.inputImage === true) {
+          trace(`recovery: input-image result needs no completion execId=${r.execId} failed=${r.error !== undefined}`)
+        } else {
+          if (!callId) {
+            trace(`recovery: uncorrelated result; no completion can acknowledge it, so this Run's later ` +
+              `checkpoints stay refused execId=${r.execId} tool=${pending.toolName}`)
+          }
+          const unacknowledged = session.unacknowledgedHostResults ??= []
+          unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+        }
       }
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
@@ -6345,33 +6372,21 @@ export async function pump(
             }
             const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
             const projectDir = ensureOpencodeProjectDir(workspaceRoot)
-            const target = remapCursorImageWritePath(binaryWrite.path, {
+            const remapped = remapCursorImageWritePath(binaryWrite.path, {
               workspaceRoot,
               projectDir,
             })
-            // Cursor also writes this Run's input images into the provider's assets
-            // cache. Those are not generated images: store them there and answer on
-            // the wire, with no host tool step (which would also stop the images
-            // counting as held, so every turn would send and save them again).
-            const hash = createHash("sha256").update(binaryWrite.data).digest("hex")
-            const inputImage = session.historyImages?.held.includes(hash)
-              || session.historyImages?.checkpointed.includes(hash)
-              || session.historyImages?.sent.some(image => image.hash === hash)
-            const attachedPath = !displayCallId && inputImage
-              ? materializeAttachedImage(target, projectDir, binaryWrite.data)
-              : undefined
-            if (attachedPath) {
-              if (!await writeExecFrames([encodeMessage("AgentClientMessage", {
-                exec_client_message: {
-                  id: parsed.id,
-                  write_result: { success: {
-                    path: attachedPath, lines_created: 0, file_size: binaryWrite.data.length,
-                  } },
-                },
-              })], `acknowledge input image id=${parsed.id}`)) return
-              trace(`exec: input image stored id=${parsed.id} path=${JSON.stringify(attachedPath)} bytes=${binaryWrite.data.length}`)
-              continue
-            }
+            // Neither kind of uncorrelated write names a call. A generated image's
+            // write runs inside its GenerateImage call, which Cursor completes only
+            // after reading this write's result; a Run's input images are Cursor's
+            // own copies, never completed, and repeat byte-identical on a resume.
+            const imageHash = imageContentHash(binaryWrite.data)
+            const generateImageCallId = displayCallId ? undefined : openGenerateImageCallId(session)
+            const inputImage = !displayCallId && !generateImageCallId && !!session.historyImages
+              && runHasHistoryImage(session.historyImages, imageHash)
+            const target = inputImage
+              ? distinctInputImagePath(remapped, binaryWrite.data, imageHash)
+              : remapped
             let imageId: string
             try {
               imageId = stageCursorImage({
@@ -6403,13 +6418,16 @@ export async function pump(
                 path: target,
                 binaryWriteBytes: undefined,
                 imageByteLength: binaryWrite.data.length,
+                ...(generateImageCallId ? { generateImageCallId } : {}),
+                ...(inputImage ? { inputImage: true } : {}),
               },
             )
             const toolCallId = `cursor_${session.sessionId}_${parsed.id}`
             trace(
               `exec: binary write STAGED toolCallId=${toolCallId} ` +
                 `requested=${JSON.stringify(binaryWrite.path)} target=${JSON.stringify(target)} ` +
-                `bytes=${binaryWrite.data.length}`,
+                `bytes=${binaryWrite.data.length} kind=${inputImage ? "input-image"
+                  : generateImageCallId ? `generated callId=${generateImageCallId}` : "uncorrelated"}`,
             )
             emittedHostTools++
             closeOpenSpans()

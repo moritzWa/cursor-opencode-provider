@@ -194,7 +194,12 @@ These are failure lessons shared by both hosts, not a replacement for
   A result acknowledgement must use the owning channel's call id: interaction
   replies have no host exec record. Display-only todo mirrors already completed
   on the server and send no reply, so waiting for another completion blocks every
-  later checkpoint. Normal pumps and terminal drains must both consume validated
+  later checkpoint. A result with no call id can never be acknowledged either:
+  Cursor's uncorrelated input-image writes left every later checkpoint refused,
+  which also stopped those images counting as held, so each turn re-sent and
+  re-saved them ([#138](https://github.com/oakimov/cursor-opencode-provider/issues/138),
+  `test/input-image-write.test.ts`). Before adding a wait, name the completion
+  that ends it. Normal pumps and terminal drains must both consume validated
   completions; otherwise the drain cannot confirm the checkpoint's history images
   (`test/parallel-pump.test.ts`, acknowledged interaction answers and terminal drains).
   Capture result cutoffs at each actual serialized write, before its drain;

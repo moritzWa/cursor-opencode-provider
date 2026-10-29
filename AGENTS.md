@@ -231,6 +231,13 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   stay final.
   Missing-blob recovery is limited to the initial control-only checkpoint path
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
+- A delivered result admits later checkpoints only after Cursor completes its
+  call id. Results without one can never be acknowledged: Cursor's copies of a
+  Run's input images (matched by content hash) need no completion whatever the
+  save's outcome; a generated image's write takes its one open GenerateImage
+  call id. Keep every other uncorrelated result waiting. Input images still
+  save through `cursor_image_save`; a name taken by other bytes, on disk or
+  staged, moves to `<name>-<hash12><ext>`, reported in the WriteResult.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it
   on failure. Retry equality uses the previous attempt's own live text. New
   checkpoints, host Stop and history rebuild drop it; unseeded history must not

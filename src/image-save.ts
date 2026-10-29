@@ -7,7 +7,6 @@
  * the plugin package; this module is safe on every graph.
  */
 
-import { createHash } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
 import { errorMessage, trace } from "./debug.js"
@@ -20,67 +19,6 @@ import { takePendingCursorImage } from "./image-staging.js"
  * a contract, not a guess at someone else's message.
  */
 export const IMAGE_PERMISSION_DENIED_PREFIX = "CursorImagePermissionDenied:"
-
-/**
- * Cursor writes the input images of a Run into the provider's own assets cache so
- * its model can refer to them by path. Those bytes are already in the conversation,
- * so they need no permission-gated host save (a save tool step also keeps the Run's
- * images from counting as held, which re-sends and re-saves them every turn).
- *
- * Returns the path now holding exactly `data`, or undefined when the write is not
- * an input-image materialization this module may do (not directly in
- * `<projectDir>/assets`, escaping the project, or unreadable/unwritable). An
- * existing file with other bytes is never replaced: different images often share a
- * file name, so the bytes go to a content-addressed name beside it.
- */
-export function materializeAttachedImage(target: string, projectDir: string, data: Uint8Array): string | undefined {
-  const assets = path.resolve(projectDir, "assets")
-  const absolute = path.resolve(target)
-  // Workspace targets and remapped external ones stay on the permission-gated path.
-  if (path.dirname(absolute) !== assets) return undefined
-  const extension = path.extname(absolute)
-  const digest = createHash("sha256").update(data).digest("hex").slice(0, 12)
-  const names = [path.basename(absolute), `${path.basename(absolute, extension)}-${digest}${extension}`]
-  for (const name of names) {
-    const candidate = path.join(assets, name)
-    const contained = resolveContainedImagePath(candidate, [projectDir])
-    if ("error" in contained) return undefined
-    const state = attachedImageState(contained.path, data)
-    if (state === "same") return candidate
-    if (state === "unreadable") return undefined
-    if (state === "missing" && writeNewAttachedImage(contained.path, data)) return candidate
-  }
-  return undefined
-}
-
-function attachedImageState(file: string, data: Uint8Array): "same" | "different" | "missing" | "unreadable" {
-  let fd: number | undefined
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
-    const stat = fs.fstatSync(fd)
-    if (!stat.isFile()) return "unreadable"
-    return stat.size === data.length && fs.readFileSync(fd).equals(data) ? "same" : "different"
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable"
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd)
-  }
-}
-
-function writeNewAttachedImage(file: string, data: Uint8Array): boolean {
-  let fd: number | undefined
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o666)
-    fs.writeFileSync(fd, data)
-    return true
-  } catch (error) {
-    trace(`attached image: could not store path=${JSON.stringify(file)} reason=${errorMessage(error)}`)
-    return false
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd)
-  }
-}
 
 /** The subset of OpenCode's plugin ToolContext this needs. */
 export type ImageSaveToolContext = {

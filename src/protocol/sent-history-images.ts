@@ -84,6 +84,13 @@ export function runHistoryImages(held?: ReadonlySet<string>): RunHistoryImages {
   return { held: [...(held ?? [])], checkpointed: [], sent: [] }
 }
 
+/** The image is in this Run's conversation: held by its checkpoint, or sent by the Run. */
+export function runHasHistoryImage(run: RunHistoryImages, hash: string): boolean {
+  return run.held.includes(hash)
+    || run.checkpointed.includes(hash)
+    || run.sent.some((image) => image.hash === hash)
+}
+
 /** `lastArrival`: the last frame arrival once the images are written. */
 export function noteHistoryImagesSent(run: RunHistoryImages, hashes: readonly string[], lastArrival = 0): void {
   run.sent.push(...hashes.map((hash) => ({ hash, afterArrival: lastArrival })))
