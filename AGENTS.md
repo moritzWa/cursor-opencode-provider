@@ -233,11 +233,17 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   (`isSoleControlFrame`); unknown/mixed frames keep the normal replay barrier.
 - A delivered result admits later checkpoints only after Cursor completes its
   call id. Results without one can never be acknowledged: Cursor's copies of a
-  Run's input images (matched by content hash) need no completion whatever the
-  save's outcome; a generated image's write takes its one open GenerateImage
-  call id. Keep every other uncorrelated result waiting. Input images still
-  save through `cursor_image_save`; a name taken by other bytes, on disk or
-  staged, moves to `<name>-<hash12><ext>`, reported in the WriteResult.
+  Run's input images (matched by content hash) need no completion; a generated
+  image's write takes its one open GenerateImage call id. Keep every other
+  uncorrelated result waiting. Input images still save through
+  `cursor_image_save`; a name taken by other bytes, on disk or staged, moves to
+  `<name>-<hash12><ext>`, reported in the WriteResult.
+- Cursor CLI fires an input image's copy and ignores its result. Answer it when
+  staged; the save step stays `answered` (not owed, no heartbeat, writes
+  nothing). A clean close while only answered steps remain keeps the Run and its
+  queued frames for the step's result to play; anything owed still closes it.
+- A Run resuming a checkpoint carries the images that checkpoint holds
+  (`resumeCheckpointImages`) as checkpointed, confirmed by its own turn end.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it
   on failure. Retry equality uses the previous attempt's own live text. New
   checkpoints, host Stop and history rebuild drop it; unseeded history must not

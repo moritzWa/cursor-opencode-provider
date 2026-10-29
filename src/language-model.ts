@@ -270,6 +270,8 @@ import {
   noteHistoryImageCheckpoint,
   noteHistoryImagesSent,
   resetHeldHistoryImagesForTests,
+  carryHistoryImages,
+  historyImagesHeldAt,
   runHasHistoryImage,
   runHistoryImages,
 } from "./protocol/sent-history-images.js"
@@ -863,6 +865,16 @@ export function promptIdentityWouldRemint(
   return false
 }
 
+/** The WriteResult Cursor CLI's client returns for a saved binary write. */
+function imageWriteSuccessFrame(execId: number, path: string, bytes: number): Uint8Array {
+  return encodeMessage("AgentClientMessage", {
+    exec_client_message: {
+      id: execId,
+      write_result: { success: { path, lines_created: 0, file_size: bytes } },
+    },
+  })
+}
+
 /** The one GenerateImage call Cursor has started and not yet completed, if exactly one. */
 function openGenerateImageCallId(session: CursorSession): string | undefined {
   let found: string | undefined
@@ -888,6 +900,7 @@ function noteRunImageCheckpoint(session: CursorSession, checkpoint: Uint8Array, 
 /** A resumed model step cannot replay a result or follow-up absent from its checkpoint. */
 function invalidateResumeCheckpoint(session: CursorSession, afterFrame = lastFrameArrival(), hostResult = false): void {
   session.resumeCheckpoint = undefined
+  session.resumeCheckpointImages = undefined
   // A later result cannot make an earlier uncheckpointed follow-up appear
   // represented in this call's host history. Only a new checkpoint clears it.
   session.checkpointRevokedByHostResult = hostResult
@@ -911,6 +924,9 @@ function acceptResumeCheckpoint(session: CursorSession, bytes: Uint8Array, frame
   if (session.resumeCheckpointAfterFrame !== undefined && arrived !== undefined
     && arrived <= session.resumeCheckpointAfterFrame) return
   session.resumeCheckpoint = Uint8Array.from(bytes)
+  session.resumeCheckpointImages = session.historyImages
+    ? historyImagesHeldAt(session.historyImages, arrived)
+    : undefined
   session.checkpointRevoked = false
   session.checkpointRevokedByHostResult = false
   session.resumeCheckpointAfterFrame = undefined
@@ -1404,6 +1420,8 @@ export async function pumpWithRecovery(input: {
   // own resumes the latest one this turn received, and two resumed attempts
   // that streamed without saving a new checkpoint stop the automatic retries.
   let turnCheckpoint: Uint8Array | undefined
+  // The history images `turnCheckpoint` holds, for the Run that resumes it.
+  let turnCheckpointImages: string[] | undefined
   let resumedAttempt = false
   let noProgressResumes = 0
   let openingFailure: CursorProviderError | undefined
@@ -1425,7 +1443,10 @@ export async function pumpWithRecovery(input: {
         : { kind: "rebase", ...(input.canRebaseFromHistory?.(pumpedSession) ? { reason: "completed-tool-results" as const } : {}) }
     resumedAttempt = recovery.kind === "resume"
     // A rebase opens another conversation; its checkpoints start over.
-    if (!resumedAttempt) turnCheckpoint = undefined
+    if (!resumedAttempt) {
+      turnCheckpoint = undefined
+      turnCheckpointImages = undefined
+    }
     // Host notes the failed Run never acknowledged belong to this turn.
     const unackedNotes = takeHostNoteInjections(pumpedSession)
     const unackedNoteCount = unackedNotes.reduce((count, batch) => count + batch.notes.length, 0)
@@ -1463,6 +1484,11 @@ export async function pumpWithRecovery(input: {
       }
       next.userTurnHostNotes = pumpedSession.userTurnHostNotes
       next.usageEstimate = { ...pumpedSession.usageEstimate }
+      // The resumed Run sends no images; the cut Run's are in the checkpoint it resumes.
+      if (next.historyImages && turnCheckpointImages?.length && checkpoint === turnCheckpoint) {
+        carryHistoryImages(next.historyImages, turnCheckpointImages)
+        trace(`recovery: resumed Run carries ${turnCheckpointImages.length} history image(s) its checkpoint holds sessionId=${next.sessionId}`)
+      }
       next.editToolCalls = new Map(pumpedSession.editToolCalls)
       // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
       // session, seeded in startSession) — no handoff needed here.
@@ -1578,9 +1604,11 @@ export async function pumpWithRecovery(input: {
       // before either recovery path so a later attempt can still resume it.
       if (pumpedSession.resumeCheckpoint) {
         turnCheckpoint = pumpedSession.resumeCheckpoint
+        turnCheckpointImages = pumpedSession.resumeCheckpointImages
         noProgressResumes = 0
       } else if (pumpedSession.checkpointRevoked) {
         turnCheckpoint = undefined
+        turnCheckpointImages = undefined
       }
       const checkpoint = turnCheckpoint
       // The inherited tool barrier forbids replaying the action, but an untouched
@@ -1762,6 +1790,7 @@ const execHeartbeatCount = new WeakMap<PendingExec, number>()
 /** A Cursor exec the host still runs, as opposed to an interaction answer or a display-only mirror. */
 function isOwedCursorExec(pending: PendingExec): boolean {
   return !pending.bridged
+    && !pending.answered
     && pending.resultField !== ASK_QUESTION_RESULT_FIELD
     && pending.resultField !== SWITCH_MODE_RESULT_FIELD
     && pending.resultField !== CREATE_PLAN_RESULT_FIELD
@@ -2803,7 +2832,7 @@ export async function cancelPendingExecsForFreshTurn(session: CursorSession): Pr
   if (session.closed || session.pending.size === 0) return 0
   const synthetic: ExtractedToolResult[] = []
   for (const [execId, pending] of session.pending.entries()) {
-    if (pending.bridged || pending.aborted) continue
+    if (pending.bridged || pending.aborted || pending.answered) continue
     if (pending.state !== "pending") continue
     // Bridged interactions (CreatePlan / AskQuestion / SwitchMode) included:
     // a host result already in the prompt was delivered before this cancel,
@@ -3869,6 +3898,9 @@ async function deliverContinuationResultsNow(
     } else if (pending.aborted) {
       if (isShellResultField(pending.resultField)) consumeCursorShellResult(r.toolCallId, r.output)
       trace(`continuation: dropped the result of execId=${r.execId}, which Cursor aborted`)
+    } else if (pending.answered) {
+      trace(`continuation: Cursor already has the reply for execId=${r.execId} tool=${pending.toolName}; ` +
+        `writing nothing failed=${r.error !== undefined}`)
     } else if (!pending.bridged) {
       try {
         const shellResult = isShellResultField(pending.resultField)
@@ -3942,22 +3974,11 @@ async function deliverContinuationResultsNow(
           && pending.toolName === CURSOR_IMAGE_SAVE_TOOL
           && pending.resultField === "write_result"
         ) {
-          frames = [encodeMessage("AgentClientMessage", {
-            exec_client_message: {
-              id: r.execId,
-              write_result: {
-                success: {
-                  path: typeof pending.resultMetadata?.path === "string"
-                    ? pending.resultMetadata.path
-                    : "",
-                  lines_created: 0,
-                  file_size: typeof pending.resultMetadata?.imageByteLength === "number"
-                    ? pending.resultMetadata.imageByteLength
-                    : 0,
-                },
-              },
-            },
-          })]
+          frames = [imageWriteSuccessFrame(
+            r.execId,
+            typeof pending.resultMetadata?.path === "string" ? pending.resultMetadata.path : "",
+            typeof pending.resultMetadata?.imageByteLength === "number" ? pending.resultMetadata.imageByteLength : 0,
+          )]
         }
         if (frames.length === 0) {
           const directPlanStage = pending.toolName === CURSOR_PLAN_STAGE_TOOL
@@ -4052,19 +4073,12 @@ async function deliverContinuationResultsNow(
         const callId = typeof interactionCallId === "string" && interactionCallId.length > 0
           ? interactionCallId
           : exec?.callId ?? (typeof generateImageCallId === "string" ? generateImageCallId : undefined)
-        // Cursor never completes its copy of an input image, so waiting would refuse
-        // every later checkpoint of the Run. Whatever the outcome, resuming a
-        // checkpoint from before it only has Cursor send the same write again.
-        if (imageSave && metadata?.inputImage === true) {
-          trace(`recovery: input-image result needs no completion execId=${r.execId} failed=${r.error !== undefined}`)
-        } else {
-          if (!callId) {
-            trace(`recovery: uncorrelated result; no completion can acknowledge it, so this Run's later ` +
-              `checkpoints stay refused execId=${r.execId} tool=${pending.toolName}`)
-          }
-          const unacknowledged = session.unacknowledgedHostResults ??= []
-          unacknowledged.push({ callId, afterFrame: beforeResultWrite })
+        if (!callId) {
+          trace(`recovery: uncorrelated result; no completion can acknowledge it, so this Run's later ` +
+            `checkpoints stay refused execId=${r.execId} tool=${pending.toolName}`)
         }
+        const unacknowledged = session.unacknowledgedHostResults ??= []
+        unacknowledged.push({ callId, afterFrame: beforeResultWrite })
       }
     }
     if (session.historyImages) noteHistoryImagesSent(session.historyImages, deliveredImageHashes, lastFrameArrival())
@@ -4103,7 +4117,7 @@ async function deliverContinuationResultsNow(
         trace(`continuation: mirrored todoread snapshot items=${snapshot.length}`)
       }
     }
-    if (pending.aborted) continue
+    if (pending.aborted || pending.answered) continue
     session.usageEstimate.inputTokens += estimateTokens(r.output.length)
     if (pending.bridged) {
       trace(
@@ -6402,6 +6416,21 @@ export async function pump(
               if (closeIfParallelStepComplete()) return
               continue
             }
+            // Cursor CLI's agent fires the write of an input image's copy and ignores
+            // its result, so Cursor may finish the turn and close the Run while the
+            // host still asks to save it. Reply now, as that client would; the
+            // permission-gated save still runs as the host step and writes nothing back.
+            if (inputImage) {
+              const beforeReply = lastFrameArrival()
+              if (!session.stream.isClosed()) {
+                if (!await writeExecFrames(
+                  [imageWriteSuccessFrame(parsed.id, target, binaryWrite.data.length)],
+                  `answer input image write id=${parsed.id}`,
+                )) return
+                invalidateResumeCheckpoint(session, beforeReply, true)
+              }
+              trace(`recovery: input-image write answered at once; Cursor neither waits for nor completes it execId=${parsed.id}`)
+            }
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
             // The write reaches the host as the save tool: Cursor's later outcome adds no row.
             if (displayCallId) session.editToolCalls?.delete(displayCallId)
@@ -6421,6 +6450,7 @@ export async function pump(
                 ...(generateImageCallId ? { generateImageCallId } : {}),
                 ...(inputImage ? { inputImage: true } : {}),
               },
+              inputImage,
             )
             const toolCallId = `cursor_${session.sessionId}_${parsed.id}`
             trace(

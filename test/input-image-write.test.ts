@@ -11,7 +11,14 @@ import {
   distinctInputImagePath,
   stageCursorImage,
 } from "../src/image-staging.js"
-import { deliverContinuationResults, pump, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
+import {
+  attachSessionHeartbeat,
+  deliverContinuationResults,
+  pump,
+  pumpWithRecovery,
+  resetTurnStateForTests,
+  settleRunSavesForTests,
+} from "../src/language-model.js"
 import { resetToolRequestsListedSeenForTests } from "../src/parallel-step.js"
 import { CURSOR_IMAGE_SAVE_TOOL } from "../src/protocol/generate-image.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
@@ -32,6 +39,7 @@ const PNG_B = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2)
 
 const tempDirs: string[] = []
 let previousCache: string | undefined
+let cacheOverridden = false
 
 function tempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-input-image-"))
@@ -46,7 +54,8 @@ afterEach(async () => {
   resetToolRequestsListedSeenForTests()
   resetTurnStateForTests()
   resetHeldHistoryImagesForTests()
-  setHostCacheDirOverride(previousCache)
+  if (cacheOverridden) setHostCacheDirOverride(previousCache)
+  cacheOverridden = false
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -65,12 +74,25 @@ const generateImageStarted = (call_id: string) => frame({ interaction_update: { 
   call_id, tool_call: { generate_image_tool_call: { args: { description: "a red fox in the snow" } } },
 } } })
 
-/** A Run whose conversation holds `inputImages`, with `cursor_image_save` advertised. */
-function imageRun(frames: Frame[], inputImages: readonly Uint8Array[] = []) {
-  previousCache = getHostCacheDirOverride()
-  setHostCacheDirOverride(tempDir())
-  const workspace = tempDir()
+/**
+ * A Run whose conversation holds `inputImages`, with `cursor_image_save`
+ * advertised. `closeCleanly` ends its stream the way Cursor ends a finished Run.
+ */
+function imageRun(
+  frames: Frame[],
+  inputImages: readonly Uint8Array[] = [],
+  sessionId = "input-image-run",
+  workspace?: string,
+) {
+  if (!cacheOverridden) {
+    previousCache = getHostCacheDirOverride()
+    setHostCacheDirOverride(tempDir())
+    cacheOverridden = true
+  }
+  workspace ??= tempDir()
   const writes: Uint8Array[] = []
+  let closed = false
+  let terminal: ((event: { kind: "remote-clean-close" }) => void) | undefined
   const iterator: AsyncIterator<Frame> = {
     next: async () => {
       const value = frames.shift()
@@ -81,10 +103,13 @@ function imageRun(frames: Frame[], inputImages: readonly Uint8Array[] = []) {
   const historyImages = runHistoryImages()
   noteHistoryImagesSent(historyImages, inputImages.map(imageContentHash), 0)
   const session = sessionFixture({
-    sessionId: "input-image-run", conversationId: "input-image-conversation", openCodeSessionId: HOST_SESSION,
+    sessionId, conversationId: "input-image-conversation", openCodeSessionId: HOST_SESSION,
     stream: {
-      write(data) { writes.push(data) }, end() {}, destroy() {}, isClosed: () => false,
-      onTerminal: () => () => {},
+      write(data) { writes.push(data) }, end() {}, destroy() {}, isClosed: () => closed,
+      onTerminal: (listener) => {
+        terminal = listener as typeof terminal
+        return () => { terminal = undefined }
+      },
       frames: () => ({ [Symbol.asyncIterator]: () => iterator }),
     },
     frames: iterator, pending: new Map(), displayToolCalls: new Map(),
@@ -94,8 +119,16 @@ function imageRun(frames: Frame[], inputImages: readonly Uint8Array[] = []) {
     allowTools: true, pumpActive: false, heartbeat: null, historyImages,
     usageEstimate: { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 },
   })
-  return { session, writes, frames, assets: path.join(opencodeProjectDir(workspace), "assets") }
+  const closeCleanly = () => {
+    closed = true
+    terminal?.({ kind: "remote-clean-close" })
+  }
+  return { session, writes, frames, workspace, closeCleanly, assets: path.join(opencodeProjectDir(workspace), "assets") }
 }
+
+const writeResults = (writes: readonly Uint8Array[]) => writes
+  .map((bytes) => decodeMessage<any>("AgentClientMessage", bytes).exec_client_message?.write_result)
+  .filter(Boolean)
 
 function collect() {
   const parts: LanguageModelV3StreamPart[] = []
@@ -184,6 +217,121 @@ describe("Cursor's input-image writes", () => {
       .find(Boolean)
     expect(result.success).toMatchObject({ path: hashed, file_size: PNG_B.length })
     expect(fs.readFileSync(path.join(run.assets, "cvs.png"))).toEqual(Buffer.from(PNG_A))
+  })
+})
+
+describe("Cursor's input-image writes, which Cursor never waits for", () => {
+  it("are answered at once, and the finished save writes nothing more", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    // Answered before the host runs the save, with the path Cursor will be given.
+    const answers = writeResults(run.writes)
+    expect(answers).toHaveLength(1)
+    expect(answers[0].success).toMatchObject({ path: path.join(run.assets, "cvs.png"), lines_created: 0, file_size: PNG_A.length })
+    expect(run.session.pending.get(1)).toMatchObject({ answered: true, toolName: CURSOR_IMAGE_SAVE_TOOL })
+    expect(run.session.heartbeat).toBeNull()
+    const save = run.session.pending.get(1)!
+    const written = run.writes.length
+    expect(await deliverContinuationResults(run.session, [{
+      sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+      toolName: CURSOR_IMAGE_SAVE_TOOL, output: "Saved the generated image",
+    }])).toBe(run.session)
+    expect(save.state).toBe("delivered")
+    expect(run.writes).toHaveLength(written)
+    expect(run.session.unacknowledgedHostResults ?? []).toEqual([])
+  })
+
+  it.each(["saved", "denied"] as const)(
+    "keep a Run Cursor ended cleanly during the save, and play its reply once the save is %s",
+    async outcome => {
+      const resume = Uint8Array.of(10, 2, 4, 4)
+      const run = imageRun([
+        imageWrite(1, PNG_A), checkpoint(resume),
+        frame({ interaction_update: { text_delta: { text: "Red" } } }), ended(),
+      ], [PNG_A])
+      await pump(run.session, collect().controller, ids)
+      run.session.policy = { ...run.session.policy, heartbeatMs: 20 }
+      attachSessionHeartbeat(run.session)
+      const sent = run.writes.length
+      run.closeCleanly()
+      expect(run.session.closed).toBe(false)
+      // Nothing more is written to the ended stream, not even a heartbeat.
+      expect(run.session.heartbeat).toBeNull()
+      await new Promise((resolve) => setTimeout(resolve, run.session.policy.heartbeatMs + 50))
+      expect(run.session.closed).toBe(false)
+      expect(run.writes).toHaveLength(sent)
+      const error = outcome === "denied" ? `${IMAGE_PERMISSION_DENIED_PREFIX} rejected by the user` : undefined
+      expect(await deliverContinuationResults(run.session, [{
+        sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+        toolName: CURSOR_IMAGE_SAVE_TOOL, output: error ?? "Saved the generated image", ...(error ? { error } : {}),
+      }])).toBe(run.session)
+      const reply = collect()
+      await pump(run.session, reply.controller, ids)
+      expect(reply.parts.filter((part) => part.type === "text-delta").map((part) => part.delta)).toEqual(["Red"])
+      expect(reply.parts.find((part) => part.type === "finish")).toMatchObject({ finishReason: { unified: "stop" } })
+      expect(run.session.closed).toBe(true)
+      // The turn ended on its own checkpoint, so the next Run skips the image.
+      expect(heldHistoryImageHashes(HOST_SESSION, run.session.conversationId, resume))
+        .toEqual(new Set([imageContentHash(PNG_A)]))
+    },
+  )
+
+  it("keep the Run when Cursor ends it while the step that answered is still ending", () => {
+    const run = imageRun([], [PNG_A])
+    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, true)
+    const owner = Symbol("pump")
+    sessionManager.beginPump(run.session, owner)
+    run.closeCleanly()
+    sessionManager.endPump(run.session, owner)
+    expect(run.session.closed).toBe(false)
+    expect(sessionManager.classify(run.session.sessionId, 1)).toMatchObject({ kind: "deliverable" })
+  })
+
+  it("still close a Run Cursor ended while the host owes it a result", () => {
+    const run = imageRun([], [PNG_A])
+    sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, true)
+    sessionManager.registerPending(2, run.session, "shell_stream", "bash")
+    run.closeCleanly()
+    expect(run.session.closed).toBe(true)
+    expect(sessionManager.classify(run.session.sessionId, 1)).toMatchObject({ kind: "terminal", reason: "remote-clean-close" })
+  })
+})
+
+describe("a Run resumed after a cut", () => {
+  const unavailable = (): Frame => ({ flags: 0x02, payload: new TextEncoder().encode(JSON.stringify({ error: { code: "unavailable" } })) })
+
+  it("confirms the images the cut Run sent, which the resumed checkpoint holds", async () => {
+    const cutAt = Uint8Array.of(10, 2, 5, 5)
+    const resumedEnd = Uint8Array.of(10, 2, 6, 6)
+    const cut = imageRun([checkpoint(cutAt), frame({ interaction_update: { text_delta: { text: "partial" } } }), unavailable()], [PNG_A])
+    const resumed = imageRun([checkpoint(resumedEnd), ended()], [], "input-image-resumed", cut.workspace)
+    const recoveries: unknown[] = []
+    await pumpWithRecovery({
+      initialSession: cut.session,
+      controller: collect().controller,
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return resumed.session
+      },
+    })
+    expect(recoveries).toEqual([{ kind: "resume", conversationId: cut.session.conversationId, checkpoint: cutAt }])
+    expect(heldHistoryImageHashes(HOST_SESSION, resumed.session.conversationId, resumedEnd))
+      .toEqual(new Set([imageContentHash(PNG_A)]))
+  })
+
+  it("carries only the images sent before the checkpoint it resumes", async () => {
+    const cutAt = Uint8Array.of(10, 2, 7, 7)
+    const resumedEnd = Uint8Array.of(10, 2, 8, 8)
+    const cut = imageRun([checkpoint(cutAt), unavailable()], [])
+    const resumed = imageRun([checkpoint(resumedEnd), ended()], [], "input-image-resumed", cut.workspace)
+    await pumpWithRecovery({
+      initialSession: cut.session,
+      controller: collect().controller,
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async () => resumed.session,
+    })
+    expect(heldHistoryImageHashes(HOST_SESSION, resumed.session.conversationId, resumedEnd)).toBeUndefined()
   })
 })
 

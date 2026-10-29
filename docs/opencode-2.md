@@ -284,8 +284,10 @@ the matching tool completion. A late pre-result checkpoint cannot authorize repl
 Question, mode-switch and plan replies use the same acknowledgement guard;
 display-only todo mirrors do not wait for a second completion. Saves of
 Cursor's input-image copies, which name no call and are never completed, do
-not wait either; a generated image's save waits for its GenerateImage
-completion. Terminal drains
+not wait either; Cursor gets their reply at once, and a Run it finishes while a
+save waits for approval is kept until the save is answered. A generated image's
+save waits for its GenerateImage completion. A resumed Run counts the images
+the interrupted Run sent. Terminal drains
 recognize matching completions too. Follow-ups retain
 checkpoints received while opening the new Run. Two resumed attempts that stream without saving a
 checkpoint end the turn.

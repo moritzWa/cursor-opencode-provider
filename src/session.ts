@@ -148,6 +148,11 @@ export type PendingExec = {
    * finds this Run so the turn goes on.
    */
   aborted?: boolean
+  /**
+   * Cursor already has this exec's reply (it never waits for a copy of an input
+   * image). The host step still runs; its result writes nothing back.
+   */
+  answered?: boolean
 }
 
 export type ContinuationTerminalReason =
@@ -207,6 +212,8 @@ export type CursorSession = {
   cacheDir?: string
   /** Latest eligible checkpoint emitted by this Run attempt. */
   resumeCheckpoint?: Uint8Array
+  /** History images `resumeCheckpoint` holds: the Run's own and those sent before it arrived. */
+  resumeCheckpointImages?: string[]
   /**
    * This Run sent a user message or tool result after its last checkpoint:
    * recovery must not resume earlier state that lacks the delivered input.
@@ -594,14 +601,14 @@ export class SessionManager {
   /** Cursor withdrew this exec; returns false when it is not one the host still owes. */
   markExecAborted(session: CursorSession, execId: number): boolean {
     const pending = session.pending.get(execId)
-    if (session.closed || !pending || pending.bridged || pending.aborted || pending.state !== "pending") return false
+    if (session.closed || !pending || pending.bridged || pending.aborted || pending.answered || pending.state !== "pending") return false
     pending.aborted = true
     return true
   }
 
   /**
    * Clear pendings that do not require a Cursor exec write: display-only bridged
-   * ones and execs Cursor aborted. Used when the host starts a fresh user turn
+   * ones, execs Cursor aborted and ones it already has the reply for. Used when the host starts a fresh user turn
    * instead of returning the result (e.g. human `continue` while a todowrite
    * mirror is outstanding).
    *
@@ -611,7 +618,7 @@ export class SessionManager {
     if (session.closed) return 0
     let settled = 0
     for (const [execId, pending] of [...session.pending.entries()]) {
-      if (!pending.bridged && !pending.aborted) continue
+      if (!pending.bridged && !pending.aborted && !pending.answered) continue
       if (pending.state === "claimed") continue
       const key = this.key(session.sessionId, execId)
       this.putTombstone(key, "delivered")
@@ -685,6 +692,7 @@ export class SessionManager {
     toolName?: string,
     bridged = false,
     resultMetadata?: Record<string, unknown>,
+    answered = false,
   ): void {
     this.registerSession(session)
     if (session.closed) throw new CursorProtocolError("Cannot register a pending exec on a closed Cursor session")
@@ -696,6 +704,7 @@ export class SessionManager {
       toolName,
       bridged,
       resultMetadata,
+      ...(answered ? { answered } : {}),
       state: "pending",
       registeredAt: now,
       hardDeadlineAt: now + session.policy.hardCapMs,
@@ -718,7 +727,7 @@ export class SessionManager {
       if (
         !pending ||
         session.closed ||
-        session.stream.isClosed() ||
+        (session.stream.isClosed() && !(pending.answered && this.holdsAfterCleanClose(session))) ||
         (typeof legacyExpiresAt === "number" && this.now() >= legacyExpiresAt)
       ) {
         this.byExecId.delete(key)
@@ -788,7 +797,7 @@ export class SessionManager {
 
     let framesWritten = 0
     try {
-      if (!pending.bridged && !pending.aborted && frames.length === 0 && !options?.replyDeferred) {
+      if (!pending.bridged && !pending.aborted && !pending.answered && frames.length === 0 && !options?.replyDeferred) {
         throw new CursorProtocolError("No result frames were produced")
       }
       for (const frame of frames) {
@@ -866,9 +875,40 @@ export class SessionManager {
     session.pumpActive = false
     const deferred = session.deferredTerminalReason
     session.deferredTerminalReason = null
+    if (deferred === "remote-clean-close" && this.waitsOnlyOnAnsweredSteps(session)) {
+      this.holdAfterCleanClose(session)
+      return true
+    }
     // A Run the host stopped is closed by its cancel, after it has read what Cursor sent last.
     if (deferred && !session.hostInterrupted) this.close(session, deferred)
     return true
+  }
+
+  /**
+   * Cursor can finish its turn and close the Run cleanly while the host still
+   * runs steps whose replies Cursor already has (copies of input images, which
+   * Cursor never waits for). Its last frames are queued for the next pump, so
+   * keep the Run: the step's result then plays them instead of rebuilding a Run
+   * from host history, which would send the images again.
+   */
+  private waitsOnlyOnAnsweredSteps(session: CursorSession): boolean {
+    return !session.hostInterrupted
+      && session.pending.size > 0
+      && [...session.pending.values()].every((pending) => pending.answered)
+  }
+
+  private holdAfterCleanClose(session: CursorSession): void {
+    session.deferredTerminalReason = "remote-clean-close"
+    // Nothing can be written to an ended stream; a heartbeat would fail and close the Run.
+    if (session.heartbeatCancel) session.heartbeatCancel()
+    else if (session.heartbeat) clearInterval(session.heartbeat)
+    session.heartbeat = null
+    trace(`sessionManager: Run closed cleanly while the host finishes answered steps; keeping it for the queued frames ` +
+      `pending=${session.pending.size} queued=${session.heldFrames?.length ?? 0} sessionId=${session.sessionId}`)
+  }
+
+  private holdsAfterCleanClose(session: CursorSession): boolean {
+    return session.deferredTerminalReason === "remote-clean-close" && session.pumpOwner === null
   }
 
   /**
@@ -1004,6 +1044,10 @@ export class SessionManager {
     if (event.kind === "local-close" || session.closed) return
     const reason = event.kind === "remote-error" ? "remote-error" : "remote-clean-close"
     if (event.kind === "remote-error") session.closeError = event.error
+    if (reason === "remote-clean-close" && session.pumpOwner === null && this.waitsOnlyOnAnsweredSteps(session)) {
+      this.holdAfterCleanClose(session)
+      return
+    }
     if (session.pumpOwner !== null || session.hostInterrupted) {
       session.deferredTerminalReason = reason
       return
