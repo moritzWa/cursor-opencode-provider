@@ -20,6 +20,27 @@ import { takePendingCursorImage } from "./image-staging.js"
  */
 export const IMAGE_PERMISSION_DENIED_PREFIX = "CursorImagePermissionDenied:"
 
+/** A repeated attachment materialization needs no host write when its cache file is unchanged. */
+export function existingAttachedImage(target: string, projectDir: string, data: Uint8Array): boolean {
+  const assets = path.resolve(projectDir, "assets")
+  // Do not turn workspace writes or remapped external targets into private cache operations.
+  if (path.dirname(path.resolve(target)) !== assets) return false
+  const contained = resolveContainedImagePath(target, [projectDir])
+  if ("error" in contained) return false
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(contained.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile() || stat.size !== data.length) return false
+    return fs.readFileSync(fd).equals(data)
+  } catch {
+    // Missing, changed or unreadable files still take the ordinary permission-gated save path.
+    return false
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
+  }
+}
+
 /** The subset of OpenCode's plugin ToolContext this needs. */
 export type ImageSaveToolContext = {
   worktree: string

@@ -28,11 +28,39 @@ import {
 } from "../src/image-staging.js"
 import {
   executeCursorImageSave,
+  existingAttachedImage,
   resolveContainedImagePath,
   IMAGE_PERMISSION_DENIED_PREFIX,
 } from "../src/image-save.js"
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01])
+
+describe("unchanged input attachment cache", () => {
+  it("recognizes only existing identical asset files", () => {
+    const target = path.join(projectDir, "assets", "input.png")
+    expect(existingAttachedImage(target, projectDir, PNG)).toBe(false)
+    fs.mkdirSync(path.dirname(target))
+    fs.writeFileSync(target, PNG)
+    const before = fs.statSync(target)
+    expect(existingAttachedImage(target, projectDir, PNG)).toBe(true)
+    expect(fs.statSync(target).mtimeMs).toBe(before.mtimeMs)
+    expect(existingAttachedImage(target, projectDir, Uint8Array.of(0))).toBe(false)
+    expect(existingAttachedImage(target, projectDir, new Uint8Array(PNG.length))).toBe(false)
+    expect(existingAttachedImage(path.dirname(target), projectDir, PNG)).toBe(false)
+    const external = path.join(workspace, "input.png")
+    fs.writeFileSync(external, PNG)
+    expect(existingAttachedImage(external, projectDir, PNG)).toBe(false)
+  })
+
+  it("does not inspect an asset symlink that leaves the provider project", () => {
+    const external = path.join(workspace, "input.png")
+    fs.writeFileSync(external, PNG)
+    fs.mkdirSync(path.join(projectDir, "assets"))
+    const target = path.join(projectDir, "assets", "input.png")
+    fs.symlinkSync(external, target)
+    expect(existingAttachedImage(target, projectDir, PNG)).toBe(false)
+  })
+})
 
 let workspace: string
 let projectDir: string

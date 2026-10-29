@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
+import os from "node:os"
+import { createHash } from "node:crypto"
 import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { deliverContinuationResults, drainSessionUntilTurnEnded, pump, pumpWithRecovery, resetTurnStateForTests, settleRunSavesForTests } from "../src/language-model.js"
@@ -9,6 +11,8 @@ import { OPENCODE_1_TOOL_DIALECT, OPENCODE_2_TOOL_DIALECT, toolsToDescriptors } 
 import { readSessionFrame, sessionManager, type Frame } from "../src/session.js"
 import { setActiveCursorMode, resetActiveCursorModesForTests } from "../src/protocol/switch-mode.js"
 import { sessionFixture } from "./session-fixture.js"
+import { ensureOpencodeProjectDir, getHostCacheDirOverride, setHostCacheDirOverride } from "../src/context/paths.js"
+import { clearPendingCursorImages } from "../src/image-staging.js"
 
 function frame(message: Record<string, unknown>): Frame {
   return { flags: 0, payload: encodeMessage("AgentServerMessage", message) }
@@ -147,6 +151,63 @@ describe("parallel tool-call pump", () => {
     await pump(session, collect().controller, ids)
     expect(reads()).toBe(3)
     expect(session.pending.size).toBe(1)
+  })
+
+  it.each(["held", "checkpointed", "sent", "unknown", "changed", "missing", "workspace", "explicit"] as const)("handles cached input image writes (%s)", async state => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-attachment-replay-"))
+    const previous = getHostCacheDirOverride()
+    setHostCacheDirOverride(root)
+    try {
+      const projectDir = ensureOpencodeProjectDir(root)
+      fs.mkdirSync(path.join(projectDir, "assets"), { recursive: true })
+      const images = Array.from({ length: 8 }, (_, index) => ({
+        path: path.join(state === "workspace" ? root : path.join(projectDir, "assets"), `input-${index}.png`),
+        data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0, index),
+      }))
+      images.forEach(image => fs.writeFileSync(image.path, image.data))
+      if (state === "changed") fs.writeFileSync(images[0]!.path, "different")
+      if (state === "missing") fs.unlinkSync(images[0]!.path)
+      const { session, writes } = fixture([
+        ...images.map((image, id) => frame({ exec_server_message: { id, write_args: {
+          path: image.path, file_bytes: image.data,
+          ...(state === "explicit" ? { tool_call_id: `image-call-${id}` } : {}),
+        } } })),
+        text("answer"), ended(),
+      ])
+      session.requestContext.env = { workspace_paths: [root] }
+      session.toolCatalog = [{ name: "cursor_image_save", description: "Save an image" }]
+      session.toolDescriptors = toolsToDescriptors(session.toolCatalog, "opencode")
+      const hashes = images.map(image => createHash("sha256").update(image.data).digest("hex"))
+      session.historyImages = {
+        held: ["held", "changed", "missing", "workspace", "explicit"].includes(state) ? hashes : [],
+        checkpointed: state === "checkpointed" ? hashes : [],
+        sent: state === "sent" ? hashes.map(hash => ({ hash, afterArrival: 0 })) : [],
+      }
+      const { parts, controller } = collect()
+      await pump(session, controller, ids)
+      if (!["held", "checkpointed", "sent"].includes(state)) {
+        expect(toolCalls(parts).map(part => part.toolName)).toEqual(["cursor_image_save"])
+        expect(session.pending.size).toBe(1)
+        return
+      }
+      expect(toolCalls(parts)).toHaveLength(0)
+      expect(finishes(parts).map(part => part.finishReason.unified)).toEqual(["stop"])
+      expect(parts.filter(part => part.type === "text-delta").map(part => part.delta)).toEqual(["answer"])
+      expect(session.pending.size).toBe(0)
+      const replies = writes.map(bytes => decodeMessage<{ exec_client_message?: {
+        id: number; write_result?: { success?: { path: string; file_size: number } }
+      } }>("AgentClientMessage", bytes).exec_client_message).filter(reply => reply?.write_result)
+      expect(replies).toHaveLength(8)
+      replies.forEach((reply, index) => expect(reply?.write_result?.success).toMatchObject({
+        path: images[index]!.path, file_size: images[index]!.data.length,
+      }))
+    } finally {
+      sessionManager.dispose()
+      await settleRunSavesForTests()
+      clearPendingCursorImages()
+      setHostCacheDirOverride(previous)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it.each([false, true])("counts a streamed edit only after its write (patch catalog: %s)", async patch => {

@@ -249,6 +249,8 @@ an event subscription that fails during startup does not retain that ownership.
 
 Generated-image saving uses the same handle-only `cursor_image_save` tool on classic and OpenCode 2.x. Classic/OCP surfaces raise `external_directory` then `edit` before the write. Stock OpenCode 2.x has no public `ask` on its tool context, so the 2.x entrypoint advertises the tool with `permission: "edit"` (agents that deny edits do not get it) and, before writing, asserts `external_directory` and `edit` on the actual target through the plugin's `ctx.permission.assert`; without that API the save is refused. The id is opaque, so the model cannot write arbitrary files.
 
+Cursor also writes input attachments into its assets cache. Repeated writes of a known input are acknowledged without another host tool step when that exact file already contains the same bytes. This fast path writes nothing, applies only to uncorrelated attachment writes in the provider cache, and leaves new files, changed files and explicit model writes on the permission-gated path. It does not remove images from Cursor's context or change checkpoint/upload deduplication.
+
 ## Task attachments
 
 Cursor Task attachments reach the native `subagent` prompt as exact, quoted

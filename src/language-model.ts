@@ -206,7 +206,7 @@ import {
   remapCursorImageWritePath,
 } from "./protocol/generate-image.js"
 import { stageCursorImage } from "./image-staging.js"
-import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
+import { existingAttachedImage, IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
 import { checkpointTokenDetails, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
   EarlyToolRows,
@@ -6295,6 +6295,25 @@ export async function pump(
             }
             const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
             const projectDir = ensureOpencodeProjectDir(workspaceRoot)
+            // Cursor also writes input attachments back into its assets directory on
+            // later Runs. Those are not generated images. A known input already on
+            // disk needs only the wire acknowledgement, not another host tool step.
+            const hash = createHash("sha256").update(binaryWrite.data).digest("hex")
+            const inputImage = session.historyImages?.held.includes(hash)
+              || session.historyImages?.checkpointed.includes(hash)
+              || session.historyImages?.sent.some(image => image.hash === hash)
+            if (!displayCallId && inputImage && existingAttachedImage(binaryWrite.path, projectDir, binaryWrite.data)) {
+              if (!await writeExecFrames([encodeMessage("AgentClientMessage", {
+                exec_client_message: {
+                  id: parsed.id,
+                  write_result: { success: {
+                    path: binaryWrite.path, lines_created: 0, file_size: binaryWrite.data.length,
+                  } },
+                },
+              })], `acknowledge cached attachment id=${parsed.id}`)) return
+              trace(`exec: cached attachment unchanged id=${parsed.id} bytes=${binaryWrite.data.length}`)
+              continue
+            }
             const target = remapCursorImageWritePath(binaryWrite.path, {
               workspaceRoot,
               projectDir,
