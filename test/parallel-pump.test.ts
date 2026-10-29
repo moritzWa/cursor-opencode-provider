@@ -153,20 +153,24 @@ describe("parallel tool-call pump", () => {
     expect(session.pending.size).toBe(1)
   })
 
-  it.each(["held", "checkpointed", "sent", "unknown", "changed", "missing", "workspace", "explicit"] as const)("handles cached input image writes (%s)", async state => {
+  const inputImageCases: string[] = [
+    "held", "checkpointed", "sent", "stored", "same-name", "unknown", "workspace", "explicit",
+  ]
+  it.each(inputImageCases)("handles Cursor's input image writes (%s)", async state => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-attachment-replay-"))
     const previous = getHostCacheDirOverride()
     setHostCacheDirOverride(root)
     try {
-      const projectDir = ensureOpencodeProjectDir(root)
-      fs.mkdirSync(path.join(projectDir, "assets"), { recursive: true })
+      const assets = path.join(ensureOpencodeProjectDir(root), "assets")
+      const sameName = state === "same-name"
       const images = Array.from({ length: 8 }, (_, index) => ({
-        path: path.join(state === "workspace" ? root : path.join(projectDir, "assets"), `input-${index}.png`),
+        path: path.join(state === "workspace" ? root : assets, sameName ? "cvs.png" : `input-${index}.png`),
         data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0, index),
       }))
-      images.forEach(image => fs.writeFileSync(image.path, image.data))
-      if (state === "changed") fs.writeFileSync(images[0]!.path, "different")
-      if (state === "missing") fs.unlinkSync(images[0]!.path)
+      if (["held", "checkpointed", "sent"].includes(state)) {
+        fs.mkdirSync(assets, { recursive: true })
+        images.forEach(image => fs.writeFileSync(image.path, image.data))
+      }
       const { session, writes } = fixture([
         ...images.map((image, id) => frame({ exec_server_message: { id, write_args: {
           path: image.path, file_bytes: image.data,
@@ -179,13 +183,13 @@ describe("parallel tool-call pump", () => {
       session.toolDescriptors = toolsToDescriptors(session.toolCatalog, "opencode")
       const hashes = images.map(image => createHash("sha256").update(image.data).digest("hex"))
       session.historyImages = {
-        held: ["held", "changed", "missing", "workspace", "explicit"].includes(state) ? hashes : [],
+        held: state === "checkpointed" || state === "sent" || state === "unknown" ? [] : hashes,
         checkpointed: state === "checkpointed" ? hashes : [],
         sent: state === "sent" ? hashes.map(hash => ({ hash, afterArrival: 0 })) : [],
       }
       const { parts, controller } = collect()
       await pump(session, controller, ids)
-      if (!["held", "checkpointed", "sent"].includes(state)) {
+      if (["unknown", "workspace", "explicit"].includes(state)) {
         expect(toolCalls(parts).map(part => part.toolName)).toEqual(["cursor_image_save"])
         expect(session.pending.size).toBe(1)
         return
@@ -198,9 +202,15 @@ describe("parallel tool-call pump", () => {
         id: number; write_result?: { success?: { path: string; file_size: number } }
       } }>("AgentClientMessage", bytes).exec_client_message).filter(reply => reply?.write_result)
       expect(replies).toHaveLength(8)
-      replies.forEach((reply, index) => expect(reply?.write_result?.success).toMatchObject({
-        path: images[index]!.path, file_size: images[index]!.data.length,
-      }))
+      replies.forEach((reply, index) => {
+        const stored = reply!.write_result!.success!.path
+        expect(path.dirname(stored)).toBe(assets)
+        expect(reply!.write_result!.success!.file_size).toBe(images[index]!.data.length)
+        expect(fs.readFileSync(stored)).toEqual(Buffer.from(images[index]!.data))
+        if (!sameName) expect(stored).toBe(images[index]!.path)
+      })
+      // Eight different images named cvs.png each keep their own file.
+      if (sameName) expect(new Set(replies.map(reply => reply!.write_result!.success!.path)).size).toBe(8)
     } finally {
       sessionManager.dispose()
       await settleRunSavesForTests()
