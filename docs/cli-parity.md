@@ -18,6 +18,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 | ConversationActions | 15 oneof actions + 3 metadata fields (`triggering_auth_id`, `triggering_user_info`, `request_context_parts`): user_message, resume, cancel, summarize, shell_command, start/execute_plan, async_ask_question_completion, cancel_subagent, background_task/shell/subagent, subscription_notification, goal_continuation, inject_context | Schema encodes 5: user_message, resume, cancel, async_ask_question_completion, inject_context (`user_context` payload for host notes and early steers) — summarize emulated via compaction marker | 🔶 |
 | Sparse protobuf decode w/ full schema | Native protobuf | Hand-rolled `struct.ts` sparse decoder + full schema table (`messages.ts`) | ✅ |
 | Checksums / framing / device id / client-version | Yes | Yes (`checksum.ts`, `framing.ts`, `device-id.ts`, `client-version.ts`) | ✅ |
+| Run response compression | Accepts gzip and br (connect-es `acceptCompression`) | Accepts gzip only, the one encoding `decodeFramePayload` inflates; Cursor answers in the request's encoding or the first accepted one | 🔶 |
 | Response-required write backpressure + heartbeat | Yes (blocks on heartbeats) | Yes (serialized drain-await without an upload deadline; terminal/cancellation settlement and heartbeat replies) | ✅ |
 
 ## Tools (exec requests) — `src/protocol/exec-variants.ts`

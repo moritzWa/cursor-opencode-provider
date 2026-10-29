@@ -829,7 +829,8 @@ export async function bidiRunStream(
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
-    "connect-accept-encoding": "gzip,br",
+    // decodeFramePayload only inflates gzip.
+    "connect-accept-encoding": "gzip",
     ...(compress ? { "connect-content-encoding": "gzip" } : {}),
     // The CLI's streaming interceptor sets this on the bidi Run stream
     // (decompiled client.ts:1190). Without it Cursor may treat the stream as
