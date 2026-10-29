@@ -14,6 +14,7 @@ import { bidiRunStream, closeCachedHttp2SessionsForTests, getSession } from "../
 const CONNECT_MODULE = pathToFileURL(path.resolve(import.meta.dir, "../src/transport/connect.ts")).href
 
 const PRELUDE = `
+import { randomBytes } from "node:crypto"
 import http2 from "node:http2"
 import { bidiRunStream, cacheHttp2SessionForTests } from ${JSON.stringify(CONNECT_MODULE)}
 
@@ -102,7 +103,7 @@ console.log("done")
 // session is released; a plain close() never closes it.
 const destroyedRun = (bytes: number, close: "destroy" | "end" | "end-then-destroy" = "destroy") => childScript(`function onServerStream(stream) { stream.pause() }`, `
 const run = await bidiRunStream("token", { baseURL: ORIGIN })
-run.write(new Uint8Array(${bytes}).fill(5))
+run.write(new Uint8Array(randomBytes(${bytes})))
 await serverStream(1)
 await new Promise((resolve) => setTimeout(resolve, 200))
 ${close !== "destroy" ? "run.end()" : ""}

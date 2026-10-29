@@ -420,6 +420,8 @@ export type CursorSession = {
   /** The host stopped the turn (OpenCode 2 interrupt); the Run is being cancelled and must not be continued. */
   hostInterrupted?: string
   reopenWithUserMessage?: (text: string, signal?: AbortSignal) => Promise<void>
+  /** Send the current Run's request again on a new stream, which goes uncompressed once Cursor refused gzip. */
+  resendRunRequest?: (signal?: AbortSignal) => Promise<void>
 }
 
 export function stoppedWith(session: CursorSession): string | undefined {

@@ -1,5 +1,5 @@
 import { CURSOR_API_HOST, CONNECT_PROTOCOL_VERSION, SERVER_CONFIG_PATH } from "../shared.js"
-import { encodeFrame, streamFrames } from "../protocol/framing.js"
+import { decodeFramePayload, encodeFrame, encodeGzipFrame, FLAG_END_STREAM, streamFrames } from "../protocol/framing.js"
 import { createCursorChecksumHeader } from "../protocol/checksum.js"
 import { getDeviceIds } from "../protocol/device-id.js"
 import { resolveClientVersion } from "../protocol/client-version.js"
@@ -14,6 +14,7 @@ import {
   CursorProviderError,
 } from "../errors.js"
 import { withAbortDeadline } from "../deadline.js"
+import { processShared } from "../process-shared.js"
 import http2 from "node:http2"
 import type { TLSSocket } from "node:tls"
 import { openProxiedTlsSocket, proxyEndpoint, resolveHttpsProxyUrl } from "./https-proxy.js"
@@ -253,8 +254,63 @@ export async function fetchAgentUrl(
 
 // ── Bidi (Run stream) ──
 
+// Cursor CLI sends Run messages with connect-es `sendCompression: gzip` and its default `compressMinBytes`.
+export const RUN_COMPRESS_MIN_BYTES = 1024
+// Origins that refused a gzip Run; their later Runs go uncompressed for the rest of the process.
+const uncompressedRunOrigins = processShared("connect.uncompressed-run-origins.v1", () => new Set<string>())
+
+/**
+ * Cursor could not take a gzip-compressed Run: HTTP 415, `unimplemented` (how Connect and gRPC
+ * refuse an unsupported encoding), or `invalid_argument`/`internal` naming the compression.
+ */
+export function isCompressionRejection(status: { httpStatus?: number; code?: string; message?: string }): boolean {
+  if (status.httpStatus === 415) return true
+  const code = status.code?.toLowerCase().replaceAll("-", "_")
+  if (code === "unimplemented" || code === "12") return true
+  return (code === "invalid_argument" || code === "internal" || code === "3" || code === "13")
+    && /compress|gzip|encoding/i.test(status.message ?? "")
+}
+
+function endStreamStatus(frame: { flags: number; payload: Uint8Array }): { code?: string; message?: string } {
+  try {
+    const { error } = JSON.parse(new TextDecoder().decode(decodeFramePayload(frame))) as {
+      error?: { code?: unknown; message?: unknown }
+    }
+    return {
+      code: typeof error?.code === "string" ? error.code : undefined,
+      message: typeof error?.message === "string" ? error.message : undefined,
+    }
+  } catch {
+    return {}
+  }
+}
+
+const gzipRunFrame = (msg: Uint8Array) => encodeGzipFrame(msg).catch((cause: unknown) => {
+  trace(`Run compression: gzip failed (${cause instanceof Error ? cause.message : String(cause)}); sending the message uncompressed`)
+  return encodeFrame(0x00, msg)
+})
+const compressedAhead = new WeakMap<Uint8Array, Uint8Array>()
+
+/**
+ * Compress a Run's opening request before its stream opens. The stream then writes it at once, so a refusal
+ * or HTTP error can only arrive after it went out and still reaches the registered Run.
+ */
+export async function compressRunRequestAhead(request: Uint8Array): Promise<void> {
+  if (request.length >= RUN_COMPRESS_MIN_BYTES && !compressedAhead.has(request)) {
+    compressedAhead.set(request, await gzipRunFrame(request))
+  }
+}
+
+export function resetRunCompressionForTests(...uncompressedOrigins: string[]): void {
+  uncompressedRunOrigins.clear()
+  for (const origin of uncompressedOrigins) uncompressedRunOrigins.add(origin)
+}
+
 export type BidiStream = {
-  write(msg: Uint8Array): boolean | void
+  /** A promise while the message waits for compression, its own or an earlier one's; false when backpressured. */
+  write(msg: Uint8Array): boolean | void | Promise<boolean>
+  /** Cursor refused this Run for its gzip compression; the origin's later Runs go uncompressed. */
+  compressionRejected?(): boolean
   /**
    * Resolves once a backpressured write has drained. There is no deadline, as
    * in Cursor CLI's transport: a stream error or close (remote or local) settles
@@ -768,12 +824,31 @@ export async function bidiRunStream(
     getSession(options.baseURL, { pingTimeoutMs: options.pingTimeoutMs }),
     resolveClientVersion(),
   ])
+  const compress = !uncompressedRunOrigins.has(origin)
+  let compressionRejected = false
+  const noteCompressionStatus = (status: Parameters<typeof isCompressionRejection>[0]) => {
+    if (!compress || compressionRejected || !isCompressionRejection(status)) return
+    compressionRejected = true
+    uncompressedRunOrigins.add(origin)
+    trace(`Run compression: Cursor refused a gzip Run ${JSON.stringify(status)}; later Runs to ${origin} go uncompressed`)
+  }
+  const noteCompressionHeaders = (h: Record<string, unknown>) => {
+    const grpcStatus = h["grpc-status"]
+    const grpcMessage = h["grpc-message"]
+    noteCompressionStatus({
+      httpStatus: h[":status"] === undefined ? undefined : Number(h[":status"]),
+      code: grpcStatus === undefined ? undefined : String(grpcStatus),
+      message: grpcMessage === undefined ? undefined : String(grpcMessage),
+    })
+  }
   const headers = {
     ...buildBaseHeaders(token, clientVersion, options.headers),
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
-    "connect-accept-encoding": "gzip,br",
+    // decodeFramePayload only inflates gzip.
+    "connect-accept-encoding": "gzip",
+    ...(compress ? { "connect-content-encoding": "gzip" } : {}),
     // The CLI's streaming interceptor sets this on the bidi Run stream
     // (decompiled client.ts:1190). Without it Cursor may treat the stream as
     // non-streaming.
@@ -947,6 +1022,7 @@ export async function bidiRunStream(
     if (consumed < merged.length) pendingChunks.push(merged.subarray(consumed))
     for (const frame of parsed) {
       frameArrivals.set(frame, ++lastArrival)
+      if (compress && frame.flags & FLAG_END_STREAM) noteCompressionStatus(endStreamStatus(frame))
       enqueueFrame(frame)
     }
   }
@@ -964,10 +1040,12 @@ export async function bidiRunStream(
     responseHeaders = h
     responseStatus = h[":status"] !== undefined ? Number(h[":status"]) : 0
     trace(`h2 response: status=${responseStatus} headers=${JSON.stringify(stripPseudo(h))}`)
+    noteCompressionHeaders(h)
   })
   stream.on("trailers", (h: Record<string, unknown>) => {
     responseTrailers = h
     trace(`h2 trailers: ${JSON.stringify(stripPseudo(h))}`)
+    noteCompressionHeaders(h)
   })
   stream.on("error", (err: Error) => {
     writable = false
@@ -1040,28 +1118,52 @@ export async function bidiRunStream(
 
   startInboundReader()
 
+  const assertWritable = () => {
+    if (!writable || remotelyClosed || stream.closed || stream.destroyed) {
+      if (locallyClosed) {
+        throw new CursorLocalCancellationError("Cursor Run stream is closed locally")
+      }
+      throw observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream is no longer writable")
+    }
+  }
+  const writeFrame = (frame: Uint8Array): boolean => {
+    try {
+      const accepted = stream.write(frame)
+      backpressured = !accepted
+      return accepted
+    } catch (cause) {
+      rawStreamError = cause
+      streamFailure = toTransportError(cause, "Cursor Run stream write failed")
+      streamFailure.replaySafe = false
+      writable = false
+      scheduleTerminalSettlement()
+      throw streamFailure
+    }
+  }
+  // Messages go out in write order: one written while another compresses waits behind it.
+  let queuedWrites: Promise<boolean> | undefined
+
   return {
     write(msg: Uint8Array) {
-      if (!writable || remotelyClosed || stream.closed || stream.destroyed) {
-        if (locallyClosed) {
-          throw new CursorLocalCancellationError("Cursor Run stream is closed locally")
-        }
-        throw observedFailure() ?? new CursorRunInterruptedError("Cursor Run stream is no longer writable")
+      assertWritable()
+      const gzip = compress && msg.length >= RUN_COMPRESS_MIN_BYTES
+      const ready = gzip ? compressedAhead.get(msg) : undefined
+      if ((!gzip || ready) && !queuedWrites) return writeFrame(ready ?? encodeFrame(0x00, msg))
+      const queued = Promise.resolve(queuedWrites).catch(() => false).then(async () => {
+        const frame = gzip ? await gzipRunFrame(msg) : encodeFrame(0x00, msg)
+        if (locallyClosed) throw new CursorLocalCancellationError("Cursor Run stream is closed locally")
+        // Cursor ended the Run meanwhile. As for a message buffered just before that, the Run's own error reports it.
+        if (!writable || remotelyClosed || stream.closed || stream.destroyed) return true
+        return writeFrame(frame)
+      })
+      queuedWrites = queued
+      const settled = () => {
+        if (queuedWrites === queued) queuedWrites = undefined
       }
-      const frame = encodeFrame(0x00, msg)
-      try {
-        const accepted = stream.write(frame)
-        backpressured = !accepted
-        return accepted
-      } catch (cause) {
-        rawStreamError = cause
-        streamFailure = toTransportError(cause, "Cursor Run stream write failed")
-        streamFailure.replaySafe = false
-        writable = false
-        scheduleTerminalSettlement()
-        throw streamFailure
-      }
+      queued.then(settled, settled)
+      return queued
     },
+    compressionRejected: () => compressionRejected,
     waitForDrain() {
       if (!backpressured) return Promise.resolve()
       if (terminalEvent) return Promise.reject(drainTerminalError(terminalEvent))
@@ -1113,7 +1215,7 @@ export async function bidiRunStream(
       settleTerminal({ kind: "local-close" })
       // A blocked write cannot finish gracefully; discard it rather than leave
       // its stream and session referenced after the drain has been rejected.
-      if (backpressured) closeLocally()
+      if (backpressured || queuedWrites) closeLocally()
       else stream.end()
     },
     async *frames() {
