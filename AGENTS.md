@@ -242,6 +242,10 @@ The **1.18 v2** API and **OpenCode 2.x** are source-incompatible:
   staged; the save step stays `answered` (not owed, no heartbeat, writes
   nothing). A clean close while only answered steps remain keeps the Run and its
   queued frames for the step's result to play; anything owed still closes it.
+  A Run Cursor ended (`isClosed()`, which includes a finished response before
+  the stream closes) takes no further replies or injected notes; notes wait
+  for the next user turn. A declined or failed copy gets a note that the file
+  does not exist.
 - A Run resuming a checkpoint carries the images that checkpoint holds
   (`resumeCheckpointImages`) as checkpointed, confirmed by its own turn end.
 - Carry an uncheckpointed request only on its unchanged checkpoint; persist it

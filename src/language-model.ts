@@ -875,6 +875,13 @@ function imageWriteSuccessFrame(execId: number, path: string, bytes: number): Ui
   })
 }
 
+/** Tells the model a copy of an input image it was given a path for is not on disk. */
+function unsavedInputImageNote(savedPath: string, error: string): string {
+  const reason = error.replace(`${IMAGE_PERMISSION_DENIED_PREFIX} `, "").trim() || "the save failed"
+  return `The copy of an attached image at ${savedPath} was not saved (${reason}), so that file does not exist. `
+    + "The image itself is still in this conversation."
+}
+
 /** The one GenerateImage call Cursor has started and not yet completed, if exactly one. */
 function openGenerateImageCallId(session: CursorSession): string | undefined {
   let found: string | undefined
@@ -3901,6 +3908,11 @@ async function deliverContinuationResultsNow(
     } else if (pending.answered) {
       trace(`continuation: Cursor already has the reply for execId=${r.execId} tool=${pending.toolName}; ` +
         `writing nothing failed=${r.error !== undefined}`)
+      // Cursor was told the copy was saved before the host asked; say when it was not.
+      const savedPath = pending.resultMetadata?.path
+      if (r.error !== undefined && pending.resultMetadata?.inputImage === true && typeof savedPath === "string") {
+        stepNotes.push(unsavedInputImageNote(savedPath, r.error))
+      }
     } else if (!pending.bridged) {
       try {
         const shellResult = isShellResultField(pending.resultField)
@@ -4181,6 +4193,13 @@ async function deliverContinuationResultsNow(
     if (deliveredResults === 0) {
       // Every result of this step was already delivered, and its notes with it.
       trace(`continuation: host notes belong to an already delivered step; not injected again count=${stepNotes.length}`)
+    } else if (session.stream.isClosed()) {
+      // Cursor ended the Run while the host ran answered steps; its reply is
+      // queued and its turn is over, so the notes ride the next user turn.
+      if (session.openCodeSessionId) {
+        appendUndeliveredHostNotes(session.openCodeSessionId, [{ notes: stepNotes, order: nextHostNoteOrder++ }])
+      }
+      trace(`continuation: Run already ended; kept ${stepNotes.length} host note(s) for the next user turn`)
     } else if (!(await injectHostNotes(session, stepNotes))) {
       return undefined
     }
@@ -6422,12 +6441,19 @@ export async function pump(
             // permission-gated save still runs as the host step and writes nothing back.
             if (inputImage) {
               const beforeReply = lastFrameArrival()
-              if (!session.stream.isClosed()) {
-                if (!await writeExecFrames(
-                  [imageWriteSuccessFrame(parsed.id, target, binaryWrite.data.length)],
-                  `answer input image write id=${parsed.id}`,
-                )) return
-                invalidateResumeCheckpoint(session, beforeReply, true)
+              try {
+                // A Run Cursor already ended (its frames queued while the host
+                // saved an earlier image) cannot take the reply, and needs none.
+                if (!session.stream.isClosed()) {
+                  if (!await writeExecFrames(
+                    [imageWriteSuccessFrame(parsed.id, target, binaryWrite.data.length)],
+                    `answer input image write id=${parsed.id}`,
+                  )) return
+                  invalidateResumeCheckpoint(session, beforeReply, true)
+                }
+              } catch (error) {
+                if (!session.stream.isClosed()) throw error
+                trace(`exec: Cursor ended the Run before the input-image reply id=${parsed.id}; it never reads it`)
               }
               trace(`recovery: input-image write answered at once; Cursor neither waits for nor completes it execId=${parsed.id}`)
             }

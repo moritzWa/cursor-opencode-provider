@@ -14,6 +14,7 @@ import {
 import {
   attachSessionHeartbeat,
   deliverContinuationResults,
+  releaseHostNoteInjectionsForTests,
   pump,
   pumpWithRecovery,
   resetTurnStateForTests,
@@ -31,6 +32,7 @@ import {
 } from "../src/protocol/sent-history-images.js"
 import { toolsToDescriptors } from "../src/protocol/tools.js"
 import { sessionManager, type Frame } from "../src/session.js"
+import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { sessionFixture } from "./session-fixture.js"
 
 const HOST_SESSION = "ses_input_image"
@@ -76,7 +78,9 @@ const generateImageStarted = (call_id: string) => frame({ interaction_update: { 
 
 /**
  * A Run whose conversation holds `inputImages`, with `cursor_image_save`
- * advertised. `closeCleanly` ends its stream the way Cursor ends a finished Run.
+ * advertised. `closeCleanly` ends its stream the way Cursor ends a finished Run;
+ * after `endWithoutNotice`, the next write fails as on a stream Cursor ended
+ * before the provider noticed.
  */
 function imageRun(
   frames: Frame[],
@@ -92,6 +96,7 @@ function imageRun(
   workspace ??= tempDir()
   const writes: Uint8Array[] = []
   let closed = false
+  let endedUnnoticed = false
   let terminal: ((event: { kind: "remote-clean-close" }) => void) | undefined
   const iterator: AsyncIterator<Frame> = {
     next: async () => {
@@ -105,7 +110,14 @@ function imageRun(
   const session = sessionFixture({
     sessionId, conversationId: "input-image-conversation", openCodeSessionId: HOST_SESSION,
     stream: {
-      write(data) { writes.push(data) }, end() {}, destroy() {}, isClosed: () => closed,
+      write(data) {
+        if (endedUnnoticed) {
+          closed = true
+          throw new CursorRunInterruptedError("Cursor Run stream is no longer writable")
+        }
+        writes.push(data)
+      },
+      end() {}, destroy() {}, isClosed: () => closed,
       onTerminal: (listener) => {
         terminal = listener as typeof terminal
         return () => { terminal = undefined }
@@ -123,7 +135,11 @@ function imageRun(
     closed = true
     terminal?.({ kind: "remote-clean-close" })
   }
-  return { session, writes, frames, workspace, closeCleanly, assets: path.join(opencodeProjectDir(workspace), "assets") }
+  const endWithoutNotice = () => { endedUnnoticed = true }
+  return {
+    session, writes, frames, workspace, closeCleanly, endWithoutNotice,
+    assets: path.join(opencodeProjectDir(workspace), "assets"),
+  }
 }
 
 const writeResults = (writes: readonly Uint8Array[]) => writes
@@ -275,6 +291,71 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
         .toEqual(new Set([imageContentHash(PNG_A)]))
     },
   )
+
+  const injectedNotes = (writes: readonly Uint8Array[]) => writes
+    .map((bytes) => decodeMessage<any>("AgentClientMessage", bytes).conversation_action?.inject_context_action)
+    .filter(Boolean)
+    .map((action) => action.user_context.user_message.text as string)
+
+  it.each(["ended", "ending unnoticed"] as const)(
+    "answer a later image's copy queued in a Run Cursor %s, without writing to it",
+    async (state) => {
+      const run = imageRun([
+        imageWrite(1, PNG_A), imageWrite(2, PNG_B, "/elsewhere/assets/other.png"),
+        frame({ interaction_update: { text_delta: { text: "Two" } } }), ended(),
+      ], [PNG_A, PNG_B])
+      await pump(run.session, collect().controller, ids)
+      if (state === "ended") run.closeCleanly()
+      else run.endWithoutNotice()
+      expect(await deliverContinuationResults(run.session, [{
+        sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+        toolName: CURSOR_IMAGE_SAVE_TOOL, output: "Saved the generated image",
+      }])).toBe(run.session)
+      const second = collect()
+      await pump(run.session, second.controller, ids)
+      expect(second.parts.find((part) => part.type === "tool-call")).toMatchObject({ toolName: CURSOR_IMAGE_SAVE_TOOL })
+      expect(run.session.pending.get(2)).toMatchObject({ answered: true })
+      expect(writeResults(run.writes)).toHaveLength(1)
+      if (state === "ending unnoticed") return
+      expect(await deliverContinuationResults(run.session, [{
+        sessionId: run.session.sessionId, execId: 2, toolCallId: "cursor_input-image-run_2",
+        toolName: CURSOR_IMAGE_SAVE_TOOL, output: "Saved the generated image",
+      }])).toBe(run.session)
+      const reply = collect()
+      await pump(run.session, reply.controller, ids)
+      expect(reply.parts.filter((part) => part.type === "text-delta").map((part) => part.delta)).toEqual(["Two"])
+      expect(reply.parts.find((part) => part.type === "finish")).toMatchObject({ finishReason: { unified: "stop" } })
+    },
+  )
+
+  it("tell the model a declined copy is not on disk, in the running turn", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    const denial = `${IMAGE_PERMISSION_DENIED_PREFIX} rejected by the user`
+    expect(await deliverContinuationResults(run.session, [{
+      sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+      toolName: CURSOR_IMAGE_SAVE_TOOL, output: denial, error: denial,
+    }])).toBe(run.session)
+    expect(injectedNotes(run.writes)).toEqual([
+      `The copy of an attached image at ${path.join(run.assets, "cvs.png")} was not saved (rejected by the user), `
+        + "so that file does not exist. The image itself is still in this conversation.",
+    ])
+  })
+
+  it("tell the model a declined copy is not on disk on the next turn, once Cursor ended the Run", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    run.closeCleanly()
+    const denial = `${IMAGE_PERMISSION_DENIED_PREFIX} rejected by the user`
+    expect(await deliverContinuationResults(run.session, [{
+      sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+      toolName: CURSOR_IMAGE_SAVE_TOOL, output: denial, error: denial,
+    }])).toBe(run.session)
+    expect(injectedNotes(run.writes)).toEqual([])
+    expect(releaseHostNoteInjectionsForTests(HOST_SESSION).undelivered).toEqual([
+      expect.stringContaining(`${path.join(run.assets, "cvs.png")} was not saved (rejected by the user)`),
+    ])
+  })
 
   it("keep the Run when Cursor ends it while the step that answered is still ending", () => {
     const run = imageRun([], [PNG_A])
