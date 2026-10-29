@@ -81,6 +81,22 @@ describe("input image materialization", () => {
     expect(fs.readFileSync(external)).toEqual(Buffer.from(PNG))
   })
 
+  it("leaves a target that is not a regular file to the permission-gated save", () => {
+    fs.mkdirSync(path.join(assets(), "taken.png"), { recursive: true })
+    expect(materializeAttachedImage(path.join(assets(), "taken.png"), projectDir, PNG)).toBeUndefined()
+  })
+
+  it.skipIf(process.getuid?.() === 0)("falls back to the permission-gated save when the cache cannot be written", () => {
+    fs.mkdirSync(assets())
+    fs.chmodSync(assets(), 0o500)
+    try {
+      expect(materializeAttachedImage(path.join(assets(), "input.png"), projectDir, PNG)).toBeUndefined()
+    } finally {
+      fs.chmodSync(assets(), 0o700)
+    }
+    expect(fs.readdirSync(assets())).toHaveLength(0)
+  })
+
   it("does not write through an assets directory that is a symlink out of the project", () => {
     fs.symlinkSync(workspace, assets())
     expect(materializeAttachedImage(path.join(assets(), "input.png"), projectDir, PNG)).toBeUndefined()
