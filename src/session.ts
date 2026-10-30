@@ -214,6 +214,8 @@ export type CursorSession = {
   resumeCheckpoint?: Uint8Array
   /** History images `resumeCheckpoint` holds: the Run's own and those sent before it arrived. */
   resumeCheckpointImages?: string[]
+  /** An answered step's result was delivered; the next pump plays what Cursor queued meanwhile. */
+  answeredContinuation?: boolean
   /**
    * This Run sent a user message or tool result after its last checkpoint:
    * recovery must not resume earlier state that lacks the delivered input.
@@ -727,7 +729,9 @@ export class SessionManager {
       if (
         !pending ||
         session.closed ||
-        (session.stream.isClosed() && !(pending.answered && this.holdsAfterCleanClose(session))) ||
+        // Cursor never waits for an answered step, so its result writes nothing
+        // and needs no live stream, also before the end has been announced.
+        (session.stream.isClosed() && !pending.answered) ||
         (typeof legacyExpiresAt === "number" && this.now() >= legacyExpiresAt)
       ) {
         this.byExecId.delete(key)
@@ -827,6 +831,7 @@ export class SessionManager {
     }
 
     pending.state = "delivered"
+    if (pending.answered) session.answeredContinuation = true
     this.putTombstone(key, "delivered")
     session.pending.delete(execId)
     this.byExecId.delete(key)
@@ -863,6 +868,7 @@ export class SessionManager {
     }
     session.pumpOwner = owner
     session.pumpActive = true
+    session.answeredContinuation = undefined
   }
 
   isPumpOwner(session: CursorSession, owner: symbol): boolean {
@@ -875,7 +881,7 @@ export class SessionManager {
     session.pumpActive = false
     const deferred = session.deferredTerminalReason
     session.deferredTerminalReason = null
-    if (deferred === "remote-clean-close" && this.waitsOnlyOnAnsweredSteps(session)) {
+    if (deferred === "remote-clean-close" && this.holdsOnlyAnsweredWork(session)) {
       this.holdAfterCleanClose(session)
       return true
     }
@@ -891,10 +897,11 @@ export class SessionManager {
    * keep the Run: the step's result then plays them instead of rebuilding a Run
    * from host history, which would send the images again.
    */
-  private waitsOnlyOnAnsweredSteps(session: CursorSession): boolean {
-    return !session.hostInterrupted
-      && session.pending.size > 0
-      && [...session.pending.values()].every((pending) => pending.answered)
+  private holdsOnlyAnsweredWork(session: CursorSession): boolean {
+    if (session.hostInterrupted) return false
+    // Delivered, with the pump that plays Cursor's queued frames still to come.
+    if (session.pending.size === 0) return !!session.answeredContinuation
+    return [...session.pending.values()].every((pending) => pending.answered)
   }
 
   private holdAfterCleanClose(session: CursorSession): void {
@@ -907,9 +914,7 @@ export class SessionManager {
       `pending=${session.pending.size} queued=${session.heldFrames?.length ?? 0} sessionId=${session.sessionId}`)
   }
 
-  private holdsAfterCleanClose(session: CursorSession): boolean {
-    return session.deferredTerminalReason === "remote-clean-close" && session.pumpOwner === null
-  }
+
 
   /**
    * Swap the live bidi Run while a pump is still pulling frames.
@@ -1044,7 +1049,7 @@ export class SessionManager {
     if (event.kind === "local-close" || session.closed) return
     const reason = event.kind === "remote-error" ? "remote-error" : "remote-clean-close"
     if (event.kind === "remote-error") session.closeError = event.error
-    if (reason === "remote-clean-close" && session.pumpOwner === null && this.waitsOnlyOnAnsweredSteps(session)) {
+    if (reason === "remote-clean-close" && session.pumpOwner === null && this.holdsOnlyAnsweredWork(session)) {
       this.holdAfterCleanClose(session)
       return
     }

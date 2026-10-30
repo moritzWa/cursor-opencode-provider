@@ -4,12 +4,14 @@ import os from "node:os"
 import path from "node:path"
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { getHostCacheDirOverride, opencodeProjectDir, setHostCacheDirOverride } from "../src/context/paths.js"
-import { IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
+import { executeCursorImageSave, IMAGE_PERMISSION_DENIED_PREFIX } from "../src/image-save.js"
 import { imageContentHash } from "../src/image-input.js"
 import {
   clearPendingCursorImages,
   distinctInputImagePath,
+  finishCursorImageSave,
   stageCursorImage,
+  takePendingCursorImage,
 } from "../src/image-staging.js"
 import {
   attachSessionHeartbeat,
@@ -136,8 +138,10 @@ function imageRun(
     terminal?.({ kind: "remote-clean-close" })
   }
   const endWithoutNotice = () => { endedUnnoticed = true }
+  // Cursor's response has ended; the transport announces it a moment later.
+  const endResponse = () => { closed = true }
   return {
-    session, writes, frames, workspace, closeCleanly, endWithoutNotice,
+    session, writes, frames, workspace, closeCleanly, endWithoutNotice, endResponse,
     assets: path.join(opencodeProjectDir(workspace), "assets"),
   }
 }
@@ -357,6 +361,72 @@ describe("Cursor's input-image writes, which Cursor never waits for", () => {
     ])
   })
 
+  const playsReply = async (run: ReturnType<typeof imageRun>) => {
+    const reply = collect()
+    await pump(run.session, reply.controller, ids)
+    expect(reply.parts.filter((part) => part.type === "text-delta").map((part) => part.delta)).toEqual(["Red"])
+    expect(reply.parts.find((part) => part.type === "finish")).toMatchObject({ finishReason: { unified: "stop" } })
+  }
+  const saved = (run: ReturnType<typeof imageRun>) => deliverContinuationResults(run.session, [{
+    sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+    toolName: CURSOR_IMAGE_SAVE_TOOL, output: "Saved the generated image",
+  }])
+
+  it("deliver a save's result after Cursor ended the Run but before the end is announced", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), frame({ interaction_update: { text_delta: { text: "Red" } } }), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    run.endResponse()
+    expect(sessionManager.classify(run.session.sessionId, 1)).toMatchObject({ kind: "deliverable" })
+    expect(await saved(run)).toBe(run.session)
+    run.closeCleanly()
+    expect(run.session.closed).toBe(false)
+    await playsReply(run)
+  })
+
+  it("keep a Run Cursor ends after the save's result was delivered and before its reply is played", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), frame({ interaction_update: { text_delta: { text: "Red" } } }), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    expect(await saved(run)).toBe(run.session)
+    run.closeCleanly()
+    expect(run.session.closed).toBe(false)
+    await playsReply(run)
+  })
+
+  it("send no heartbeat to a Run whose end is not announced yet", async () => {
+    const run = imageRun([imageWrite(1, PNG_A), ended()], [PNG_A])
+    await pump(run.session, collect().controller, ids)
+    run.session.policy = { ...run.session.policy, heartbeatMs: 20 }
+    attachSessionHeartbeat(run.session)
+    const sent = run.writes.length
+    run.endResponse()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(run.writes).toHaveLength(sent)
+    expect(run.session.closed).toBe(false)
+    run.session.heartbeatCancel?.()
+  })
+
+  it.each(["saved", "declined"] as const)(
+    "tell the model where a same-named copy went when it is %s beside Cursor's path",
+    async (outcome) => {
+      const run = imageRun([imageWrite(1, PNG_B), ended()], [PNG_B])
+      fs.mkdirSync(run.assets, { recursive: true })
+      fs.writeFileSync(path.join(run.assets, "cvs.png"), PNG_A)
+      await pump(run.session, collect().controller, ids)
+      const requested = path.join(run.assets, "cvs.png")
+      const besides = path.join(run.assets, `cvs-${imageContentHash(PNG_B).slice(0, 12)}.png`)
+      const denial = `${IMAGE_PERMISSION_DENIED_PREFIX} rejected by the user`
+      expect(await deliverContinuationResults(run.session, [{
+        sessionId: run.session.sessionId, execId: 1, toolCallId: "cursor_input-image-run_1",
+        toolName: CURSOR_IMAGE_SAVE_TOOL,
+        ...(outcome === "saved" ? { output: "Saved the generated image" } : { output: denial, error: denial }),
+      }])).toBe(run.session)
+      expect(injectedNotes(run.writes)).toEqual([outcome === "saved"
+        ? `The copy of an attached image meant for ${requested} was saved as ${besides}, because ${requested} holds a different image.`
+        : `The copy of an attached image meant for ${requested} was not saved (rejected by the user); ${requested} `
+          + "holds a different image. The image itself is still in this conversation."])
+    },
+  )
+
   it("keep the Run when Cursor ends it while the step that answered is still ending", () => {
     const run = imageRun([], [PNG_A])
     sessionManager.registerPending(1, run.session, "write_result", CURSOR_IMAGE_SAVE_TOOL, false, { inputImage: true }, true)
@@ -451,6 +521,54 @@ describe("a generated image's write", () => {
 describe("distinctInputImagePath", () => {
   const hash = imageContentHash(PNG_B)
   const hashedName = `cvs-${hash.slice(0, 12)}.png`
+
+  it("moves aside from a different image whose save is waiting for permission", () => {
+    const target = path.join(tempDir(), "cvs.png")
+    const first = stageCursorImage({ path: target, mime: "image/png", data: PNG_A })
+    expect(takePendingCursorImage(first)).toBeDefined()
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(path.join(path.dirname(target), hashedName))
+    finishCursorImageSave(first)
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(target)
+  })
+
+  it.each(["declined", "approved"] as const)("keeps the name reserved until a save is %s", async (outcome) => {
+    const dir = tempDir()
+    const target = path.join(dir, "cvs.png")
+    const first = stageCursorImage({ path: target, projectDir: dir, mime: "image/png", data: PNG_A })
+    let answer: (approved: boolean) => void = () => {}
+    const asked = new Promise<boolean>((resolve) => { answer = resolve })
+    const save = executeCursorImageSave({ image_id: first }, {
+      worktree: dir, directory: dir,
+      ask: async () => { if (!await asked) throw new Error("rejected") },
+    }).catch((error: unknown) => error)
+    await Promise.resolve()
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(path.join(dir, hashedName))
+    answer(outcome === "approved")
+    await save
+    // A declined save leaves the name free; an approved one leaves the first image there.
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(outcome === "approved" ? path.join(dir, hashedName) : target)
+  })
+
+  it("refuses rather than overwrite when every name beside a taken one is taken", () => {
+    const dir = tempDir()
+    const target = path.join(dir, "cvs.png")
+    fs.writeFileSync(target, PNG_A)
+    for (let n = 1; n <= 100; n++) {
+      fs.writeFileSync(path.join(dir, `cvs-${hash.slice(0, 12)}${n === 1 ? "" : `-${n}`}.png`), `unrelated ${n}`)
+    }
+    expect(() => distinctInputImagePath(target, PNG_B, hash)).toThrow("nothing was overwritten")
+  })
+
+  it("checks the name beside a taken one too, and never overwrites another file there", () => {
+    const dir = tempDir()
+    const target = path.join(dir, "cvs.png")
+    fs.writeFileSync(target, PNG_A)
+    fs.writeFileSync(path.join(dir, hashedName), "an unrelated file")
+    const next = path.join(dir, `cvs-${hash.slice(0, 12)}-2.png`)
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(next)
+    fs.writeFileSync(next, PNG_B)
+    expect(distinctInputImagePath(target, PNG_B, hash)).toBe(next)
+  })
 
   it("keeps a free target or one already holding the same bytes", () => {
     const dir = tempDir()

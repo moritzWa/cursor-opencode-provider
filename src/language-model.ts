@@ -875,11 +875,26 @@ function imageWriteSuccessFrame(execId: number, path: string, bytes: number): Ui
   })
 }
 
-/** Tells the model a copy of an input image it was given a path for is not on disk. */
-function unsavedInputImageNote(savedPath: string, error: string): string {
+/**
+ * What the model must hear about a copy of an input image: nothing when it was
+ * saved where Cursor said, otherwise where it went or that it was not saved.
+ */
+function inputImageCopyNote(metadata: Record<string, unknown>, error: string | undefined): string | undefined {
+  const savedPath = typeof metadata.path === "string" ? metadata.path : undefined
+  if (!savedPath) return undefined
+  const requested = typeof metadata.requestedPath === "string" ? metadata.requestedPath : undefined
+  if (error === undefined) {
+    return requested
+      ? `The copy of an attached image meant for ${requested} was saved as ${savedPath}, `
+        + `because ${requested} holds a different image.`
+      : undefined
+  }
   const reason = error.replace(`${IMAGE_PERMISSION_DENIED_PREFIX} `, "").trim() || "the save failed"
-  return `The copy of an attached image at ${savedPath} was not saved (${reason}), so that file does not exist. `
-    + "The image itself is still in this conversation."
+  return requested
+    ? `The copy of an attached image meant for ${requested} was not saved (${reason}); `
+      + `${requested} holds a different image. The image itself is still in this conversation.`
+    : `The copy of an attached image at ${savedPath} was not saved (${reason}), so that file does not exist. `
+      + "The image itself is still in this conversation."
 }
 
 /** The one GenerateImage call Cursor has started and not yet completed, if exactly one. */
@@ -1745,6 +1760,8 @@ export function attachSessionHeartbeat(session: CursorSession): void {
   const generation = bumpHeartbeatGeneration(session)
   const interval = setInterval(() => {
     if (session.closed || !isCurrentHeartbeatGeneration(session, generation)) return
+    // Cursor ended the stream; its terminal event, not a failed write, decides the Run.
+    if (session.stream.isClosed()) return
     if (heartbeatWritePendingBySession.get(session)) {
       trace(`heartbeat skipped: prior heartbeat write is still pending sessionId=${session.sessionId}`)
       return
@@ -3908,11 +3925,11 @@ async function deliverContinuationResultsNow(
     } else if (pending.answered) {
       trace(`continuation: Cursor already has the reply for execId=${r.execId} tool=${pending.toolName}; ` +
         `writing nothing failed=${r.error !== undefined}`)
-      // Cursor was told the copy was saved before the host asked; say when it was not.
-      const savedPath = pending.resultMetadata?.path
-      if (r.error !== undefined && pending.resultMetadata?.inputImage === true && typeof savedPath === "string") {
-        stepNotes.push(unsavedInputImageNote(savedPath, r.error))
-      }
+      // Only input-image copies are answered. Cursor was told the copy was saved
+      // before the host asked, at the path the model knows; say when it was not
+      // saved, or was saved under another name.
+      const note = inputImageCopyNote(pending.resultMetadata ?? {}, r.error)
+      if (note) stepNotes.push(note)
     } else if (!pending.bridged) {
       try {
         const shellResult = isShellResultField(pending.resultField)
@@ -6417,11 +6434,10 @@ export async function pump(
             const generateImageCallId = displayCallId ? undefined : openGenerateImageCallId(session)
             const inputImage = !displayCallId && !generateImageCallId && !!session.historyImages
               && runHasHistoryImage(session.historyImages, imageHash)
-            const target = inputImage
-              ? distinctInputImagePath(remapped, binaryWrite.data, imageHash)
-              : remapped
+            let target = remapped
             let imageId: string
             try {
+              if (inputImage) target = distinctInputImagePath(remapped, binaryWrite.data, imageHash)
               imageId = stageCursorImage({
                 path: target,
                 projectDir,
@@ -6430,7 +6446,7 @@ export async function pump(
                 sessionId: session.openCodeSessionId,
               })
             } catch (error) {
-              if (!await rejectExec(parsed, (error as Error).message, "binary write too large")) return
+              if (!await rejectExec(parsed, (error as Error).message, "binary write not staged")) return
               disposeParallelCall(displayCallId)
               if (closeIfParallelStepComplete()) return
               continue
@@ -6475,6 +6491,8 @@ export async function pump(
                 imageByteLength: binaryWrite.data.length,
                 ...(generateImageCallId ? { generateImageCallId } : {}),
                 ...(inputImage ? { inputImage: true } : {}),
+                // Cursor's own path, which the model was given, when the copy went beside it.
+                ...(target !== remapped ? { requestedPath: remapped } : {}),
               },
               inputImage,
             )
